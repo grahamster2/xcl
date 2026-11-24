@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -55,9 +55,24 @@ const TOP_TIMESTAMPS: u32 = 0xC;
 /// fills larger than this are not done (one pattern buffer per value, up to this size)
 const MAX_FILL: u64 = 256 << 20;
 /// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
+/// Overridable via `XCL_WAIT_TIMEOUT_MS` for diagnostics.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Watchdog timeout for GPU wait-before-signal when a recorded producer list is never submitted.
+const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
+
+fn wait_timeout() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("XCL_WAIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(WAIT_TIMEOUT)
+    })
+}
 
 fn once(counter: &AtomicU64, n: u64) -> bool {
     counter.fetch_add(1, Ordering::Relaxed) < n
@@ -165,6 +180,9 @@ struct PendingWait {
     comparison: u32,
     value: u64,
     mask: u64,
+    /// True if this list already recorded a `Write64BitValue*` before this wait (potential
+    /// intra-list fork-join where hoisting a GPU wait before list submission could deadlock).
+    after_write64: bool,
 }
 
 fn compare_u64(op: u32, lhs: u64, rhs: u64) -> Option<bool> {
@@ -544,6 +562,10 @@ struct ListState {
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
+    /// Non-timestamp 64-bit `(va, value)` writes recorded by `Write64BitValue{Bottom,Top}OfPipeX`
+    /// so `ExecuteCommandLists` / `KickoffX` can signal per-address GPU fences for cross-queue
+    /// `Wait64BitValueX` without blocking the submitter thread on the CPU.
+    write64_signals: Vec<(u64, u64)>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
@@ -586,6 +608,21 @@ impl ListState {
         std::mem::take(&mut self.sparse_writes)
     }
 
+    fn push_write64_signal(&mut self, va: u64, value: u64) {
+        if self.write64_signals.is_empty() {
+            WRITE64_SIGNAL_LISTS.fetch_add(1, Ordering::AcqRel);
+        }
+        self.write64_signals.push((va, value));
+    }
+
+    fn clear_write64_signals(&mut self) -> Vec<(u64, u64)> {
+        if self.write64_signals.is_empty() {
+            return Vec::new();
+        }
+        WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
+        std::mem::take(&mut self.write64_signals)
+    }
+
     fn has_prior_write(&self, va: u64, size: u64) -> bool {
         let end = va.saturating_add(size);
         self.written_ranges.iter().any(|&(s, e)| va < e && s < end)
@@ -619,6 +656,8 @@ static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
 static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
+/// Number of lists with recorded non-timestamp `Write64BitValue*` signals (fast-path guard).
+static WRITE64_SIGNAL_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Set once any list uses `RSSetDepthBiasX` (fast-path guard for Draw* hooks).
 static DEPTH_BIAS_USED: AtomicBool = AtomicBool::new(false);
 /// Set once any list uses `SetPredicationBufferX` (fast-path guard for Close/Reset hooks).
@@ -694,6 +733,9 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
             if !old.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
+            if !old.write64_signals.is_empty() {
+                WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
+            }
         }
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
@@ -723,6 +765,9 @@ pub(super) fn on_release(list: usize) {
         }
         if !old.sparse_writes.is_empty() {
             SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
+        }
+        if !old.write64_signals.is_empty() {
+            WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -875,20 +920,411 @@ fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
-unsafe fn wait_all(waits: &[PendingWait]) {
+// ---------------------------------------------------------------------------------------
+// per-address GPU fence bridge for monotonic 64-bit Write64BitValue* -> Wait64BitValueX
+// ---------------------------------------------------------------------------------------
+
+/// Recent `Write32/64BitValue*` call for timeout diagnostics.
+#[derive(Clone, Copy)]
+struct WriteTraceEntry {
+    va: u64,
+    value: u64,
+    flags: u32,
+    list_type: i32,
+    what: &'static str,
+}
+
+struct WriteTraceRing {
+    entries: [Option<WriteTraceEntry>; 32],
+    next: usize,
+    total: u64,
+}
+
+impl WriteTraceRing {
+    const fn new() -> Self {
+        Self { entries: [None; 32], next: 0, total: 0 }
+    }
+
+    fn push(&mut self, e: WriteTraceEntry) {
+        self.entries[self.next] = Some(e);
+        self.next = (self.next + 1) % self.entries.len();
+        self.total += 1;
+    }
+
+    fn snapshot(&self) -> (u64, Vec<WriteTraceEntry>) {
+        let mut out = Vec::with_capacity(self.entries.len());
+        for i in 0..self.entries.len() {
+            let idx = (self.next + i) % self.entries.len();
+            if let Some(e) = self.entries[idx] {
+                out.push(e);
+            }
+        }
+        (self.total, out)
+    }
+}
+
+static WRITE_TRACE: Mutex<WriteTraceRing> = Mutex::new(WriteTraceRing::new());
+
+fn record_write_trace(list: *mut c_void, va: u64, value: u64, flags: u32, what: &'static str) {
+    let ty = LISTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(list as usize)))
+        .and_then(|s| s.list_type)
+        .map_or(-1, |t| t.0);
+    WRITE_TRACE.lock().unwrap().push(WriteTraceEntry { va, value, flags, list_type: ty, what });
+}
+
+/// Per-address GPU fence state bridging `Write64BitValue{Bottom,Top}OfPipeX` to cross-queue
+/// `Wait64BitValueX` (`GREATER_EQUAL`, full 64-bit mask).
+#[derive(Default)]
+struct SyncCell {
+    fence: Option<ID3D12Fence>,
+    /// Raw `ID3D12Device` pointer owning `fence`.
+    device: usize,
+    /// Highest non-zero value recorded in a `Write64BitValue*` targeting this VA.
+    recorded_max: u64,
+    /// Command list type of the most recent recording advancing `recorded_max`.
+    recorded_list_type: Option<D3D12_COMMAND_LIST_TYPE>,
+    /// Last queue the recording list was executed on (if known), used to prevent same-queue
+    /// wait-before-signal self-deadlocks.
+    recorded_last_queue: Option<usize>,
+    /// Highest value submitted via `queue.Signal(&fence, v)`.
+    submitted_max: u64,
+    /// Queue that issued the latest `Signal`.
+    submitted_queue: Option<usize>,
+    /// Set once a non-monotonic write (`value <= submitted_max`) is observed at this VA, disabling
+    /// GPU-fence bridging and falling back to CPU polling.
+    non_monotonic: bool,
+    /// Pending GPU `queue.Wait(&fence, v)` values whose producer had not been submitted yet.
+    unsubmitted_waits: Vec<(u64, Instant)>,
+}
+
+// SAFETY: `ID3D12Fence` is a free-threaded COM object in D3D12.
+unsafe impl Send for SyncCell {}
+
+static SYNC_CELLS: Mutex<Option<HashMap<u64, SyncCell>>> = Mutex::new(None);
+static UNSUBMITTED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
+static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+
+fn wake_sync_watchdog() {
+    let pair = SYNC_WATCHDOG_WAKE.get_or_init(|| {
+        let pair = (Mutex::new(()), Condvar::new());
+        let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
+            let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
+            let guard = lock.lock().unwrap();
+            if UNSUBMITTED_GPU_WAITS.load(Ordering::Acquire) == 0 {
+                let _g = cv.wait(guard).unwrap();
+                continue;
+            }
+            let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            let expired = {
+                let mut g = SYNC_CELLS.lock().unwrap();
+                let mut out: Vec<(u64, u64, ID3D12Fence, u64, u64)> = Vec::new();
+                if let Some(m) = g.as_mut() {
+                    for (&va, cell) in m.iter_mut() {
+                        if cell.unsubmitted_waits.is_empty() {
+                            continue;
+                        }
+                        let mut max_exp = 0u64;
+                        let before = cell.unsubmitted_waits.len();
+                        cell.unsubmitted_waits.retain(|&(val, armed_at)| {
+                            if cell.submitted_max >= val {
+                                return false;
+                            }
+                            if armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                                max_exp = max_exp.max(val);
+                                return false;
+                            }
+                            true
+                        });
+                        let removed = before - cell.unsubmitted_waits.len();
+                        if removed > 0 {
+                            UNSUBMITTED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
+                        }
+                        if max_exp > 0 {
+                            if let Some(ref f) = cell.fence {
+                                out.push((va, max_exp, f.clone(), cell.recorded_max, cell.submitted_max));
+                            }
+                        }
+                    }
+                }
+                out
+            };
+            for (va, val, fence, rec, sub) in expired {
+                unsafe {
+                    let _ = fence.Signal(val);
+                }
+                crate::xlog_warn!(
+                    "D3D12.X: GPU wait-before-signal at {va:#x} >= {val:#x} was not submitted within {} ms (recorded_max={rec:#x}, submitted_max={sub:#x}) – released on CPU to prevent GPU hang",
+                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                );
+            }
+        });
+        pair
+    });
+    pair.1.notify_one();
+}
+
+unsafe fn queue_device_and_type(queue: *mut c_void) -> Option<(ID3D12Device, usize, D3D12_COMMAND_LIST_TYPE)> {
+    if queue.is_null() {
+        return None;
+    }
+    let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
+    let ty = q.GetDesc().Type;
+    let mut dev: Option<ID3D12Device> = None;
+    q.GetDevice(&mut dev).ok()?;
+    let dev = dev?;
+    let raw = dev.as_raw() as usize;
+    Some((dev, raw, ty))
+}
+
+unsafe fn ensure_cell_fence(va: u64, dev: &ID3D12Device, dev_raw: usize) -> Option<ID3D12Fence> {
+    {
+        let g = SYNC_CELLS.lock().unwrap();
+        if let Some(cell) = g.as_ref().and_then(|m| m.get(&va)) {
+            if cell.non_monotonic {
+                return None;
+            }
+            if let Some(ref f) = cell.fence {
+                return (cell.device == dev_raw).then(|| f.clone());
+            }
+        }
+    }
+    let created: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    let mut g = SYNC_CELLS.lock().unwrap();
+    let cell = g.get_or_insert_with(HashMap::new).entry(va).or_default();
+    if cell.non_monotonic {
+        return None;
+    }
+    if let Some(ref existing) = cell.fence {
+        return (cell.device == dev_raw).then(|| existing.clone());
+    }
+    cell.fence = Some(created.clone());
+    cell.device = dev_raw;
+    Some(created)
+}
+
+fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
+    if value == 0 || !va.is_multiple_of(8) {
+        return;
+    }
+    let (lty, last_q) = {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+        s.push_write64_signal(va, value);
+        (s.list_type, s.last_queue)
+    };
+    let mut g = SYNC_CELLS.lock().unwrap();
+    let cell = g.get_or_insert_with(HashMap::new).entry(va).or_default();
+    if cell.non_monotonic {
+        return;
+    }
+    if value <= cell.submitted_max {
+        cell.non_monotonic = true;
+        cell.fence = None;
+        return;
+    }
+    if value > cell.recorded_max {
+        cell.recorded_max = value;
+        cell.recorded_list_type = lty;
+        cell.recorded_last_queue = last_q;
+    }
+}
+
+unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
+    if queue.is_null() || pairs.is_empty() {
+        return;
+    }
+    let Some((dev, dev_raw, _ty)) = queue_device_and_type(queue) else { return };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    // Coalesce per-VA max value within this batch.
+    let mut max_by_va: Vec<(u64, u64)> = Vec::with_capacity(pairs.len());
+    for &(va, val) in pairs {
+        if val == 0 {
+            continue;
+        }
+        if let Some(entry) = max_by_va.iter_mut().find(|e| e.0 == va) {
+            entry.1 = entry.1.max(val);
+        } else {
+            max_by_va.push((va, val));
+        }
+    }
+    for (va, val) in max_by_va {
+        let skip = {
+            let g = SYNC_CELLS.lock().unwrap();
+            g.as_ref().and_then(|m| m.get(&va)).is_some_and(|c| c.non_monotonic || c.submitted_max >= val)
+        };
+        if skip {
+            continue;
+        }
+        let Some(fence) = ensure_cell_fence(va, &dev, dev_raw) else { continue };
+        let should_signal = {
+            let mut g = SYNC_CELLS.lock().unwrap();
+            let cell = g.get_or_insert_with(HashMap::new).entry(va).or_default();
+            if cell.non_monotonic || cell.device != dev_raw || val <= cell.submitted_max {
+                false
+            } else {
+                cell.submitted_max = val;
+                cell.submitted_queue = Some(queue as usize);
+                if val > cell.recorded_max {
+                    cell.recorded_max = val;
+                }
+                let before = cell.unsubmitted_waits.len();
+                cell.unsubmitted_waits.retain(|&(w_val, _)| w_val > val);
+                let removed = before - cell.unsubmitted_waits.len();
+                if removed > 0 {
+                    UNSUBMITTED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
+                }
+                true
+            }
+        };
+        if should_signal {
+            if let Err(e) = q.Signal(&fence, val) {
+                crate::xlog_warn!("D3D12.X: Write64 fence Signal({va:#x}, {val:#x}) failed ({e}) – signalling on CPU");
+                let _ = fence.Signal(val);
+            }
+        }
+    }
+}
+
+/// After `queue.ExecuteCommandLists(lists)`: signal per-address GPU fences for any
+/// `Write64BitValue{Bottom,Top}OfPipeX` commands recorded on `lists`.
+pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_void]) {
+    if WRITE64_SIGNAL_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
+        return;
+    }
+    let pairs: Vec<(u64, u64)> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        let mut out = Vec::new();
+        for &l in lists {
+            if let Some(s) = m.get(&(l as usize)) {
+                out.extend_from_slice(&s.write64_signals);
+            }
+        }
+        out
+    };
+    signal_write64_pairs(queue, &pairs);
+}
+
+/// Attempt to satisfy a `Wait64BitValueX(GREATER_EQUAL, u64::MAX)` on the GPU via
+/// `queue.Wait(&fence, w.value)` instead of blocking the submission thread on the CPU.
+/// Returns `true` if the wait was handled on the GPU (or already satisfied).
+unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait) -> bool {
+    if queue.is_null()
+        || w.width != 8
+        || w.comparison != D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32
+        || w.mask != u64::MAX
+        || w.value == 0
+        || w.after_write64
+    {
+        return false;
+    }
+    let Some((dev, dev_raw, q_ty)) = queue_device_and_type(queue) else { return false };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return false };
+
+    let eligible = {
+        let g = SYNC_CELLS.lock().unwrap();
+        g.as_ref().and_then(|m| m.get(&w.va)).is_some_and(|c| {
+            !c.non_monotonic
+                && c.recorded_max >= w.value
+                && !(c.submitted_max < w.value && c.recorded_last_queue == Some(queue as usize))
+        })
+    };
+    if !eligible {
+        return false;
+    }
+    let Some(fence) = ensure_cell_fence(w.va, &dev, dev_raw) else { return false };
+
+    let (unsubmitted, rec_ty) = {
+        let mut g = SYNC_CELLS.lock().unwrap();
+        let Some(cell) = g.as_mut().and_then(|m| m.get_mut(&w.va)) else { return false };
+        if cell.non_monotonic || cell.device != dev_raw || cell.recorded_max < w.value {
+            return false;
+        }
+        if fence.GetCompletedValue() >= w.value {
+            // Fence already reached `w.value`: only trust it if CPU memory agrees (not reset/reused).
+            return w.is_satisfied();
+        }
+        let unsubmitted = cell.submitted_max < w.value;
+        if unsubmitted {
+            if cell.recorded_last_queue == Some(queue as usize) {
+                return false;
+            }
+            cell.unsubmitted_waits.push((w.value, Instant::now()));
+            UNSUBMITTED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+        }
+        (unsubmitted, cell.recorded_list_type)
+    };
+
+    if let Err(e) = q.Wait(&fence, w.value) {
+        if unsubmitted {
+            let mut g = SYNC_CELLS.lock().unwrap();
+            if let Some(cell) = g.as_mut().and_then(|m| m.get_mut(&w.va)) {
+                if let Some(pos) = cell.unsubmitted_waits.iter().rposition(|&(v, _)| v == w.value) {
+                    cell.unsubmitted_waits.remove(pos);
+                    UNSUBMITTED_GPU_WAITS.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+        crate::xlog_warn!("D3D12.X: Wait64 GPU queue.Wait({:#x}, {:#x}) failed ({e}) – falling back to CPU wait", w.va, w.value);
+        return false;
+    }
+
+    if unsubmitted {
+        wake_sync_watchdog();
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if once(&LOGGED, 8) {
+            crate::xlog_info!(
+                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} bridged to GPU queue.Wait (queue type {}, producer type {:?}; wait-before-signal)",
+                w.va,
+                w.value,
+                q_ty.0,
+                rec_ty.map(|t| t.0)
+            );
+        }
+    }
+    true
+}
+
+unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
+    let timeout = wait_timeout();
+    let q_ty = queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0);
     for w in waits {
-        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 40) {
+        if w.is_satisfied() || try_gpu_wait(queue, w) {
+            continue;
+        }
+        if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
+            let cell_diag = {
+                let g = SYNC_CELLS.lock().unwrap();
+                g.as_ref().and_then(|m| m.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
+            };
             crate::xlog_warn!(
-                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?})",
+                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?}; queue_type={}, after_write64={}, sync={cell_diag:x?})",
                 w.width * 8,
-                WAIT_TIMEOUT.as_millis(),
+                timeout.as_millis(),
                 w.va,
                 w.comparison,
                 w.value,
                 w.mask,
-                w.read_value()
+                w.read_value(),
+                q_ty,
+                w.after_write64
             );
+            if once(&RING_DUMPED, 2) {
+                let (total, entries) = WRITE_TRACE.lock().unwrap().snapshot();
+                let summary: Vec<String> = entries
+                    .iter()
+                    .rev()
+                    .take(16)
+                    .map(|e| format!("{}({:#x}={:#x},f={:#x},ty={})", e.what, e.va, e.value, e.flags, e.list_type))
+                    .collect();
+                crate::xlog_warn!("D3D12.X: recent Write32/64 calls ({total} total): [{}]", summary.join(", "));
+            }
         }
     }
 }
@@ -930,7 +1366,9 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
-pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
+/// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
+/// bridged to GPU-side `queue.Wait` without blocking the submitter thread on the CPU.
+pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
@@ -955,12 +1393,17 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl 
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all(waits);
+        wait_all_on(queue, waits);
         start = i;
     }
     if start < lists.len() {
         submit(&lists[start..]);
     }
+}
+
+#[cfg(test)]
+pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMut(&[*mut c_void])) {
+    execute_with_waits_on(std::ptr::null_mut(), lists, submit);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1219,16 +1662,19 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
 ///
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
-pub unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value: u32, _flush: u32, _flags: u32) {
+pub unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value: u32, _flush: u32, flags: u32) {
+    record_write_trace(this, va, value as u64, flags, "W32B");
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfPipeX");
 }
 
 /// command list #70 Write64BitValueBottomOfPipeX(address, value, flush, flags)
 pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64, value: u64, _flush: u32, flags: u32) {
     const W: &str = "Write64BitValueBottomOfPipeX";
+    record_write_trace(this, va, value, flags, "W64B");
     if flags & BOTTOM_TIMESTAMPS != 0 {
         return timestamp(this, va, W);
     }
+    note_write64_recorded(this, va, value);
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
 }
 
@@ -1263,7 +1709,8 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if s.has_prior_write(va, n) {
         return;
     }
-    s.push_wait(PendingWait { va, width, comparison, value, mask });
+    let after_write64 = !s.write64_signals.is_empty();
+    s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64 });
 }
 
 /// command list #71 Wait32BitValueX(address, comparison, value, mask, flags)
@@ -1281,21 +1728,25 @@ pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, compar
 }
 
 /// command list #88 Write32BitValueTopOfPipeX(address, value, flags)
-pub(super) unsafe extern "system" fn write32_top_x(this: *mut c_void, va: u64, value: u32, _flags: u32) {
+pub(super) unsafe extern "system" fn write32_top_x(this: *mut c_void, va: u64, value: u32, flags: u32) {
+    record_write_trace(this, va, value as u64, flags, "W32T");
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write32BitValueTopOfPipeX");
 }
 
 /// command list #89 Write64BitValueTopOfPipeX(address, value, flags)
 pub(super) unsafe extern "system" fn write64_top_x(this: *mut c_void, va: u64, value: u64, flags: u32) {
     const W: &str = "Write64BitValueTopOfPipeX";
+    record_write_trace(this, va, value, flags, "W64T");
     if flags & TOP_TIMESTAMPS != 0 {
         return timestamp(this, va, W);
     }
+    note_write64_recorded(this, va, value);
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, W);
 }
 
 /// command list #90 Write32BitValueBottomOfShaderX(address, value, stage)
-pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_void, va: u64, value: u32, _stage: u32) {
+pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_void, va: u64, value: u32, stage: u32) {
+    record_write_trace(this, va, value as u64, stage, "W32S");
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfShaderX");
 }
 
@@ -1532,13 +1983,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             std::mem::take(&mut s.pending_waits)
         };
         let sparse_writes = s.clear_sparse_writes();
+        let write64_signals = s.clear_write64_signals();
         s.written_ranges.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, cpu_writes))
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
     };
-    let (sparse_writes, cpu_writes) = sparse_writes;
+    let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -1560,13 +2012,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
     if !waits.is_empty() {
-        wait_all(&waits);
+        wait_all_on(q_raw, &waits);
     }
 
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
@@ -2135,6 +2588,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.clear_sparse_writes();
+        s.clear_write64_signals();
         s.clear_waits();
         s.cpu_writes.clear();
         s.predication = None;
@@ -2712,6 +3166,7 @@ mod tests {
             comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
             value: 0x0000_005A,
             mask: 0x0000_00FF,
+            after_write64: false,
         };
         unsafe {
             assert!(!w32.is_satisfied());
@@ -2731,6 +3186,7 @@ mod tests {
             comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
             value: 0x0000_0002_0000_0000,
             mask: u64::MAX,
+            after_write64: false,
         };
         unsafe {
             assert!(!w64.is_satisfied());
@@ -2775,6 +3231,7 @@ mod tests {
                 comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
                 value: 42,
                 mask: u32::MAX as u64,
+                after_write64: false,
             });
         }
 
@@ -3712,6 +4169,260 @@ mod tests {
             assert_ne!(*bottom_ts, 0);
 
             on_release(list_ptr as usize);
+        }
+    }
+
+    #[test]
+    fn write_buffer_immediate_on_open_existing_heap_visible_to_cpu() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let dev3: ID3D12Device3 = dev.cast().unwrap();
+
+            let mem = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            assert!(!mem.is_null());
+            let base = mem as usize;
+
+            let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(mem).expect("OpenExistingHeapFromAddress");
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 0x1_0000,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                ..Default::default()
+            };
+            let mut buf: Option<ID3D12Resource> = None;
+            dev.CreatePlacedResource(&heap, 0, &buf_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).unwrap();
+            let buf = buf.unwrap();
+            let gpu_va = buf.GetGPUVirtualAddress();
+
+            // Upload buffer holding known u64 for CopyBufferRegion comparison
+            let up_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut up: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &up_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut up,
+            )
+            .unwrap();
+            let up = up.unwrap();
+            let mut up_ptr = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut up_ptr)).unwrap();
+            *(up_ptr as *mut u64) = 0xCAFE_BABE_DEAD_BEEFu64;
+            up.Unmap(0, None);
+
+            // Readback buffer to inspect what the GPU itself sees at +0x100, +0x180, +0x200
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &up_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut rb,
+            )
+            .unwrap();
+            let rb = rb.unwrap();
+
+            // 1. DIRECT queue: WriteBufferImmediate at +0x100 and CopyBufferRegion at +0x200
+            let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let dl: ID3D12GraphicsCommandList2 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let make_barrier = |before, after| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: ManuallyDrop::new(Some(buf.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: before,
+                        StateAfter: after,
+                    }),
+                },
+            };
+
+            dl.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            let p_direct = [
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x100, Value: 0x0000_0677 },
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x104, Value: 0x0000_0000 },
+            ];
+            let m_direct = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; 2];
+            dl.WriteBufferImmediate(2, p_direct.as_ptr(), Some(m_direct.as_ptr()));
+            dl.CopyBufferRegion(&buf, 0x200, &up, 0, 8);
+            dl.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            dl.Close().unwrap();
+            let dcl: ID3D12CommandList = dl.cast().unwrap();
+            dq.ExecuteCommandLists(&[Some(dcl)]);
+            dq.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 2000).unwrap();
+
+            // 2. COMPUTE queue: WriteBufferImmediate at +0x180
+            let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let cl2: ID3D12GraphicsCommandList2 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca, None).unwrap();
+            cl2.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            let p_comp = [
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x180, Value: 0x0000_0677 },
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x184, Value: 0x1122_3344 },
+            ];
+            let m_comp = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; 2];
+            cl2.WriteBufferImmediate(2, p_comp.as_ptr(), Some(m_comp.as_ptr()));
+            cl2.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            cl2.Close().unwrap();
+            let ccl: ID3D12CommandList = cl2.cast().unwrap();
+            cq.ExecuteCommandLists(&[Some(ccl)]);
+            cq.Signal(&fence, 2).unwrap();
+            crate::gpu::fence::wait(&fence, 2, &dev, None, 2000).unwrap();
+
+            // 3. GPU readback of +0x100, +0x180, +0x200
+            let da2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let dl2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da2, None).unwrap();
+            dl2.CopyBufferRegion(&rb, 0, &buf, 0x100, 8);
+            dl2.CopyBufferRegion(&rb, 8, &buf, 0x180, 8);
+            dl2.CopyBufferRegion(&rb, 16, &buf, 0x200, 8);
+            dl2.Close().unwrap();
+            let dcl2: ID3D12CommandList = dl2.cast().unwrap();
+            dq.ExecuteCommandLists(&[Some(dcl2)]);
+            dq.Signal(&fence, 3).unwrap();
+            crate::gpu::fence::wait(&fence, 3, &dev, None, 2000).unwrap();
+
+            let cpu_direct = *((base + 0x100) as *const u64);
+            let cpu_comp = *((base + 0x180) as *const u64);
+            let cpu_copy = *((base + 0x200) as *const u64);
+            let mut rb_ptr = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rb_ptr)).unwrap();
+            let gpu_direct = *(rb_ptr as *const u64);
+            let gpu_comp = *((rb_ptr as *const u64).add(1));
+            let gpu_copy = *((rb_ptr as *const u64).add(2));
+            rb.Unmap(0, None);
+
+            drop(dl);
+            drop(dl2);
+            drop(cl2);
+            drop(buf);
+            drop(heap);
+            VirtualFree(mem, 0, MEM_RELEASE);
+
+            assert_eq!(cpu_direct, 0x677, "DIRECT WriteBufferImmediate must be visible to CPU (gpu={gpu_direct:#x})");
+            assert_eq!(cpu_comp, 0x1122_3344_0000_0677, "COMPUTE WriteBufferImmediate must be visible to CPU (gpu={gpu_comp:#x})");
+            assert_eq!(cpu_copy, 0xCAFE_BABE_DEAD_BEEF, "DIRECT CopyBufferRegion must be visible to CPU (gpu={gpu_copy:#x})");
+        }
+    }
+
+    /// Submitting a DIRECT list with `Wait64BitValueX(va, >=, 0x677)` BEFORE submitting the
+    /// COMPUTE list that recorded `Write64BitValueBottomOfPipeX(va, 0x677)` must bridge via
+    /// GPU `queue.Wait`/`queue.Signal` without blocking the submitter thread for `WAIT_TIMEOUT`.
+    #[test]
+    fn cross_queue_wait64_before_signal_does_not_deadlock_submit_thread() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let dl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
+            let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca, None).unwrap();
+            let done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as u64;
+
+            let dl_ptr = dl.as_raw();
+            let cl_ptr = cl.as_raw();
+            on_create(dl_ptr, da.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            on_create(cl_ptr, ca.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            // Worker threads record both lists: COMPUTE writes `va = 0x677`, DIRECT waits `va >= 0x677`.
+            note_write64_recorded(cl_ptr, va, 0x677);
+            wait64_x(dl_ptr, va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x677, 1, 0);
+            dl.Close().unwrap();
+            cl.Close().unwrap();
+
+            // Single submitter thread submits DIRECT (consumer) FIRST — before COMPUTE (producer)!
+            let t0 = Instant::now();
+            let dcl: ID3D12CommandList = dl.cast().unwrap();
+            execute_with_waits_on(dq.as_raw(), &[dl_ptr], |chunk| {
+                assert_eq!(chunk, &[dl_ptr]);
+                dq.ExecuteCommandLists(&[Some(dcl.clone())]);
+                signal_write64_fences(dq.as_raw(), chunk);
+            });
+            let direct_submit_ms = t0.elapsed().as_millis();
+            assert!(
+                direct_submit_ms < 500,
+                "wait-before-signal must bridge to GPU queue.Wait without blocking CPU (took {direct_submit_ms} ms)"
+            );
+            dq.Signal(&done_fence, 1).unwrap();
+
+            // Now submit COMPUTE (producer) which signals the per-VA GPU fence.
+            let ccl: ID3D12CommandList = cl.cast().unwrap();
+            execute_with_waits_on(cq.as_raw(), &[cl_ptr], |chunk| {
+                assert_eq!(chunk, &[cl_ptr]);
+                cq.ExecuteCommandLists(&[Some(ccl.clone())]);
+                signal_write64_fences(cq.as_raw(), chunk);
+            });
+
+            // DIRECT queue must now unblock and finish promptly on the GPU.
+            crate::gpu::fence::wait(&done_fence, 1, &dev, None, 2000).expect("DIRECT queue must complete after COMPUTE signals per-VA fence");
+
+            on_release(dl_ptr as usize);
+            on_release(cl_ptr as usize);
+            SYNC_CELLS.lock().unwrap().as_mut().map(|m| m.remove(&va));
         }
     }
 }
