@@ -976,6 +976,15 @@ fn record_write_trace(list: *mut c_void, va: u64, value: u64, flags: u32, what: 
     WRITE_TRACE.lock().unwrap().push(WriteTraceEntry { va, value, flags, list_type: ty, what });
 }
 
+/// Active GPU `queue.Wait(&fence, val)` tracked for cycle detection and deadlock watchdog.
+#[derive(Clone, Copy)]
+struct ArmedGpuWait {
+    val: u64,
+    waiting_queue: usize,
+    waiting_queue_ty: i32,
+    armed_at: Instant,
+}
+
 /// Per-address GPU fence state bridging `Write64BitValue{Bottom,Top}OfPipeX` to cross-queue
 /// `Wait64BitValueX` (`GREATER_EQUAL`, full 64-bit mask).
 #[derive(Default)]
@@ -997,16 +1006,37 @@ struct SyncCell {
     /// Set once a non-monotonic write (`value <= submitted_max`) is observed at this VA, disabling
     /// GPU-fence bridging and falling back to CPU polling.
     non_monotonic: bool,
-    /// Pending GPU `queue.Wait(&fence, v)` values whose producer had not been submitted yet.
-    unsubmitted_waits: Vec<(u64, Instant)>,
+    /// All active GPU `queue.Wait(&fence, v)` calls on this cell not yet confirmed completed on GPU.
+    armed_waits: Vec<ArmedGpuWait>,
 }
 
 // SAFETY: `ID3D12Fence` is a free-threaded COM object in D3D12.
 unsafe impl Send for SyncCell {}
 
 static SYNC_CELLS: Mutex<Option<HashMap<u64, SyncCell>>> = Mutex::new(None);
-static UNSUBMITTED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
+static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+
+/// Remove any `armed_waits` already satisfied on the GPU (or if the device was removed).
+/// Returns the fence's current completed value (or `0` if no fence exists yet).
+unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
+    let Some(ref fence) = cell.fence else { return 0 };
+    let completed = fence.GetCompletedValue();
+    if cell.armed_waits.is_empty() {
+        return completed;
+    }
+    let before = cell.armed_waits.len();
+    if completed == u64::MAX {
+        cell.armed_waits.clear();
+    } else {
+        cell.armed_waits.retain(|aw| aw.val > completed);
+    }
+    let removed = before - cell.armed_waits.len();
+    if removed > 0 {
+        ARMED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
+    }
+    completed
+}
 
 fn wake_sync_watchdog() {
     let pair = SYNC_WATCHDOG_WAKE.get_or_init(|| {
@@ -1014,50 +1044,64 @@ fn wake_sync_watchdog() {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
             let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
             let guard = lock.lock().unwrap();
-            if UNSUBMITTED_GPU_WAITS.load(Ordering::Acquire) == 0 {
+            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
                 let _g = cv.wait(guard).unwrap();
                 continue;
             }
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let expired = {
                 let mut g = SYNC_CELLS.lock().unwrap();
-                let mut out: Vec<(u64, u64, ID3D12Fence, u64, u64)> = Vec::new();
+                let mut out: Vec<(u64, u64, ID3D12Fence, i32, Option<i32>, u64, u64, u64)> = Vec::new();
                 if let Some(m) = g.as_mut() {
                     for (&va, cell) in m.iter_mut() {
-                        if cell.unsubmitted_waits.is_empty() {
+                        if cell.armed_waits.is_empty() {
+                            continue;
+                        }
+                        let completed = unsafe { prune_completed_waits(cell) };
+                        if cell.armed_waits.is_empty() || completed == u64::MAX {
                             continue;
                         }
                         let mut max_exp = 0u64;
-                        let before = cell.unsubmitted_waits.len();
-                        cell.unsubmitted_waits.retain(|&(val, armed_at)| {
-                            if cell.submitted_max >= val {
-                                return false;
-                            }
-                            if armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
-                                max_exp = max_exp.max(val);
+                        let mut waiter_ty = -1i32;
+                        let before = cell.armed_waits.len();
+                        cell.armed_waits.retain(|aw| {
+                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                                if aw.val >= max_exp {
+                                    max_exp = aw.val;
+                                    waiter_ty = aw.waiting_queue_ty;
+                                }
                                 return false;
                             }
                             true
                         });
-                        let removed = before - cell.unsubmitted_waits.len();
+                        let removed = before - cell.armed_waits.len();
                         if removed > 0 {
-                            UNSUBMITTED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
+                            ARMED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
                         }
                         if max_exp > 0 {
                             if let Some(ref f) = cell.fence {
-                                out.push((va, max_exp, f.clone(), cell.recorded_max, cell.submitted_max));
+                                out.push((
+                                    va,
+                                    max_exp,
+                                    f.clone(),
+                                    waiter_ty,
+                                    cell.recorded_list_type.map(|t| t.0),
+                                    cell.recorded_max,
+                                    cell.submitted_max,
+                                    completed,
+                                ));
                             }
                         }
                     }
                 }
                 out
             };
-            for (va, val, fence, rec, sub) in expired {
+            for (va, val, fence, waiter_ty, prod_ty, rec, sub, done) in expired {
                 unsafe {
                     let _ = fence.Signal(val);
                 }
                 crate::xlog_warn!(
-                    "D3D12.X: GPU wait-before-signal at {va:#x} >= {val:#x} was not submitted within {} ms (recorded_max={rec:#x}, submitted_max={sub:#x}) – released on CPU to prevent GPU hang",
+                    "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter_ty={waiter_ty}, prod_ty={prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
                     GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
                 );
             }
@@ -1065,6 +1109,10 @@ fn wake_sync_watchdog() {
         pair
     });
     pair.1.notify_one();
+}
+
+fn live_queues_of_type(ty: D3D12_COMMAND_LIST_TYPE) -> usize {
+    LIVE_QUEUES.lock().unwrap().iter().filter(|q| q.ty == ty).count()
 }
 
 unsafe fn queue_device_and_type(queue: *mut c_void) -> Option<(ID3D12Device, usize, D3D12_COMMAND_LIST_TYPE)> {
@@ -1163,6 +1211,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
         let should_signal = {
             let mut g = SYNC_CELLS.lock().unwrap();
             let cell = g.get_or_insert_with(HashMap::new).entry(va).or_default();
+            prune_completed_waits(cell);
             if cell.non_monotonic || cell.device != dev_raw || val <= cell.submitted_max {
                 false
             } else {
@@ -1170,12 +1219,6 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 cell.submitted_queue = Some(queue as usize);
                 if val > cell.recorded_max {
                     cell.recorded_max = val;
-                }
-                let before = cell.unsubmitted_waits.len();
-                cell.unsubmitted_waits.retain(|&(w_val, _)| w_val > val);
-                let removed = before - cell.unsubmitted_waits.len();
-                if removed > 0 {
-                    UNSUBMITTED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
                 }
                 true
             }
@@ -1209,94 +1252,212 @@ pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_v
     signal_write64_pairs(queue, &pairs);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GpuWaitOutcome {
+    /// Satisfied on GPU (via `queue.Wait` or same-queue FIFO order) — no CPU wait needed.
+    Handled,
+    /// Skipping this wait avoids a guaranteed GPU/CPU cycle (logged once).
+    CycleSkip,
+    /// Not eligible for GPU fence bridging — fall back to bounded CPU poll.
+    FallbackCpu,
+}
+
+/// Detect whether emitting `q_raw.Wait` on `prod_queue` / `prod_ty` would close a 2-queue cycle
+/// (the producer queue is already waiting on an unsubmitted write from `q_raw` or `list_writes`).
+unsafe fn would_create_gpu_cycle(
+    map: &mut HashMap<u64, SyncCell>,
+    q_raw: usize,
+    q_ty: i32,
+    prod_queue: Option<usize>,
+    prod_ty: Option<i32>,
+    list_writes: &[(u64, u64)],
+) -> bool {
+    for (&other_va, other_cell) in map.iter_mut() {
+        if other_cell.armed_waits.is_empty() {
+            continue;
+        }
+        let completed = prune_completed_waits(other_cell);
+        if other_cell.armed_waits.is_empty() || completed == u64::MAX {
+            continue;
+        }
+        let other_prod_q = other_cell.submitted_queue.or(other_cell.recorded_last_queue);
+        let other_prod_ty = other_cell.recorded_list_type.map(|t| t.0);
+        for aw in &other_cell.armed_waits {
+            let waiter_is_our_producer = match (prod_queue, prod_ty) {
+                (Some(pq), _) => aw.waiting_queue == pq,
+                (None, Some(pt)) => aw.waiting_queue_ty == pt,
+                (None, None) => false,
+            };
+            if !waiter_is_our_producer {
+                continue;
+            }
+            let written_by_this_list = list_writes.iter().any(|&(wva, wv)| wva == other_va && wv >= aw.val);
+            let unsubmitted_from_us = other_cell.submitted_max < aw.val
+                && (other_prod_q == Some(q_raw) || (other_prod_q.is_none() && other_prod_ty == Some(q_ty)));
+            if written_by_this_list || unsubmitted_from_us {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Attempt to satisfy a `Wait64BitValueX(GREATER_EQUAL, u64::MAX)` on the GPU via
-/// `queue.Wait(&fence, w.value)` instead of blocking the submission thread on the CPU.
-/// Returns `true` if the wait was handled on the GPU (or already satisfied).
-unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait) -> bool {
+/// `queue.Wait(&fence, w.value)` (or same-queue FIFO ordering) instead of blocking the
+/// submission thread on the CPU.
+unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64, u64)]) -> GpuWaitOutcome {
     if queue.is_null()
         || w.width != 8
         || w.comparison != D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32
         || w.mask != u64::MAX
         || w.value == 0
-        || w.after_write64
     {
-        return false;
+        return GpuWaitOutcome::FallbackCpu;
     }
-    let Some((dev, dev_raw, q_ty)) = queue_device_and_type(queue) else { return false };
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return false };
+    let Some((dev, dev_raw, q_ty)) = queue_device_and_type(queue) else { return GpuWaitOutcome::FallbackCpu };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return GpuWaitOutcome::FallbackCpu };
+    let q_raw = queue as usize;
+    let same_ty_queues = live_queues_of_type(q_ty);
 
-    let eligible = {
+    // Fast path: check eligibility and same-queue FIFO bypass before allocating a fence.
+    let pre = {
         let g = SYNC_CELLS.lock().unwrap();
-        g.as_ref().and_then(|m| m.get(&w.va)).is_some_and(|c| {
-            !c.non_monotonic
-                && c.recorded_max >= w.value
-                && !(c.submitted_max < w.value && c.recorded_last_queue == Some(queue as usize))
+        g.as_ref().and_then(|m| m.get(&w.va)).map(|c| {
+            (
+                c.non_monotonic,
+                c.recorded_max,
+                c.submitted_max,
+                c.submitted_queue,
+                c.recorded_last_queue,
+                c.recorded_list_type,
+            )
         })
     };
-    if !eligible {
-        return false;
+    let Some((non_mono, rec_max, sub_max, sub_q, rec_q, rec_ty)) = pre else {
+        return GpuWaitOutcome::FallbackCpu;
+    };
+    if non_mono || rec_max < w.value {
+        return GpuWaitOutcome::FallbackCpu;
     }
-    let Some(fence) = ensure_cell_fence(w.va, &dev, dev_raw) else { return false };
+    // Producer already submitted earlier on THIS EXACT queue: D3D12 FIFO executes it strictly
+    // before this list without needing a CPU wait or redundant queue.Wait.
+    if sub_max >= w.value && sub_q == Some(q_raw) {
+        return GpuWaitOutcome::Handled;
+    }
+    // Same-queue wait-before-signal guard: never block a queue waiting on an unsubmitted write
+    // destined for that same queue.
+    if sub_max < w.value && (rec_q == Some(q_raw) || (rec_q.is_none() && rec_ty == Some(q_ty) && same_ty_queues <= 1)) {
+        static SAME_Q_WARN: AtomicU64 = AtomicU64::new(0);
+        if once(&SAME_Q_WARN, 8) {
+            crate::xlog_warn!(
+                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} skipped to avoid same-queue wait-before-signal deadlock (queue_type={}, recorded={rec_max:#x}, submitted={sub_max:#x})",
+                w.va,
+                w.value,
+                q_ty.0
+            );
+        }
+        return GpuWaitOutcome::CycleSkip;
+    }
 
-    let (unsubmitted, rec_ty) = {
+    let Some(fence) = ensure_cell_fence(w.va, &dev, dev_raw) else { return GpuWaitOutcome::FallbackCpu };
+
+    let (unsubmitted, final_rec_ty) = {
         let mut g = SYNC_CELLS.lock().unwrap();
-        let Some(cell) = g.as_mut().and_then(|m| m.get_mut(&w.va)) else { return false };
-        if cell.non_monotonic || cell.device != dev_raw || cell.recorded_max < w.value {
-            return false;
-        }
-        if fence.GetCompletedValue() >= w.value {
-            // Fence already reached `w.value`: only trust it if CPU memory agrees (not reset/reused).
-            return w.is_satisfied();
-        }
-        let unsubmitted = cell.submitted_max < w.value;
-        if unsubmitted {
-            if cell.recorded_last_queue == Some(queue as usize) {
-                return false;
+        let Some(map) = g.as_mut() else { return GpuWaitOutcome::FallbackCpu };
+        let (cell_ok, cell_sub_max, cell_sub_q, cell_rec_q, cell_rec_ty) = match map.get_mut(&w.va) {
+            Some(cell) => {
+                if cell.non_monotonic || cell.device != dev_raw || cell.recorded_max < w.value {
+                    (false, 0, None, None, None)
+                } else {
+                    let completed = prune_completed_waits(cell);
+                    if completed >= w.value {
+                        // Fence already reached `w.value`: trust it if CPU memory agrees (not reset).
+                        return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
+                    }
+                    if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
+                        return GpuWaitOutcome::Handled;
+                    }
+                    (true, cell.submitted_max, cell.submitted_queue, cell.recorded_last_queue, cell.recorded_list_type)
+                }
             }
-            cell.unsubmitted_waits.push((w.value, Instant::now()));
-            UNSUBMITTED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+            None => (false, 0, None, None, None),
+        };
+        if !cell_ok {
+            return GpuWaitOutcome::FallbackCpu;
         }
-        (unsubmitted, cell.recorded_list_type)
+        let unsubmitted = cell_sub_max < w.value;
+        if unsubmitted && (cell_rec_q == Some(q_raw) || (cell_rec_q.is_none() && cell_rec_ty == Some(q_ty) && same_ty_queues <= 1)) {
+            return GpuWaitOutcome::CycleSkip;
+        }
+        let prod_q = cell_sub_q.or(cell_rec_q);
+        let prod_ty = cell_rec_ty.map(|t| t.0);
+        if would_create_gpu_cycle(map, q_raw, q_ty.0, prod_q, prod_ty, list_writes) {
+            static CYCLE_WARN: AtomicU64 = AtomicU64::new(0);
+            if once(&CYCLE_WARN, 16) {
+                crate::xlog_warn!(
+                    "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} skipped to break cross-queue cycle (queue_type={}, prod_ty={prod_ty:?}, after_write64={}, list_writes={})",
+                    w.va,
+                    w.value,
+                    q_ty.0,
+                    w.after_write64,
+                    list_writes.len()
+                );
+            }
+            return GpuWaitOutcome::CycleSkip;
+        }
+        if let Some(cell) = map.get_mut(&w.va) {
+            cell.armed_waits.push(ArmedGpuWait {
+                val: w.value,
+                waiting_queue: q_raw,
+                waiting_queue_ty: q_ty.0,
+                armed_at: Instant::now(),
+            });
+            ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+        }
+        (unsubmitted, cell_rec_ty)
     };
 
     if let Err(e) = q.Wait(&fence, w.value) {
-        if unsubmitted {
-            let mut g = SYNC_CELLS.lock().unwrap();
-            if let Some(cell) = g.as_mut().and_then(|m| m.get_mut(&w.va)) {
-                if let Some(pos) = cell.unsubmitted_waits.iter().rposition(|&(v, _)| v == w.value) {
-                    cell.unsubmitted_waits.remove(pos);
-                    UNSUBMITTED_GPU_WAITS.fetch_sub(1, Ordering::AcqRel);
-                }
+        let mut g = SYNC_CELLS.lock().unwrap();
+        if let Some(cell) = g.as_mut().and_then(|m| m.get_mut(&w.va)) {
+            if let Some(pos) = cell.armed_waits.iter().rposition(|aw| aw.val == w.value && aw.waiting_queue == q_raw) {
+                cell.armed_waits.remove(pos);
+                ARMED_GPU_WAITS.fetch_sub(1, Ordering::AcqRel);
             }
         }
         crate::xlog_warn!("D3D12.X: Wait64 GPU queue.Wait({:#x}, {:#x}) failed ({e}) – falling back to CPU wait", w.va, w.value);
-        return false;
+        return GpuWaitOutcome::FallbackCpu;
     }
 
+    wake_sync_watchdog();
     if unsubmitted {
-        wake_sync_watchdog();
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         if once(&LOGGED, 8) {
             crate::xlog_info!(
-                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} bridged to GPU queue.Wait (queue type {}, producer type {:?}; wait-before-signal)",
+                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} bridged to GPU queue.Wait (queue type {}, producer type {:?}; wait-before-signal, after_write64={})",
                 w.va,
                 w.value,
                 q_ty.0,
-                rec_ty.map(|t| t.0)
+                final_rec_ty.map(|t| t.0),
+                w.after_write64
             );
         }
     }
-    true
+    GpuWaitOutcome::Handled
 }
 
-unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait]) {
+unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
     let timeout = wait_timeout();
     let q_ty = queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0);
     for w in waits {
-        if w.is_satisfied() || try_gpu_wait(queue, w) {
+        if w.is_satisfied() {
             continue;
+        }
+        match try_gpu_wait(queue, w, list_writes) {
+            GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
+            GpuWaitOutcome::FallbackCpu => {}
         }
         if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
@@ -1373,27 +1534,27 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         submit(lists);
         return;
     }
-    let per_list: Vec<Vec<PendingWait>> = {
+    let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>)> = {
         let g = LISTS.lock().unwrap();
         lists
             .iter()
             .map(|&l| {
                 g.as_ref()
                     .and_then(|m| m.get(&(l as usize)))
-                    .map(|s| s.pending_waits.clone())
+                    .map(|s| (s.pending_waits.clone(), s.write64_signals.clone()))
                     .unwrap_or_default()
             })
             .collect()
     };
     let mut start = 0usize;
-    for (i, waits) in per_list.iter().enumerate() {
+    for (i, (waits, list_writes)) in per_list.iter().enumerate() {
         if waits.is_empty() || waits.iter().all(|w| w.is_satisfied()) {
             continue;
         }
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all_on(queue, waits);
+        wait_all_on(queue, waits, list_writes);
         start = i;
     }
     if start < lists.len() {
@@ -2012,7 +2173,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
     if !waits.is_empty() {
-        wait_all_on(q_raw, &waits);
+        wait_all_on(q_raw, &waits, &write64_signals);
     }
 
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
@@ -4423,6 +4584,100 @@ mod tests {
             on_release(dl_ptr as usize);
             on_release(cl_ptr as usize);
             SYNC_CELLS.lock().unwrap().as_mut().map(|m| m.remove(&va));
+        }
+    }
+
+    /// Cross-queue cycle detection (`DIRECT` waits on `COMPUTE` while `COMPUTE` is already
+    /// blocked on an unsubmitted write from `DIRECT`) and same-queue FIFO bypass must both
+    /// complete immediately without stalling CPU or hanging GPU.
+    #[test]
+    fn cross_queue_cycle_and_same_queue_fifo_do_not_deadlock() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let ca1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let ca2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let dl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
+            let cl1: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca1, None).unwrap();
+            let cl2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca2, None).unwrap();
+            let done_d: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done_c: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let cell_a = Box::new(AtomicU64::new(0));
+            let cell_b = Box::new(AtomicU64::new(0));
+            let va_a = &*cell_a as *const AtomicU64 as u64;
+            let va_b = &*cell_b as *const AtomicU64 as u64;
+
+            let (dl_ptr, cl1_ptr, cl2_ptr) = (dl.as_raw(), cl1.as_raw(), cl2.as_raw());
+            on_create(dl_ptr, da.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            on_create(cl1_ptr, ca1.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            on_create(cl2_ptr, ca2.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            // Fork-join cycle: DIRECT writes A then waits on B; COMPUTE1 waits on A then writes B;
+            // COMPUTE2 waits on B (same-queue FIFO after COMPUTE1) after writing something else.
+            note_write64_recorded(dl_ptr, va_a, 0x702);
+            wait64_x(dl_ptr, va_b, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x702, 1, 0);
+            wait64_x(cl1_ptr, va_a, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x702, 1, 0);
+            note_write64_recorded(cl1_ptr, va_b, 0x702);
+            wait64_x(cl2_ptr, va_b, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x702, 1, 0);
+            dl.Close().unwrap();
+            cl1.Close().unwrap();
+            cl2.Close().unwrap();
+
+            let t0 = Instant::now();
+            let ccl1: ID3D12CommandList = cl1.cast().unwrap();
+            execute_with_waits_on(cq.as_raw(), &[cl1_ptr], |chunk| {
+                cq.ExecuteCommandLists(&[Some(ccl1.clone())]);
+                signal_write64_fences(cq.as_raw(), chunk);
+            });
+            // Same-queue FIFO bypass: cl2 waits on va_b already submitted on cq.
+            let ccl2: ID3D12CommandList = cl2.cast().unwrap();
+            execute_with_waits_on(cq.as_raw(), &[cl2_ptr], |chunk| {
+                cq.ExecuteCommandLists(&[Some(ccl2.clone())]);
+                signal_write64_fences(cq.as_raw(), chunk);
+            });
+            cq.Signal(&done_c, 1).unwrap();
+
+            // Cycle breaking: dl writes va_a (which cq is blocked on) and waits on va_b (from cq).
+            // Must detect the cycle, skip hoisting va_b ahead of dl, submit dl immediately, and unblock BOTH queues!
+            let dcl: ID3D12CommandList = dl.cast().unwrap();
+            execute_with_waits_on(dq.as_raw(), &[dl_ptr], |chunk| {
+                dq.ExecuteCommandLists(&[Some(dcl.clone())]);
+                signal_write64_fences(dq.as_raw(), chunk);
+            });
+            dq.Signal(&done_d, 1).unwrap();
+
+            assert!(t0.elapsed().as_millis() < 500, "submits must not stall CPU (took {} ms)", t0.elapsed().as_millis());
+            crate::gpu::fence::wait(&done_d, 1, &dev, None, 2000).expect("DIRECT must finish without GPU deadlock");
+            crate::gpu::fence::wait(&done_c, 1, &dev, None, 2000).expect("COMPUTE must finish once DIRECT signals A");
+
+            on_release(dl_ptr as usize);
+            on_release(cl1_ptr as usize);
+            on_release(cl2_ptr as usize);
+            if let Some(m) = SYNC_CELLS.lock().unwrap().as_mut() {
+                m.remove(&va_a);
+                m.remove(&va_b);
+            }
         }
     }
 }
