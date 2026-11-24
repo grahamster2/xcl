@@ -470,6 +470,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   translator's compact form (programs of 20 000 instructions and more) and `XCL_PER_LANE` keep
   only the thread's 65 536 passes in all. `XCL_DISPATCH_LOOP_BUDGET=0` leaves every loop the
   thread's 65 536 passes, as before (to compare).
+- `XCL_DEFER_PRIVATE_HOME_TILES=1` keeps sparse physical pages used only for storage I/O
+  in CPU memory. When the title maps those pages at their home address, XCL allocates their
+  GPU tiles and uploads the stored data before the next GPU submission. Off by default.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
 - Title texture pages stay in video memory up to `XCL_VRAM_HEADROOM_MB` (default 1024) under the
   budget Windows gives the process; past it new page pools go in system memory, slower for the GPU

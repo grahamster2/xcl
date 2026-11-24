@@ -1170,6 +1170,14 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
+static INITIAL_CPU_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+pub(crate) fn rescan_cpu_backing(start: usize, bytes: usize) {
+    INITIAL_CPU_RANGES.lock().unwrap().push((start, bytes));
+}
+
+unsafe fn refresh_once(queue: *mut c_void) {
+
 /// `XCL_WATCH_HOT=0`: every look before a submit walks all the watched memory, as before.
 /// Otherwise a look takes the 2 MiB blocks written in the last few seconds only, and a thread of
 /// its own walks the rest in small steps and makes a block hot when it finds a written page there
@@ -1671,6 +1679,13 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
                 }
             }
         });
+        let watched = dirty.len();
+        if *crate::hle::kernelx::DEFER_PRIVATE_HOME_TILES {
+            let mut initial = INITIAL_CPU_RANGES.lock().unwrap();
+            for (start, size) in initial.drain(..) {
+                dirty.extend((start..start + size).step_by(page as usize));
+            }
+        }
         dirty.sort_unstable();
         dirty.dedup();
         dirty.len()
