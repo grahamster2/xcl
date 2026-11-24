@@ -471,6 +471,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   only the thread's 65 536 passes in all. `XCL_DISPATCH_LOOP_BUDGET=0` leaves every loop the
   thread's 65 536 passes, as before (to compare).
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
+- Title texture pages stay in video memory up to `XCL_VRAM_HEADROOM_MB` (default 1024) under the
+  budget Windows gives the process; past it new page pools go in system memory, slower for the GPU
+  to read but not over-committed.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
   pipeline bound at the last operation DRED saw complete and those bound after it, by their
