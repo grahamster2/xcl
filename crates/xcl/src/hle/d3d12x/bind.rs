@@ -100,6 +100,17 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
+/// The recording on `from` goes on in `to` (a list split at a wait: `list_x::split_before_wait`):
+/// its pipeline, root arguments and memory move with it.
+pub(super) fn move_state(from: *mut c_void, to: *mut c_void) {
+    let mut g = STATES.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    let s = m.remove(&(from as usize)).unwrap_or_default();
+    if let Some(old) = m.insert(to as usize, s) {
+        console_list::hold_until_reset(old.allocator, old.uma);
+    }
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {

@@ -208,6 +208,17 @@ pub fn rt0_resource(list: usize) -> Option<usize> {
     rtv_resource(h)
 }
 
+/// The recording on PC list `from` goes on in `to` (a list split at a wait): its render target 0
+/// with it (not one `to` had in an earlier recording).
+pub fn move_rt0(from: usize, to: usize) {
+    if let Some(m) = LISTS.lock().unwrap().as_mut() {
+        match m.get(&from).copied() {
+            Some(h) => m.insert(to, h),
+            None => m.remove(&to),
+        };
+    }
+}
+
 pub fn note_rt0(list: usize, handle: usize) {
     if !enabled() {
         return;

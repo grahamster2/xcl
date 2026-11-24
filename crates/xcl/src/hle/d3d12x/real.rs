@@ -5019,11 +5019,18 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into
-    let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
-        .iter()
-        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
-        .collect();
+    // console-shaped lists run as the PC lists they were translated into (a title list split
+    // at its waits: its parts, in order)
+    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    for &l in std::slice::from_raw_parts(lists, n as usize) {
+        match super::console_list::pc_list(l) {
+            Some(p) => mapped.push(p),
+            None => match super::title_list::backing(l) {
+                Some(b) => super::list_x::push_recording(b, &mut mapped),
+                None => mapped.push(l),
+            },
+        }
+    }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());

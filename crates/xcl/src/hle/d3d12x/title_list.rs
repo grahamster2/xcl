@@ -13,6 +13,12 @@
 //! (`mov rcx, [rcx + F_BACKING]` and on to the PC list's own vtable entry). QueryInterface
 //! hands out the console object again, Release frees it with the PC list, and
 //! ExecuteCommandLists runs the PC lists (`backing`).
+//!
+//! The PC list behind it can change while the title records: a wait recorded after other
+//! commands closes the PC list there and recording goes on in another one
+//! (`list_x::split_before_wait`). The PC list the object was made for keeps the title's
+//! references (`F_IDENTITY`), and each forwarded call is counted (`F_CALLS`) so a wait that
+//! comes first is told from one that follows other commands.
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -27,6 +33,10 @@ const LIST_SLOTS: usize = 600;
 const OBJECT_BYTES: usize = 0x3000;
 const ROOM: usize = 0x1000;
 const F_BACKING: usize = 0x2FF8;
+/// the PC list the object was made for: QueryInterface, AddRef and Release go to it
+const F_IDENTITY: usize = 0x2FF0;
+/// calls forwarded to the PC list (u64)
+const F_CALLS: usize = 0x2FE8;
 const F_WRITE: usize = 0x18;
 const F_DISPATCH_END: usize = 0x28;
 const F_END: usize = 0x30;
@@ -48,6 +58,7 @@ fn vtable() -> usize {
             *e = if trace { forward_traced(slot) } else { forward(slot) };
         }
         v[0] = qi as usize;
+        v[1] = add_ref as usize;
         v[2] = release as usize;
         v[9] = close as usize;
         Vtable(Box::leak(v.into_boxed_slice()).as_ptr() as usize)
@@ -55,9 +66,17 @@ fn vtable() -> usize {
     .0
 }
 
-/// `mov rcx, [rcx + F_BACKING]; mov rax, [rcx]; jmp [rax + slot * 8]`
+/// `inc qword [rcx + F_CALLS]`
+fn count_call() -> Vec<u8> {
+    let mut c = vec![0x48, 0xFF, 0x81];
+    c.extend_from_slice(&(F_CALLS as u32).to_le_bytes());
+    c
+}
+
+/// `inc qword [rcx + F_CALLS]; mov rcx, [rcx + F_BACKING]; mov rax, [rcx]; jmp [rax + slot * 8]`
 fn forward(slot: usize) -> usize {
-    let mut c = vec![0x48, 0x8B, 0x89];
+    let mut c = count_call();
+    c.extend_from_slice(&[0x48, 0x8B, 0x89]);
     c.extend_from_slice(&(F_BACKING as u32).to_le_bytes());
     c.extend_from_slice(&[0x48, 0x8B, 0x01, 0xFF, 0xA0]);
     c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
@@ -70,7 +89,8 @@ fn forward(slot: usize) -> usize {
 
 /// `forward` after `record(this, slot)` (argument registers, xmm0–3 kept)
 fn forward_traced(slot: usize) -> usize {
-    let mut c: Vec<u8> = vec![0x51, 0x52, 0x41, 0x50, 0x41, 0x51]; // push rcx, rdx, r8, r9
+    let mut c: Vec<u8> = count_call();
+    c.extend_from_slice(&[0x51, 0x52, 0x41, 0x50, 0x41, 0x51]); // push rcx, rdx, r8, r9
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]); // sub rsp, 0x68
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
         c.extend_from_slice(&[0xF3, 0x0F, 0x7F, reg, 0x24, off]); // movdqu [rsp+off], xmmN
@@ -135,7 +155,30 @@ pub unsafe fn wrap(pc: *mut c_void) -> *mut c_void {
         *(o.add(f) as *mut usize) = room;
     }
     *(o.add(F_BACKING) as *mut usize) = pc as usize;
+    *(o.add(F_IDENTITY) as *mut usize) = pc as usize;
+    super::list_x::note_wrapper(pc, o as *mut c_void);
     o as *mut c_void
+}
+
+/// Recording on console list object `list` goes on in PC list `pc`.
+pub(super) unsafe fn set_backing(list: *mut c_void, pc: *mut c_void) {
+    *((list as usize + F_BACKING) as *mut *mut c_void) = pc;
+}
+
+/// Calls forwarded to the PC lists behind console list object `list` so far.
+pub(super) unsafe fn calls(list: *mut c_void) -> u64 {
+    *((list as usize + F_CALLS) as *const u64)
+}
+
+/// What a forwarding thunk counts, for a test that calls the PC list's hook itself (calls from
+/// outside the title go to the PC methods: `guard`).
+#[cfg(test)]
+pub(super) unsafe fn count_call_for_test(list: *mut c_void) {
+    *((list as usize + F_CALLS) as *mut u64) += 1;
+}
+
+unsafe fn identity(this: *mut c_void) -> *mut c_void {
+    *((this as usize + F_IDENTITY) as *const *mut c_void)
 }
 
 /// The PC list behind a console list object (None: not one).
@@ -161,7 +204,7 @@ const CONSOLE_LIST_IIDS: [(u32, u16, u16, [u8; 8]); 2] = [
 ];
 
 unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+    let pc = identity(this);
     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 0));
     if !riid.is_null() && !ppv.is_null() {
         let g = &*riid;
@@ -179,13 +222,22 @@ unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mu
     hr
 }
 
-/// Release: the console object goes with the PC list's last reference.
+/// AddRef: on the PC list the object was made for (the one Release counts on).
+unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+    let pc = identity(this);
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 1));
+    f(pc)
+}
+
+/// Release: the console object goes with the PC list's last reference (and the PC lists XCL
+/// made for its recordings with it).
 unsafe extern "system" fn release(this: *mut c_void) -> u32 {
-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+    let pc = identity(this);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
         super::bind::forget(pc);
+        super::list_x::forget_split(this);
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n

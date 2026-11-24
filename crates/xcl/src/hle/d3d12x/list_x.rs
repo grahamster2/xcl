@@ -578,6 +578,10 @@ struct ListState {
     predication: Option<D3D12_PREDICATION_OP>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
+    /// the console list object (`title_list`) recording on this PC list (0: none)
+    wrapper: usize,
+    /// queries other than occlusion begun and not yet ended in this recording
+    open_queries: u32,
 }
 
 impl ListState {
@@ -1008,6 +1012,8 @@ struct SyncCell {
     non_monotonic: bool,
     /// All active GPU `queue.Wait(&fence, v)` calls on this cell not yet confirmed completed on GPU.
     armed_waits: Vec<ArmedGpuWait>,
+    /// waits on this cell skipped so far to break a cycle (`GpuWaitOutcome::CycleSkip`)
+    cycle_skips: u64,
 }
 
 // SAFETY: `ID3D12Fence` is a free-threaded COM object in D3D12.
@@ -1456,7 +1462,13 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             continue;
         }
         match try_gpu_wait(queue, w, list_writes) {
-            GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
+            GpuWaitOutcome::Handled => continue,
+            GpuWaitOutcome::CycleSkip => {
+                if let Some(c) = SYNC_CELLS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&w.va)) {
+                    c.cycle_skips += 1;
+                }
+                continue;
+            }
             GpuWaitOutcome::FallbackCpu => {}
         }
         if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
@@ -1565,6 +1577,259 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
 #[cfg(test)]
 pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMut(&[*mut c_void])) {
     execute_with_waits_on(std::ptr::null_mut(), lists, submit);
+}
+
+// ---------------------------------------------------------------------------------------
+// a recording split at its waits
+// ---------------------------------------------------------------------------------------
+//
+// On the console a Wait*BitValueX holds the GPU where it was recorded: what the list recorded
+// before it runs first. A PC list cannot wait in the middle, and the waits are checked before
+// the list is submitted – so a list [wait A][write B][wait C][write D] could not write B until
+// C held, and a list on another queue that waits on B before it writes C never ran (a retail
+// title's compute and direct lists at world start, #539). So a title list (`title_list`) is
+// closed at a wait that follows other commands and its recording goes on in another PC list:
+// each part is submitted after the waits recorded before it, and its writes are signalled
+// before the next part's waits (`execute_with_waits_on` over the parts, in order).
+
+/// The parts of a console list object's recording.
+#[derive(Default)]
+struct Split {
+    /// closed PC lists of the open recording, in order (the object's backing records the last)
+    segments: Vec<*mut c_void>,
+    /// PC lists XCL made for this object, and those of them not in use
+    owned: Vec<*mut c_void>,
+    free: Vec<*mut c_void>,
+    /// forwarded calls when the current part began, and its waits before any other command
+    start_calls: u64,
+    leading_waits: u64,
+}
+
+// SAFETY: the PC lists are free-threaded COM objects, used by the thread recording the list.
+unsafe impl Send for Split {}
+
+static SPLITS: Mutex<Option<HashMap<usize, Split>>> = Mutex::new(None);
+/// spare allocators PC lists for splits are made with (device, type) – they are reset onto the
+/// title's allocator before they record
+static SPARE_ALLOCATORS: Mutex<Vec<(usize, i32, ID3D12CommandAllocator)>> = Mutex::new(Vec::new());
+
+fn split_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPLIT_WAITS").map_or(true, |v| v != "0"))
+}
+
+/// PC list `list` records for console list object `wrapper` (`title_list::wrap`).
+pub(super) fn note_wrapper(list: *mut c_void, wrapper: *mut c_void) {
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        s.wrapper = wrapper as usize;
+    } else {
+        return;
+    }
+    SPLITS.lock().unwrap().get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default();
+}
+
+fn wrapper_of(list: *mut c_void) -> usize {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.wrapper)
+}
+
+/// The PC lists to submit for the recording whose current part is `list`, in order (appended).
+pub(super) fn push_recording(list: *mut c_void, out: &mut Vec<*mut c_void>) {
+    let w = wrapper_of(list);
+    if w != 0 {
+        if let Some(sp) = SPLITS.lock().unwrap().as_ref().and_then(|m| m.get(&w)) {
+            out.extend_from_slice(&sp.segments);
+        }
+    }
+    out.push(list);
+}
+
+/// The recording of `wrapper` starts anew (Reset, KickoffX): its closed parts are free again.
+fn recycle_segments(wrapper: usize) {
+    let segments = {
+        let mut g = SPLITS.lock().unwrap();
+        let Some(sp) = g.as_mut().and_then(|m| m.get_mut(&wrapper)) else { return };
+        sp.start_calls = unsafe { super::title_list::calls(wrapper as *mut c_void) };
+        sp.leading_waits = 0;
+        let segments = std::mem::take(&mut sp.segments);
+        sp.free.extend_from_slice(&segments);
+        segments
+    };
+    for l in segments {
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(l as usize))) {
+            s.clear_waits();
+            s.clear_sparse_writes();
+            s.clear_write64_signals();
+            s.cpu_writes.clear();
+            s.written_ranges.clear();
+        }
+        super::title_textures::list_reset(l as usize);
+    }
+}
+
+/// The console list object is gone: the PC lists XCL made for it go too.
+pub(super) unsafe fn forget_split(wrapper: *mut c_void) {
+    let sp = SPLITS.lock().unwrap().as_mut().and_then(|m| m.remove(&(wrapper as usize)));
+    for l in sp.map(|s| s.owned).unwrap_or_default() {
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = transmute_copy(&*(*(l as *const *const usize)).add(2));
+        release(l);
+    }
+}
+
+/// A PC list of type `ty` on the device of `like`, closed, for a recording to go on in.
+unsafe fn spare_list(like: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
+    let dev = device_of(like)?;
+    let dev_raw = dev.as_raw() as usize;
+    // (held while the list is made and closed: an allocator is not free-threaded)
+    let mut g = SPARE_ALLOCATORS.lock().unwrap();
+    let alloc = match g.iter().find(|(d, t, _)| *d == dev_raw && *t == ty.0) {
+        Some((_, _, a)) => a.clone(),
+        None => {
+            let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+            g.push((dev_raw, ty.0, a.clone()));
+            a
+        }
+    };
+    // the device's own CreateCommandList (the adopted device's slot makes a console object)
+    let f: unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT =
+        if real::is_adopted(dev.as_raw()) { transmute_copy(&real::orig_fn(dev.as_raw(), 12)) } else { transmute_copy(&*(*(dev.as_raw() as *const *const usize)).add(12)) };
+    let mut out = std::ptr::null_mut();
+    if f(dev.as_raw(), 0, ty, alloc.as_raw(), std::ptr::null_mut(), &ID3D12GraphicsCommandList::IID, &mut out).is_err() || out.is_null() {
+        return None;
+    }
+    let close: unsafe extern "system" fn(*mut c_void) -> i32 = transmute_copy(&*(*(out as *const *const usize)).add(PC_CLOSE));
+    close(out);
+    drop(g);
+    real::adopt(out, real::Kind::CommandList);
+    on_create(out, alloc.as_raw() as usize, 0, ty);
+    Some(out)
+}
+
+/// `list` (recording for console list object `wrapper`) records a wait: when it follows other
+/// commands, `list` is closed there and the recording goes on in another PC list, which is
+/// returned (the wait goes to it). None: the wait stays on `list`.
+unsafe fn split_before_wait(list: *mut c_void, wrapper: usize) -> Option<*mut c_void> {
+    static SPLIT: AtomicU64 = AtomicU64::new(0);
+    static ERR: AtomicU64 = AtomicU64::new(0);
+    static NO_SPARE: AtomicBool = AtomicBool::new(false);
+    if !split_enabled() || NO_SPARE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let calls = super::title_list::calls(wrapper as *mut c_void);
+    {
+        let mut g = SPLITS.lock().unwrap();
+        let sp = g.get_or_insert_with(HashMap::new).entry(wrapper).or_default();
+        // (this wait's own call is counted)
+        if calls <= sp.start_calls + sp.leading_waits + 1 {
+            sp.leading_waits += 1;
+            return None;
+        }
+    }
+    let (alloc, ty, open_queries) = {
+        let g = LISTS.lock().unwrap();
+        let s = g.as_ref()?.get(&(list as usize))?;
+        (s.allocator, s.list_type?, s.open_queries)
+    };
+    // (a query other than occlusion open across the wait: the PC list cannot close there)
+    if alloc == 0 || open_queries > 0 || (ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        return None;
+    }
+    let reused = SPLITS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&wrapper)).and_then(|sp| sp.free.pop());
+    let next = match reused {
+        Some(l) => l,
+        None => {
+            let Some(l) = spare_list(list, ty) else {
+                NO_SPARE.store(true, Ordering::Relaxed);
+                warn(&ERR, "Wait*BitValueX", format_args!("no PC list to go on recording in – lists are no longer split at their waits"));
+                return None;
+            };
+            SPLITS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&wrapper)).map(|sp| sp.owned.push(l));
+            l
+        }
+    };
+
+    // the PC list cannot close with a query or predication open: as KickoffX does
+    let (active_query, pred_buf_raw) = {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.as_mut()?.get_mut(&(list as usize))?;
+        let pb = if std::mem::replace(&mut s.pred_in_state, false) { s.pred_buf.as_ref().map(|r| r.as_raw() as usize) } else { None };
+        (s.occlusion.end_active_early(), pb)
+    };
+    if let Some(((h, i), qty)) = active_query {
+        pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
+    }
+    if let Some(pb) = pred_buf_raw {
+        transition(list, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+    }
+    let ext = *(list as *const usize);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
+    real::preserve_vtable(list, ext);
+    if hr < 0 {
+        // the recording is broken already: the title's own Close reports it, and nothing that
+        // did not close is submitted
+        warn(&ERR, "Wait*BitValueX", format_args!("Close before the wait failed ({hr:#x}) – not split"));
+        SPLITS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&wrapper)).map(|sp| sp.free.push(next));
+        return None;
+    }
+    // what the recording carries on with; the rest (its waits, writes, signals) stays with `list`
+    let (bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, occlusion, bindings, written_ranges, last_queue) = {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.as_mut()?.get_mut(&(list as usize))?;
+        (
+            s.bound_pso,
+            s.depth_bias,
+            s.index_buffer,
+            s.depth_bounds,
+            s.predication,
+            s.pred_buf.take(),
+            std::mem::take(&mut s.occlusion),
+            s.bindings.clone(),
+            s.written_ranges.clone(),
+            s.last_queue,
+        )
+    };
+    // (not yet this object's: its Reset must not start the recording anew)
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next as usize))) {
+        s.wrapper = 0;
+    }
+    let hr = reset_x(next, alloc, bound_pso);
+    if hr < 0 {
+        // `list` is closed and nothing records the rest: the title's calls and its Close fail on
+        // it, as on a list it could not record
+        warn(&ERR, "Wait*BitValueX", format_args!("Reset of the next part failed ({hr:#x})"));
+        SPLITS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&wrapper)).map(|sp| sp.free.push(next));
+        return None;
+    }
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next as usize))) {
+        s.list_type = Some(ty);
+        s.last_queue = last_queue;
+        s.depth_bias = depth_bias;
+        s.index_buffer = index_buffer;
+        s.depth_bounds = depth_bounds;
+        s.predication = predication;
+        s.pred_buf = pred_buf.clone();
+        s.occlusion = occlusion;
+        s.bindings = bindings;
+        s.written_ranges = written_ranges;
+        s.wrapper = wrapper;
+    }
+    super::bind::move_state(list, next);
+    super::present::move_rt0(list as usize, next as usize);
+    let dev_raw = device_of(next).map_or(0, |d| d.as_raw() as usize);
+    restore_recording(next, dev_raw, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf.map(|r| r.as_raw() as usize));
+    {
+        let mut g = SPLITS.lock().unwrap();
+        if let Some(sp) = g.as_mut().and_then(|m| m.get_mut(&wrapper)) {
+            sp.segments.push(list);
+            sp.start_calls = calls - 1;
+            sp.leading_waits = 1;
+        }
+    }
+    super::title_list::set_backing(wrapper as *mut c_void, next);
+    let n = SPLIT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_power_of_two() && n >= 1024 {
+        crate::xlog_info!("D3D12.X: a list waits after other commands: split there, the part before submitted first ({n} splits so far)");
+    }
+    Some(next)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1865,11 +2130,18 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if comparison == D3D12_COMPARISON_FUNC_NEVER.0 as u32 {
         return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
     }
+    let wrapper = {
+        let g = LISTS.lock().unwrap();
+        let s = g.as_ref().and_then(|m| m.get(&(list as usize)));
+        if s.is_some_and(|s| s.has_prior_write(va, n)) {
+            return;
+        }
+        s.map_or(0, |s| s.wrapper)
+    };
+    // after other commands: the recording goes on in another PC list from here
+    let list = if wrapper != 0 { split_before_wait(list, wrapper).unwrap_or(list) } else { list };
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-    if s.has_prior_write(va, n) {
-        return;
-    }
     let after_write64 = !s.write64_signals.is_empty();
     s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64 });
 }
@@ -2172,12 +2444,26 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
+    type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
+    // the parts recorded before this one's waits (a list split at a wait) run first
+    let wrapper = wrapper_of(this);
+    let mut parts = Vec::new();
+    push_recording(this, &mut parts);
+    parts.pop();
+    if !parts.is_empty() {
+        execute_with_waits_on(q_raw, &parts, |chunk| {
+            exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+            signal_write64_fences(q_raw, chunk);
+            readback_sparse_writes(q_raw, chunk);
+            cpu_writes_after(q_raw, chunk);
+            super::title_textures::submitted(chunk);
+        });
+    }
     if !waits.is_empty() {
         wait_all_on(q_raw, &waits, &write64_signals);
     }
 
-    type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
-    let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
     signal_write64_pairs(q_raw, &write64_signals);
@@ -2198,6 +2484,25 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    if wrapper != 0 {
+        recycle_segments(wrapper);
+    }
+    restore_recording(this, dev_raw, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf);
+}
+
+/// After a PC Reset that goes on with a recording (KickoffX, a list split at a wait): set again
+/// what the recording had set that Reset cleared.
+#[allow(clippy::too_many_arguments)]
+unsafe fn restore_recording(
+    this: *mut c_void,
+    dev_raw: usize,
+    bound_pso: usize,
+    depth_bias: Option<DepthBias>,
+    index_buffer: Option<D3D12_INDEX_BUFFER_VIEW>,
+    depth_bounds: Option<(f32, f32)>,
+    predication: Option<D3D12_PREDICATION_OP>,
+    pred_buf: Option<usize>,
+) {
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(this, &b);
@@ -2747,6 +3052,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.index_buffer = None;
         s.depth_bounds = None;
         s.occlusion = Occlusion::default();
+        s.open_queries = 0;
         s.written_ranges.clear();
         s.clear_sparse_writes();
         s.clear_write64_signals();
@@ -2755,8 +3061,13 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
-        s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+        (s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE), s.wrapper)
     };
+    let (is_bundle, wrapper) = is_bundle;
+    // a new recording: the parts of the last one (a list split at its waits) are free again
+    if wrapper != 0 {
+        recycle_segments(wrapper);
+    }
     super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
@@ -3130,6 +3441,8 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
         if let Some(m) = VISIBLE.lock().unwrap().as_mut() {
             m.remove(&(heap, index));
         }
+    } else if ty != D3D12_QUERY_TYPE_TIMESTAMP {
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().open_queries += 1;
     }
     pc::<QueryFn>(this, PC_BEGIN_QUERY)(this, heap, ty, index);
 }
@@ -3149,6 +3462,10 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
             let v = if ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION { 1 } else { VISIBLE_SAMPLES };
             VISIBLE.lock().unwrap().get_or_insert_with(HashMap::new).insert((heap, index), v);
             return;
+        }
+    } else if ty != D3D12_QUERY_TYPE_TIMESTAMP {
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            s.open_queries = s.open_queries.saturating_sub(1);
         }
     }
     pc::<QueryFn>(this, PC_END_QUERY)(this, heap, ty, index);
@@ -4515,6 +4832,7 @@ mod tests {
     fn cross_queue_wait64_before_signal_does_not_deadlock_submit_thread() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::*;
+        let _one = GPU_WAIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
 
         unsafe {
             let mut dev: Option<ID3D12Device> = None;
@@ -4594,6 +4912,7 @@ mod tests {
     fn cross_queue_cycle_and_same_queue_fifo_do_not_deadlock() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::*;
+        let _one = GPU_WAIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
 
         unsafe {
             let mut dev: Option<ID3D12Device> = None;
@@ -4678,6 +4997,217 @@ mod tests {
                 m.remove(&va_a);
                 m.remove(&va_b);
             }
+        }
+    }
+
+    /// Tests that arm GPU waits run one at a time: the cycle check looks at every armed wait.
+    static GPU_WAIT_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Forget the sync cells of addresses `vas` (their armed waits first, so the count drops).
+    unsafe fn forget_cells(vas: &[u64]) {
+        if let Some(m) = SYNC_CELLS.lock().unwrap().as_mut() {
+            for va in vas {
+                if let Some(mut c) = m.remove(va) {
+                    ARMED_GPU_WAITS.fetch_sub(c.armed_waits.len(), Ordering::AcqRel);
+                    c.armed_waits.clear();
+                }
+            }
+        }
+    }
+
+    /// A D3D12 device for the split tests (WARP without a GPU), or None.
+    unsafe fn split_test_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp = CreateDXGIFactory1::<IDXGIFactory4>().ok()?.EnumWarpAdapter::<IDXGIAdapter>().ok()?;
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+        }
+        dev
+    }
+
+    /// A title list as `device_x::create_list` makes it: an adopted PC list, tracked, wrapped.
+    unsafe fn split_test_list(dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE, alloc: &ID3D12CommandAllocator) -> *mut c_void {
+        let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, alloc, None).unwrap();
+        let raw = l.into_raw();
+        real::adopt(raw, real::Kind::CommandList);
+        on_create(raw, alloc.as_raw() as usize, 0, ty);
+        super::super::bind::reset(raw, alloc.as_raw() as usize, 0);
+        super::super::title_list::wrap(raw)
+    }
+
+    /// The title's call of console slot `slot` on list object `o`.
+    unsafe fn split_test_slot<F: Copy>(o: *mut c_void, slot: usize) -> F {
+        transmute_copy(&*(*(o as *const *const usize)).add(slot))
+    }
+
+    type CloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
+    type RefFn = unsafe extern "system" fn(*mut c_void) -> u32;
+
+    /// The title's call of a console method on list object `o`: counted by its thunk, run by
+    /// the hook on the PC list behind it (a call from outside the title would go to the PC
+    /// method: `guard`).
+    unsafe fn split_test_call(o: *mut c_void) -> *mut c_void {
+        super::super::title_list::count_call_for_test(o);
+        super::super::title_list::backing(o).unwrap()
+    }
+
+    unsafe fn split_test_wait(o: *mut c_void, va: u64, value: u64) {
+        wait64_x(split_test_call(o), va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value, 1, 0);
+    }
+
+    unsafe fn split_test_write(o: *mut c_void, va: u64, value: u64) {
+        write64_bottom_x(split_test_call(o), va, value, 0, 0);
+    }
+
+    /// The PC lists `o`'s recording runs as, with each part's (waits, Write64 signals).
+    fn split_test_parts(o: *mut c_void) -> Vec<(*mut c_void, Vec<u64>, Vec<u64>)> {
+        let mut parts = Vec::new();
+        push_recording(super::super::title_list::backing(o).unwrap(), &mut parts);
+        let g = LISTS.lock().unwrap();
+        parts
+            .into_iter()
+            .map(|l| {
+                let s = g.as_ref().unwrap().get(&(l as usize)).unwrap();
+                (l, s.pending_waits.iter().map(|w| w.va).collect(), s.write64_signals.iter().map(|w| w.0).collect())
+            })
+            .collect()
+    }
+
+    /// Submit `lists` on `q` as `q_execute_command_lists` does.
+    unsafe fn split_test_submit(q: &ID3D12CommandQueue, lists: &[*mut c_void]) {
+        execute_with_waits_on(q.as_raw(), lists, |chunk| {
+            (Interface::vtable(q).ExecuteCommandLists)(q.as_raw(), chunk.len() as u32, chunk.as_ptr() as _);
+            signal_write64_fences(q.as_raw(), chunk);
+        });
+    }
+
+    /// The trace of #539: a compute list records [wait A][write B][wait C][write D] and a direct
+    /// list [wait B][write C]. Checked before the whole compute list, its wait on C would have
+    /// to come before its write of B, which the direct list waits on before it writes C. Split at
+    /// the wait on C, each part waits where it was recorded: both waits run on the GPU (none is
+    /// skipped as a cycle) and both queues finish without the watchdog releasing a wait.
+    #[test]
+    fn a_list_is_split_at_a_wait_after_other_commands_and_runs_without_a_cycle() {
+        if !split_enabled() {
+            return;
+        }
+        let _one = GPU_WAIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = split_test_device() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let done_d: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done_c: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let cells: Box<[AtomicU64; 4]> = Box::new([const { AtomicU64::new(0) }; 4]);
+            let [a, b, c, d] = [0, 1, 2, 3].map(|i| &cells[i] as *const AtomicU64 as u64);
+            cells[0].store(1, Ordering::Relaxed); // A holds already
+
+            let cw = split_test_list(&dev, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca);
+            let dw = split_test_list(&dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &da);
+            split_test_wait(cw, a, 1);
+            split_test_write(cw, b, 0x10);
+            split_test_wait(cw, c, 0x10);
+            split_test_write(cw, d, 0x10);
+            split_test_wait(dw, b, 0x10);
+            split_test_write(dw, c, 0x10);
+            assert!(split_test_slot::<CloseFn>(cw, 9)(cw) >= 0 && split_test_slot::<CloseFn>(dw, 9)(dw) >= 0);
+
+            // the compute list in two parts, each with the waits recorded before it; the direct
+            // list's wait comes first: one part
+            let parts = split_test_parts(cw);
+            assert_eq!(parts.len(), 2, "split at the wait on C");
+            assert_eq!((parts[0].1.clone(), parts[0].2.clone()), (vec![a], vec![b]));
+            assert_eq!((parts[1].1.clone(), parts[1].2.clone()), (vec![c], vec![d]));
+            assert_eq!(split_test_parts(dw).len(), 1, "a wait before any other command does not split");
+
+            // the GPU's writes reach the memory the waits read (here: when their fences complete)
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let stop = stop.clone();
+                let writes = [(b, 0x10u64), (c, 0x10), (d, 0x10)];
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        for &(va, v) in &writes {
+                            let f = SYNC_CELLS.lock().unwrap().as_ref().and_then(|m| m.get(&va)).and_then(|c| c.fence.clone());
+                            if f.is_some_and(|f| f.GetCompletedValue() >= v) {
+                                (*(va as *const AtomicU64)).store(v, Ordering::Release);
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            };
+            let t0 = Instant::now();
+            let cparts: Vec<*mut c_void> = parts.iter().map(|p| p.0).collect();
+            split_test_submit(&cq, &cparts);
+            cq.Signal(&done_c, 1).unwrap();
+            split_test_submit(&dq, &[super::super::title_list::backing(dw).unwrap()]);
+            dq.Signal(&done_d, 1).unwrap();
+            assert!(t0.elapsed() < Duration::from_millis(500), "the submits must not wait on the CPU ({:?})", t0.elapsed());
+            let skips = |va: u64| SYNC_CELLS.lock().unwrap().as_ref().and_then(|m| m.get(&va)).map_or(0, |c| c.cycle_skips);
+            assert_eq!((skips(b), skips(c)), (0, 0), "no wait may be skipped as a cycle");
+            // within the watchdog's 1 s from the first submit: no wait was released on the CPU
+            let left = || 900u32.saturating_sub(t0.elapsed().as_millis() as u32);
+            let finished = crate::gpu::fence::wait(&done_c, 1, &dev, None, left()).and_then(|_| crate::gpu::fence::wait(&done_d, 1, &dev, None, left()));
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+            finished.expect("both queues must finish");
+
+            assert_eq!(split_test_slot::<RefFn>(cw, 2)(cw), 0);
+            assert_eq!(split_test_slot::<RefFn>(dw, 2)(dw), 0);
+            forget_cells(&[a, b, c, d]);
+        }
+    }
+
+    /// A new recording (Reset) goes on in the PC lists the last one was split into, and they go
+    /// with the list object; the title's references stay on the PC list it was made for.
+    #[test]
+    fn split_lists_are_reused_after_reset_and_released_with_the_list() {
+        if !split_enabled() {
+            return;
+        }
+        unsafe {
+            let Some(dev) = split_test_device() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let cells: Box<[AtomicU64; 2]> = Box::new([const { AtomicU64::new(0) }; 2]);
+            let [a, b] = [0, 1].map(|i| &cells[i] as *const AtomicU64 as u64);
+            let cw = split_test_list(&dev, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca);
+            let first = super::super::title_list::backing(cw).unwrap();
+            let record = || {
+                split_test_write(cw, a, 0x20);
+                split_test_wait(cw, b, 0x20);
+                split_test_write(cw, a, 0x21);
+                assert!(split_test_slot::<CloseFn>(cw, 9)(cw) >= 0);
+            };
+            let owned = |o: *mut c_void| SPLITS.lock().unwrap().as_ref().and_then(|m| m.get(&(o as usize))).map(|sp| sp.owned.clone()).unwrap_or_default();
+            record();
+            assert_eq!(split_test_parts(cw).len(), 2);
+            let made = owned(cw);
+            assert_eq!(made.len(), 1);
+            // AddRef / Release count on the list the object was made for
+            assert_eq!(split_test_slot::<RefFn>(cw, 1)(cw), 2);
+            assert_eq!(split_test_slot::<RefFn>(cw, 2)(cw), 1);
+
+            ca.Reset().unwrap();
+            assert!(reset_x(split_test_call(cw), ca.as_raw() as usize, 0) >= 0);
+            assert_eq!(split_test_parts(cw).len(), 1, "a Reset starts a recording of one part");
+            record();
+            assert_eq!(split_test_parts(cw).len(), 2);
+            assert_eq!(owned(cw), made, "the second recording makes no new PC list (it goes on in the one the first was split from)");
+
+            assert_eq!(split_test_slot::<RefFn>(cw, 2)(cw), 0);
+            assert!(!has_list_state(first as usize) && !has_list_state(made[0] as usize), "the PC lists go with the list object");
+            forget_cells(&[a]);
         }
     }
 }
