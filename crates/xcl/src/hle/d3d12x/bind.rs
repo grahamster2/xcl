@@ -229,6 +229,87 @@ pub(super) fn note_root_changing_signature(sig: usize) {
     ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
 }
 
+/// command signature → (byte stride, bytes of one command's arguments), for `indirect_count`
+static SIGNATURES: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+/// command signatures whose command is a dispatch (the skip counters)
+static DISPATCH_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// Command signature `sig` was made with `stride` and the PC argument descs `args` ([type,
+/// three words of its union]). One with an argument whose size is not known here is not
+/// checked (`indirect_count` passes its calls on as they are).
+pub(super) fn note_signature(sig: usize, stride: u32, args: &[[u32; 4]]) {
+    let bytes = args.iter().try_fold(0u32, |sum, a| Some(sum + argument_bytes(a)?));
+    let mut g = SIGNATURES.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    match bytes {
+        Some(b) if b > 0 && stride >= b => m.insert(sig, (stride, b)),
+        _ => m.remove(&sig),
+    };
+    let mut d = DISPATCH_SIGNATURES.lock().unwrap();
+    let d = d.get_or_insert_with(Default::default);
+    if args.last().is_some_and(|a| a[0] == 2) {
+        d.insert(sig);
+    } else {
+        d.remove(&sig);
+    }
+}
+
+/// Bytes a PC indirect argument takes in a command (None: a type not handled here)
+fn argument_bytes(a: &[u32; 4]) -> Option<u32> {
+    Some(match a[0] {
+        0 => 16,                   // DRAW
+        1 => 20,                   // DRAW_INDEXED
+        2 | 10 => 12,              // DISPATCH, DISPATCH_MESH
+        3 | 4 => 16,               // VERTEX_BUFFER_VIEW, INDEX_BUFFER_VIEW
+        5 => 4 * a[3],             // CONSTANT: Num32BitValuesToSet
+        6..=8 => 8,                // CBV / SRV / UAV: a GPU address
+        _ => return None,
+    })
+}
+
+/// How many commands an ExecuteIndirect with signature `sig` may run: `max`, but no more than fit
+/// in its argument buffer (`args_len` bytes) from `args_off` – the PC reads past the buffer
+/// otherwise; a title's `max` is an upper bound it sizes generously, its buffer the real one.
+/// `count` is the count buffer (its bytes, the offset of the count). Err: the call would read
+/// outside its buffers and is not made. A signature not seen at its creation: `max` as it is.
+fn indirect_count(sig: usize, max: u32, args_len: u64, args_off: u64, count: Option<(u64, u64)>) -> Result<u32, &'static str> {
+    let Some((stride, command)) = SIGNATURES.lock().unwrap().as_ref().and_then(|m| m.get(&sig).copied()) else {
+        return Ok(max);
+    };
+    if args_off % 4 != 0 {
+        return Err("the argument offset is not a multiple of 4");
+    }
+    if let Some((len, off)) = count {
+        if off % 4 != 0 || off.checked_add(4).is_none_or(|end| end > len) {
+            return Err("the count is outside its buffer");
+        }
+    }
+    let room = args_len.saturating_sub(args_off);
+    let fit = if room < command as u64 { 0 } else { (room - command as u64) / stride as u64 + 1 };
+    Ok((max as u64).min(fit) as u32)
+}
+
+/// The bytes the GPU can read from offset 0 of buffer `res` on: a console buffer in a committed
+/// window of unified memory reaches to the window's end (a title may read past the buffer it
+/// names into the memory after it – mapped, as on the console); any other buffer, its size.
+unsafe fn readable_bytes(res: usize) -> Option<u64> {
+    if let (Some((p, _)), Some(u)) = (super::real::console_buffer(res), crate::gpu::uma::get()) {
+        if u.is_committed(p) {
+            let (base, size) = u.window(u.window_of(p)?);
+            return Some((base + size - p) as u64 + super::real::buffer_delta(res));
+        }
+    }
+    buffer_bytes(res)
+}
+
+/// The bytes of buffer `res` (None: not a buffer, or unknown).
+unsafe fn buffer_bytes(res: usize) -> Option<u64> {
+    let raw = res as *mut c_void;
+    let r = ID3D12Resource::from_raw_borrowed(&raw)?;
+    let d = r.GetDesc();
+    (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER).then_some(d.Width)
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -237,7 +318,39 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
-    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    let (args_off, count_off) = (args_off.saturating_add(super::real::buffer_delta(args)), count_off.saturating_add(super::real::buffer_delta(count_buf)));
+    // no more commands than the argument buffer holds, and a count inside its buffer
+    let max = if max == 0 {
+        max
+    } else {
+        let count_at = if count_buf == 0 { None } else { readable_bytes(count_buf).map(|len| (len, count_off)) };
+        let extent = readable_bytes(args);
+        let checked = match extent {
+            Some(len) => indirect_count(sig, max, len, args_off, count_at),
+            None => Ok(max),
+        };
+        match checked {
+            Ok(n) if n > 0 => {
+                if n < max {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                        crate::xlog_warn!("D3D12.X: ExecuteIndirect of up to {max} commands runs {n}: no more fit in its argument buffer ({:?} bytes from offset {args_off:#x})", extent);
+                    }
+                }
+                n
+            }
+            _ => {
+                let dispatch = DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|d| d.contains(&sig));
+                count(if dispatch { DISPATCHES_SKIPPED } else { DRAWS_SKIPPED });
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    let why = checked.err().unwrap_or("no command fits in its argument buffer");
+                    crate::xlog_warn!("D3D12.X: ExecuteIndirect skipped: {why} (argument buffer {:?} bytes, offset {args_off:#x}; count at {count_off:#x})", extent);
+                }
+                return;
+            }
+        }
+    };
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
         // the list may hold XCL's ABI root signature from a translated draw before it – the PC
@@ -958,6 +1071,51 @@ mod tests {
         pso_async::released(built);
         pso_async::released(failed);
         assert!(!pso_async::is_pending(building));
+    }
+
+    /// An ExecuteIndirect runs no more commands than its argument buffer holds, whatever count
+    /// the title passes, and is not made when its count lies outside the count buffer.
+    #[test]
+    fn indirect_commands_stay_inside_their_buffers() {
+        let (dispatch, constants_then_draw, unknown) = (0x7E57_7001usize, 0x7E57_7002usize, 0x7E57_7003usize);
+        // a dispatch (12 bytes) every 16 bytes
+        note_signature(dispatch, 16, &[[2, 0, 0, 0]]);
+        // 3 root constants, then an indexed draw: 12 + 20 bytes every 32
+        note_signature(constants_then_draw, 32, &[[5, 0, 0, 3], [1, 0, 0, 0]]);
+        // dispatch rays: not sized here, not checked
+        note_signature(unknown, 128, &[[9, 0, 0, 0]]);
+
+        // a garbage count: as many as fit (64 bytes: 4 records; the last needs only 12)
+        assert_eq!(indirect_count(dispatch, u32::MAX, 64, 0, None), Ok(4));
+        assert_eq!(indirect_count(dispatch, u32::MAX, 60, 0, None), Ok(4));
+        assert_eq!(indirect_count(dispatch, u32::MAX, 59, 0, None), Ok(3));
+        // a count within the buffer stays
+        assert_eq!(indirect_count(dispatch, 2, 64, 0, None), Ok(2));
+        // records counted from the offset; past the end: none
+        assert_eq!(indirect_count(dispatch, 100, 64, 32, None), Ok(2));
+        assert_eq!(indirect_count(dispatch, 100, 64, 64, None), Ok(0));
+        assert_eq!(indirect_count(dispatch, 100, 64, 1 << 40, None), Ok(0));
+        assert_eq!(indirect_count(constants_then_draw, 10, 100, 0, None), Ok(3));
+        // the offset must be a multiple of 4
+        assert!(indirect_count(dispatch, 1, 64, 2, None).is_err());
+        // the count must lie in its buffer: a buffer smaller than the offset + 4 is no count
+        assert_eq!(indirect_count(dispatch, 4, 64, 0, Some((16, 12))), Ok(4));
+        assert!(indirect_count(dispatch, 4, 64, 0, Some((16, 16))).is_err());
+        assert!(indirect_count(dispatch, 4, 64, 0, Some((2, 0))).is_err());
+        assert!(indirect_count(dispatch, 4, 64, 0, Some((u64::MAX, u64::MAX - 1))).is_err());
+        assert!(indirect_count(dispatch, 4, 64, 0, Some((64, 6))).is_err());
+        // signatures not sized here, or not seen: as the title asks
+        assert_eq!(indirect_count(unknown, 7, 0, 0, None), Ok(7));
+        assert_eq!(indirect_count(0x7E57_70FF, 7, 0, 0, None), Ok(7));
+        // an incrementing constant's bytes in the buffer are not certain: not checked
+        note_signature(0x7E57_7004, 16, &[[11, 0, 0, 0], [2, 0, 0, 0]]);
+        assert_eq!(indirect_count(0x7E57_7004, 7, 0, 0, None), Ok(7));
+        // the skip counters tell dispatches from draws by the signature's command
+        assert!(DISPATCH_SIGNATURES.lock().unwrap().as_ref().unwrap().contains(&dispatch));
+        assert!(!DISPATCH_SIGNATURES.lock().unwrap().as_ref().unwrap().contains(&constants_then_draw));
+        // a stride smaller than its arguments is not a signature the PC makes: not checked
+        note_signature(dispatch, 8, &[[2, 0, 0, 0]]);
+        assert_eq!(indirect_count(dispatch, 9, 16, 0, None), Ok(9));
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
