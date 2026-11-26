@@ -1224,6 +1224,55 @@ unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
     }
 }
 
+/// Why a two-pass ExecuteIndirect was skipped when its arguments are in a title GPU view.
+const ARGS_IN_GPU_VIEW: &str = "its arguments are in the title's GPU-only view";
+
+/// What to tell about ExecuteIndirect arguments in a title GPU view.
+#[derive(Debug, PartialEq)]
+enum ViewHint {
+    /// not in a GPU view, a window covers it, or there is no UMA layout: nothing to add
+    None,
+    /// the layout has no view windows: `XCL_UMA_WINDOWS=16` gives it some
+    NoViewWindows,
+    /// the layout has view windows, but this view got none of them
+    ViewWindowsFull,
+}
+
+/// The hint for an address that `paired` with a CPU view (a title GPU view), that a window
+/// `covered`, in a layout of `view_windows` view windows (None: no UMA).
+fn view_hint(paired: bool, covered: bool, view_windows: Option<usize>) -> ViewHint {
+    match (paired && !covered, view_windows) {
+        (true, Some(0)) => ViewHint::NoViewWindows,
+        (true, Some(_)) => ViewHint::ViewWindowsFull,
+        _ => ViewHint::None,
+    }
+}
+
+fn view_hint_at(va: usize) -> ViewHint {
+    let paired = super::super::kernelx::mirrors::source(va).is_some();
+    let uma = crate::gpu::uma::get();
+    let covered = uma.is_some_and(|u| u.is_view(va) || u.contains(va));
+    view_hint(paired, covered, uma.map(|u| (0..64).filter(|&k| u.is_view_window(k)).count()))
+}
+
+/// For an ExecuteIndirect whose arguments resource `args` is not a console buffer: whether it
+/// lies in a title GPU view no window covers (`view_hint`). That one is warned about here, with
+/// a running count at powers of two.
+fn note_args_in_gpu_view(args: usize) -> bool {
+    let hint = super::real::title_address(args).map_or(ViewHint::None, view_hint_at);
+    let what = match hint {
+        ViewHint::None => return false,
+        ViewHint::NoViewWindows => "the current UMA layout has no view windows. Run with XCL_UMA_WINDOWS=16 and XCL_HEAP_WINDOWS=1",
+        ViewHint::ViewWindowsFull => "the GPU view windows are full (none left for this view)",
+    };
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped (#{n}): its arguments live in the title's GPU-only view, and {what}");
+    }
+    true
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -1288,7 +1337,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 let commands = max as usize * msig.byte_stride as usize;
                 let src = match commands_at {
                     Some((p, n)) if commands <= n => p,
-                    _ => return Err("its arguments are not in a console buffer in unified memory".into()),
+                    Some((_, n)) => return Err(format!("its {commands} B of commands do not fit the {n} B left of its console buffer in unified memory")),
+                    None if note_args_in_gpu_view(args) => return Err(ARGS_IN_GPU_VIEW.into()),
+                    None => return Err("its arguments are not in a console buffer in unified memory".into()),
                 };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let (res_buf, res_va, cap) = ensure_res_buffer(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record))?;
@@ -1331,7 +1382,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     mesh_work(this, super::targets::SKIPPED);
                     count(DRAWS_SKIPPED);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    // (the GPU-view case has its own counted warning, `note_args_in_gpu_view`)
+                    if e != ARGS_IN_GPU_VIEW && N.fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {e}");
                     }
                 }
@@ -2455,6 +2507,39 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// What the hint says for ExecuteIndirect arguments: only for an address in a title GPU view
+    /// that no window covers, and by whether the layout has view windows.
+    #[test]
+    fn gpu_view_hint_depends_on_the_layout() {
+        assert_eq!(view_hint(true, false, Some(0)), ViewHint::NoViewWindows);
+        assert_eq!(view_hint(true, false, Some(6)), ViewHint::ViewWindowsFull);
+        assert_eq!(view_hint(true, false, None), ViewHint::None, "no UMA");
+        assert_eq!(view_hint(true, true, Some(0)), ViewHint::None, "a window covers it");
+        assert_eq!(view_hint(true, true, Some(6)), ViewHint::None);
+        assert_eq!(view_hint(false, false, Some(0)), ViewHint::None, "not a GPU view");
+    }
+
+    /// Addresses are told apart as GPU view or not by the `mirrors` pairing.
+    #[test]
+    fn gpu_view_addresses_are_paired_ones() {
+        use super::super::super::kernelx::mirrors;
+        // (addresses far above anything Windows hands out: only the bookkeeping is tested)
+        let (a, b, size) = (0x7040_0000_0000usize, 0x7046_0000_0000usize, 0x6_0000_0000usize);
+        struct Release(usize, usize);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                mirrors::released(self.0);
+                mirrors::released(self.1);
+            }
+        }
+        let _g = Release(a, b);
+        mirrors::reserved(a, size, 0x2040_2000, 0x04);
+        mirrors::reserved(b, size, 0x2040_2000, 0x801);
+        assert!(mirrors::source(b + 0x1_0000).is_some(), "in the GPU view");
+        assert!(mirrors::source(a + 0x1_0000).is_none(), "the CPU view is no GPU view");
+        assert!(mirrors::source(b + size).is_none(), "past its end");
+    }
 
     /// Counts D3D12 takes are dispatched as they are; more than 65 535 in X with 1 in Y are
     /// folded into Y with the console's count kept (a retail game's 72 512 × 1 × 1); others past
