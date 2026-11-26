@@ -423,7 +423,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
         // the driver pipeline `resolve_wait` returned.)
-        if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
+        // A call replayed at the submit (`AT_SUBMIT`) was put off only because it was a console
+        // compute call; the title may have released the stand-in since, which forgets the
+        // `CONSOLE_COMPUTE` marker, so the marker is not asked for then.
+        if signature_dispatches(sig)
+            && (AT_SUBMIT.get() || super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso))
+        {
             skip(DISPATCHES_SKIPPED, unbuilt_cause(raw_pso, refused));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1851,19 +1856,15 @@ void main(uint t : SV_GroupIndex) {
 
         // the default: the call waits for the build, which then fails. The refusal is what is
         // reported, not the build failure the wait ended with
+        // (checked on the state the wait leaves, not by racing a build against the call: the
+        // build is over before `unbuilt_cause` is asked)
         let waited = 0x7270_0004usize;
-        pso_async::submit(
-            waited,
-            true,
-            Box::new(|| {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                0
-            }),
-        );
+        pso_async::submit(waited, true, Box::new(|| 0));
         real::register_console_compute_for_test(waited);
-        reset(list, 0x7270_0100, waited);
-        expect_skip(Cause::BuildingNoWrapper, || unsafe { dispatch(list, 1, 1, 1) });
+        assert_eq!(pso_async::resolve_wait(waited), waited, "the build failed");
         assert_eq!(pso_async::build_state(waited), pso_async::BuildState::Failed);
+        assert_eq!(unbuilt_cause(waited, None), Cause::BuildFailed);
+        expect_skip(Cause::BuildingNoWrapper, || skip(DISPATCHES_SKIPPED, unbuilt_cause(waited, Some(Cause::BuildingNoWrapper))));
 
         // a console compute pipeline nothing builds: no translation; put off to a submit and
         // released by then: released
@@ -1876,12 +1877,24 @@ void main(uint t : SV_GroupIndex) {
         let _ = std::panic::catch_unwind(|| at_submit(|| panic!("a panic in a put-off call")));
         assert!(!AT_SUBMIT.get(), "a panic does not leave the thread marked");
 
+        // a put-off ExecuteIndirect dispatch whose stand-in the title released before the
+        // submit: the release forgot the console marker, and the call is still that dispatch,
+        // not a PC ExecuteIndirect
+        let gone_indirect = 0x7270_0005usize;
+        real::register_console_compute_for_test(gone_indirect);
+        real::forget_pso_for_test(gone_indirect);
+        assert!(!real::is_console_compute(gone_indirect));
+        reset(list, 0x7270_0100, gone_indirect);
+        let calls = unsafe { (*(list as *const FakeAdoptedList)).execute_indirect_calls.load(Ordering::Relaxed) };
+        expect_skip(Cause::Released, || at_submit(|| unsafe { execute_indirect(list, sig_dispatch, 1, 0, 0, 0, 0) }));
+        assert_eq!(unsafe { (*(list as *const FakeAdoptedList)).execute_indirect_calls.load(Ordering::Relaxed) }, calls, "no PC ExecuteIndirect");
+
         // a put-off dispatch that could not be recorded
         expect_skip(Cause::Dropped, dispatch_dropped);
 
         forget(list);
         note_signature_dispatches(sig_dispatch, false);
-        for p in [failed, building, waited, gone] {
+        for p in [failed, building, waited, gone, gone_indirect] {
             let _ = pso_async::released(p);
             real::forget_pso_for_test(p);
         }
