@@ -2094,9 +2094,14 @@ const HOMES_AHEAD: usize = 1024;
 /// already (another page may be mapped at that address, given up in this call), or that cannot
 /// be, is left to `home_again`.
 unsafe fn commit_homes_ahead(away: &mut Away, ats: impl Iterator<Item = usize>) {
+    let mut page_of: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut homes: Vec<usize> = ats
-        .filter_map(|at| away.at.get(&at).filter(|_| !lazy::is_marked(at)).and_then(|&p| page_home(p)))
-        .filter(|&h| lazy_home(h) && !away.gone.contains(&h))
+        .filter_map(|at| away.at.get(&at).filter(|_| !lazy::is_marked(at)).and_then(|&p| page_home(p).map(|h| (p, h))))
+        .filter(|&(_, h)| lazy_home(h) && !away.gone.contains(&h))
+        .map(|(p, h)| {
+            page_of.insert(h, p);
+            h
+        })
         .collect();
     homes.sort_unstable();
     homes.dedup();
@@ -2123,7 +2128,18 @@ unsafe fn commit_homes_ahead(away: &mut Away, ats: impl Iterator<Item = usize>) 
                 && !mem::VirtualAlloc(first as *const c_void, last - first, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null()
             {
                 if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(first)) {
-                    crate::hle::d3d12x::sparse::committed(first, last - first);
+                    if *DEFER_PRIVATE_HOME_TILES {
+                        // as `home_again`: no GPU tile until the page is exposed
+                        for h in (first..last).step_by(PHYS_PAGE) {
+                            if let Some(&pg) = page_of.get(&h) {
+                                if away.sparse_homes.get(&pg) != Some(&SparseHome::Exposed) {
+                                    away.sparse_homes.insert(pg, SparseHome::CpuOnly);
+                                }
+                            }
+                        }
+                    } else {
+                        crate::hle::d3d12x::sparse::committed(first, last - first);
+                    }
                 }
                 #[cfg(test)]
                 tests::HOME_RUNS.with(|c| c.set(c.get() + 1));
