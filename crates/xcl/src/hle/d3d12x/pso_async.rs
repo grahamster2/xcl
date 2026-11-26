@@ -119,6 +119,13 @@ pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted()))
 }
 
+/// This thread is a worker building a pipeline a bind waited for and went on without
+/// (`resolve_within`): nobody waits for it now, but the title's draws or dispatches with it are
+/// left out until it is built (`real::huge_compile_turn`).
+pub(super) fn build_is_late() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.late.load(Ordering::Acquire)))
+}
+
 /// This thread is a backlog worker building a pipeline nobody has used yet: its huge driver
 /// compile gives its turn to any other (`real::big_compile_turn`).
 pub(super) fn build_is_ahead() -> bool {

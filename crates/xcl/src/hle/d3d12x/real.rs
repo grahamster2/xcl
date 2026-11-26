@@ -4709,7 +4709,17 @@ pub(super) fn huge_compile_turn(bytes: usize) -> SlotGuard {
     if !slots.ahead && super::pso_async::build_is_ahead() {
         super::pso_async::build_parks();
     }
-    big_compile_turn(slots, || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, super::pso_async::build_is_ahead)
+    big_compile_turn(slots, || big_compile_commit_free(headroom_for(bytes, super::pso_async::build_is_late())), super::pso_async::build_is_wanted, super::pso_async::build_is_ahead)
+}
+
+/// The commit headroom a huge compile of `bytes` waits for (`big_compile_headroom`), halved for
+/// one whose pipeline the title already uses and draws without (`late`): with a wait budget no
+/// build stays wanted, and on a machine short of commit every one of them then stood at the gate
+/// for the full headroom while the frames that needed them were left out (33 builds held, one for
+/// 129 s, with 4.5 GB of commit free and 44,596 draws skipped meanwhile).
+fn headroom_for(bytes: usize, late: bool) -> u64 {
+    let full = big_compile_headroom(bytes);
+    if late { full / 2 } else { full }
 }
 
 /// Commit headroom a big driver compile waits for: 3 GB for the class that starts at
@@ -4734,6 +4744,18 @@ mod big_compile_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_late_build_waits_for_half_the_headroom() {
+        let bytes = huge_pso_bytes();
+        assert_eq!(headroom_for(bytes, false), big_compile_headroom(bytes));
+        assert_eq!(headroom_for(bytes, true), big_compile_headroom(bytes) / 2);
+        // (the class's floor: 3 GB, 1.5 GB for a late one - what one such compile takes)
+        assert_eq!(headroom_for(1 << 20, false), 3 << 30);
+        assert_eq!(headroom_for(1 << 20, true), 3 << 29);
+        // a giant program keeps a headroom that grows with it
+        assert_eq!(headroom_for(32 << 20, true), (32u64 << 20) * 256);
+    }
 
     #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
