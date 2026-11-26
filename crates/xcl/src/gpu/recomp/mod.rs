@@ -52,6 +52,7 @@
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
 pub mod cfg;
+pub mod code_loads;
 pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
@@ -219,6 +220,13 @@ pub const IO_UMA_BASE_HI: usize = 112;
 /// the lanes past it out of EXEC. Written by D3D12.X and read by both compute backends.
 /// (113 is left for the group-limit slot of #1428.)
 pub const IO_THREAD_LIMIT: [usize; 3] = [114, 115, 116];
+/// High dword `s_getpc_b64` gives a program that has constant data in its code region
+/// (`Options::rodata`) and a load that may or may not read it (`code_loads::CodeLoad::Maybe`),
+/// with any number of memory windows: its code addresses are then above every
+/// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
+/// told from a load of the title's memory at the same low dword (descriptor tables in window 0,
+/// any memory with one window, which ignores the high dword).
+pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -545,11 +553,17 @@ pub struct Options {
     pub structured: bool,
     /// force the console-sized form used when an indirect dispatch cannot scale GPU arguments
     pub no_remap: bool,
+    /// constant data the console compiler put in the code region after the program
+    /// (`xbox::Fssm::rodata`): (address from the program's start, dwords). The program finds
+    /// it with `s_getpc_b64` and reads it with `s_load` / `global_load`; the title's memory does
+    /// not hold the code, so a load at a code address in one of these ranges takes the dwords
+    /// from the shader (`CODE_ADDRESS_HI`)
+    pub rodata: Vec<(u32, Vec<u32>)>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, no_remap: false }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, no_remap: false, rodata: Vec::new() }
     }
 }
 
@@ -1678,6 +1692,9 @@ fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
+    if !opt.rodata.is_empty() {
+        em.code_loads = code_loads::code_loads(&insts);
+    }
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits

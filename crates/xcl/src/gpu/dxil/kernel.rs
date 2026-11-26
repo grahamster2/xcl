@@ -9,7 +9,7 @@
 //! `recomp::CsInterface`): user SGPRs from `io`, then the enabled group ids
 //! and TG_SIZE; v0..v2 = thread id in the group; results only through memory.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::cfg::{Cfg, Term};
 use super::container::Stage;
@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 9;
+pub const TRANSLATOR_VERSION: u32 = 10;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -178,6 +178,28 @@ fn translate_entry(
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
 ) -> Result<Kernel, String> {
+    translate_entry_with(code, o, entry, compact, nest, Vec::new())
+}
+
+/// A program at `entry` with the constant data the console compiler put after it in the code
+/// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
+/// compiler's offset is its address, and dword loads at such an address read the table the
+/// module carries (`Lw::rodata_loads`). Otherwise as `translate_full` / `translate_compute` /
+/// `translate_mesh` / `translate_vertex` / `translate_pixel` / `translate_geometry`.
+pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let compact = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { compact_mode() } else { None };
+    let o = if matches!(entry, Entry::Geometry(_)) { KernelOptions { wave64: true, ..o } } else { o };
+    translate_entry_with(code, o, entry, compact, None, rodata.to_vec())
+}
+
+fn translate_entry_with(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
@@ -189,7 +211,7 @@ fn translate_entry(
         .spawn(move || {
             #[cfg(test)]
             super::module::NO_SELECT_FOLD.with(|c| c.set(no_select_fold));
-            translate_on_this_thread(&code, o, entry, compact, nest)
+            translate_on_this_thread(&code, o, entry, compact, nest, rodata)
         })
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
@@ -220,6 +242,7 @@ fn translate_on_this_thread(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
+    rodata: Vec<(u32, Vec<u32>)>,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
@@ -251,6 +274,10 @@ fn translate_on_this_thread(
         return Err("graphics whole-wave reduction needs the HLSL path".into());
     }
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    if !rodata.is_empty() {
+        lw.code_loads = crate::gpu::recomp::code_loads::code_loads(&cfg.insts);
+    }
+    lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -566,6 +593,9 @@ impl Lw {
             heap_flat: reads_heap_flat(entry, heap_mem.is_some(), o.mem_windows),
             res,
             fmt_table: None,
+            rodata: Vec::new(),
+            rodata_table: None,
+            code_loads: BTreeMap::new(),
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
             reload: None,
