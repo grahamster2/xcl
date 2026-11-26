@@ -200,6 +200,47 @@ fn take_sparse_in(
     Some(at)
 }
 
+/// `take_sparse_in` from the top down: the highest `align`-aligned block of `size` bytes
+/// (`size <= WINDOW`) in `[lo_bound, hi_bound)` that does not straddle a 4 GiB window boundary.
+fn take_sparse_top_in(
+    g: &mut (BTreeMap<usize, usize>, BTreeMap<usize, usize>),
+    lo_bound: usize,
+    hi_bound: usize,
+    size: usize,
+    align: usize,
+) -> Option<usize> {
+    if lo_bound >= hi_bound || size == 0 || size > WINDOW {
+        return None;
+    }
+    let last_fit = |(&o, &l): (&usize, &usize)| {
+        let lo = o.max(lo_bound);
+        let hi = o.saturating_add(l).min(hi_bound);
+        let mut top = hi;
+        loop {
+            let at = top.checked_sub(size)? & !(align - 1);
+            if at < lo {
+                return None;
+            }
+            if at / WINDOW == (at + size - 1) / WINDOW {
+                return Some((o, l, at));
+            }
+            // it straddles: end it at the window boundary inside it
+            top = (at + size - 1) / WINDOW * WINDOW;
+        }
+    };
+    // (free ranges are disjoint: from the first one ending at or below lo_bound on, none reaches it)
+    let (start, len, at) = g.0.range(..hi_bound).rev().take_while(|(&o, &l)| o + l > lo_bound).find_map(last_fit)?;
+    g.0.remove(&start);
+    if at > start {
+        g.0.insert(start, at - start);
+    }
+    if at + size < start + len {
+        g.0.insert(at + size, start + len - (at + size));
+    }
+    g.1.insert(at, size);
+    Some(at)
+}
+
 /// The reservation of `take_sparse_in` at `p` goes back to the free ranges (merged with its
 /// neighbours): its bytes.
 fn give_back(g: &mut (BTreeMap<usize, usize>, BTreeMap<usize, usize>), p: usize) -> Option<usize> {
@@ -609,16 +650,20 @@ impl Uma {
         }
     }
 
-    /// `sparse_alloc` for memory shaders never address with 32 bits: windows 1+ first (as
-    /// `sparse_reserve`), window 0 only when they have no room – it stands for the console's low
-    /// 4 GiB, where a title's own descriptor heaps must lie (`console_heap::title_memory`).
+    /// `sparse_alloc` for memory shaders never address with 32 bits: windows 1+ first, from the
+    /// top of the last one down, window 0 only when they have no room – it stands for the
+    /// console's low 4 GiB, where a title's own descriptor heaps must lie
+    /// (`console_heap::title_memory`). From the top, so the title's reservations
+    /// (`sparse_reserve`, first fit from window 1 up) keep one free run between: a retail game's
+    /// page pool of 63632 pages (3.9 GiB, across windows 1 and 2) found no room once physical
+    /// page homes had gone first-fit into windows 1+, and was plain memory.
     /// Above a window the same as `sparse_alloc`.
     pub fn sparse_alloc_above(&self, size: usize, align: usize) -> Option<(usize, usize)> {
         if size <= WINDOW && self.has_sparse() {
             let size = size.max(1).checked_next_multiple_of(GRAIN)?;
             let align = align.max(GRAIN).checked_next_power_of_two()?;
             let above_0 = (self.base + WINDOW).max(self.title_sparse_start());
-            if let Some(at) = take_sparse_in(&mut self.sparse_free.lock().unwrap(), above_0, self.sparse_end(), size, align, true) {
+            if let Some(at) = take_sparse_top_in(&mut self.sparse_free.lock().unwrap(), above_0, self.sparse_end(), size, align) {
                 return Some((at, size));
             }
         }
@@ -633,6 +678,21 @@ impl Uma {
         let g = self.sparse_free.lock().unwrap();
         let runs = g.0.iter().map(|(&o, &l)| (o.max(lo), (o + l).min(hi))).filter(|&(a, e)| a < e).map(|(a, e)| e - a);
         runs.fold((0, 0), |(all, big), n| (all + n, big.max(n)))
+    }
+
+    /// Diagnostic: the free bytes of all the sparse windows the title may take (not
+    /// `desc_range`), in all and the largest run (runs go across window boundaries).
+    pub fn sparse_free_all(&self) -> (usize, usize) {
+        let (lo, hi) = (self.title_sparse_start(), self.sparse_end());
+        let g = self.sparse_free.lock().unwrap();
+        let runs = g.0.iter().map(|(&o, &l)| (o.max(lo), (o + l).min(hi))).filter(|&(a, e)| a < e).map(|(a, e)| e - a);
+        runs.fold((0, 0), |(all, big), n| (all + n, big.max(n)))
+    }
+
+    /// The bytes of the sparse windows the title's memory may take (all of them less
+    /// `desc_range`): no reservation larger than this ever fits there.
+    pub fn sparse_title_capacity(&self) -> usize {
+        self.sparse_end().saturating_sub(self.title_sparse_start())
     }
 
     /// The bytes of the sparse reservation starting at `p` (it is gone after this).
@@ -1511,21 +1571,48 @@ mod tests {
         let u = Uma::for_runtime_windows(16 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
         let b = u.base();
         let (h, n) = u.sparse_alloc_above(664 << 20, GRAIN).unwrap();
-        assert_eq!((h, n), (b + WINDOW, 664 << 20));
+        assert_eq!((h, n), (b + 3 * WINDOW - (664 << 20), 664 << 20), "the top of the last sparse window");
         // window 0 still has the room a 38 MB view heap needs after 2.9 GB of GPU heaps
         let heaps = u.sparse_alloc(2892 << 20, 2 << 20).unwrap();
         assert_eq!(u.window_of(heaps.0), Some(0));
         assert_eq!(u.sparse_alloc(0x260_0000, GRAIN).map(|(a, _)| u.window_of(a)), Some(Some(0)));
         let used = (2892 << 20) + 0x260_0000;
         assert_eq!(u.sparse_free_in(0), (WINDOW - 0x2001_0000 - used, WINDOW - 0x2020_0000 - used));
-        assert_eq!(u.sparse_free_in(1), (WINDOW - (664 << 20), WINDOW - (664 << 20)));
-        // windows 1..2 full: window 0
+        assert_eq!(u.sparse_free_in(1), (WINDOW, WINDOW));
+        assert_eq!(u.sparse_free_in(2), (WINDOW - (664 << 20), WINDOW - (664 << 20)));
+        // the rest of windows 1..2 is one run (with the end of window 0 before it): a title
+        // reservation of all of it fits
+        assert_eq!(u.sparse_free_all().1, 2 * WINDOW - (664 << 20) + u.sparse_free_in(0).1);
         let rest = u.sparse_reserve(2 * WINDOW - (664 << 20)).unwrap();
-        assert_eq!(u.window_of(rest), Some(1));
+        assert_eq!(rest, b + WINDOW);
+        // windows 1..2 full: window 0
         let (w0, _) = u.sparse_alloc_above(GRAIN, GRAIN).unwrap();
         assert_eq!(u.window_of(w0), Some(0));
         assert!(w0 >= u.title_sparse_start(), "never the descriptor headroom");
         assert!(u.sparse_alloc_above(WINDOW + GRAIN, GRAIN).is_none(), "no room above a window");
+    }
+
+    /// From the top down, a block of `sparse_alloc_above` still never straddles a window
+    /// boundary: one that would ends at the boundary instead, and with no room on either side
+    /// it goes to window 0.
+    #[test]
+    fn sparse_alloc_above_from_the_top_keeps_within_a_window() {
+        let u = Uma::for_runtime_windows(16 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let b = u.base();
+        let title = u.sparse_reserve(WINDOW - (100 << 20)).unwrap();
+        assert_eq!(title, b + WINDOW);
+        let (top, _) = u.sparse_alloc_above(WINDOW - (50 << 20), GRAIN).unwrap();
+        assert_eq!(top, b + 2 * WINDOW + (50 << 20));
+        // free above window 0: the last 100 MB of window 1 and the first 50 MB of window 2
+        assert_eq!((u.sparse_free_in(1), u.sparse_free_in(2)), ((100 << 20, 100 << 20), (50 << 20, 50 << 20)));
+        let (at, n) = u.sparse_alloc_above(80 << 20, 1 << 20).unwrap();
+        assert_eq!((at, n), (b + 2 * WINDOW - (80 << 20), 80 << 20), "ends at the boundary");
+        let (w0, _) = u.sparse_alloc_above(60 << 20, GRAIN).unwrap();
+        assert_eq!(u.window_of(w0), Some(0), "20 MB in window 1 and 50 MB in window 2 hold no 60 MB");
+        for p in [w0, at, top, title] {
+            assert!(u.sparse_release(p).is_some());
+        }
+        assert_eq!(u.sparse_free_all(), (u.sparse_title_capacity(), u.sparse_title_capacity()));
     }
 
     /// With 16 windows nothing of Windows' lands in the aperture: shaders read every window of
