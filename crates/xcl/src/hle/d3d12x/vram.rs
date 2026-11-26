@@ -1389,6 +1389,14 @@ pub(super) fn has_unmapped_levels(resource: usize) -> bool {
     PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).and_then(|t| t.levels.as_ref()).is_some_and(|l| l.groups.iter().any(|g| !g.3)))
 }
 
+/// Of a texture with lazy levels: whether each of its levels has pages, level by level. None: any
+/// other texture.
+pub(super) fn mapped_levels(resource: usize) -> Option<Vec<bool>> {
+    let g = PAGES.lock().unwrap();
+    let l = g.values().flatten().find_map(|p| p.targets.get(&resource).and_then(|t| t.levels.as_ref()))?;
+    Some((0..l.groups.len()).flat_map(|k| l.levels_of(k).map(move |_| l.groups[k].3)).collect())
+}
+
 /// XG and the PC driver pack volume mip tails differently. Keep these textures on the
 /// detile/upload path rather than mapping title pages directly onto the driver's packed tail.
 fn console_has_packed_3d_mips(desc: &D3D12_RESOURCE_DESC) -> bool {

@@ -127,6 +127,28 @@ pub(super) fn unknown(known: &Known) {
     k.forgotten += 1;
 }
 
+/// What the pages of `parts` (from, to) of a texture at `src` hold is not taken for what its PC
+/// texture holds: their next write goes up. The others stay known. When nothing is kept now (or a
+/// comparison has them out), nothing is kept of the comparison either: the next write sends all.
+pub(super) fn unknown_parts(known: &Known, src: usize, size: usize, parts: &[(usize, usize)]) {
+    let mut k = known.lock().unwrap();
+    if k.hashes.len() != pages_of(src, size) {
+        k.hashes.clear();
+        k.forgotten += 1;
+        return;
+    }
+    let first = src / PAGE;
+    for &(from, to) in parts {
+        let to = to.min(size);
+        if from >= to {
+            continue;
+        }
+        for p in (src + from) / PAGE..(src + to).div_ceil(PAGE) {
+            k.hashes[p - first] = 0;
+        }
+    }
+}
+
 /// `parts` of a texture (from, to) are not what its PC texture holds (a mapping changed under
 /// them): they go up again with its next upload, with no comparison (`take_again`).
 pub(super) fn stale(known: &Known, parts: Vec<(usize, usize)>) {
@@ -931,6 +953,35 @@ mod tests {
         let both = || unsafe { changed(&[Written { src: at, size: 300 * PAGE, dirty: &pages, known: &a, pages: None }, Written { src: at + 300 * PAGE, size: 290 * PAGE, dirty: &pages, known: &b, pages: None }], true).0 };
         assert_eq!(both(), vec![Change::Parts(vec![(0, 300 * PAGE)]), Change::Parts(vec![(0, 290 * PAGE)])]);
         assert_eq!(both(), vec![Change::None, Change::None]);
+    }
+
+    /// The pages of some bytes of a texture are not known (a level with no video memory): their
+    /// next write goes up and the others' stay known. With nothing known, or the hashes out for a
+    /// comparison, nothing is kept: the next write sends all of it.
+    #[test]
+    fn pages_of_some_bytes_are_not_known() {
+        let mut mem = vec![0u8; 12 * PAGE];
+        let base = (mem.as_mut_ptr() as usize).next_multiple_of(PAGE);
+        let (src, size) = (base + PAGE + 0x800, 7 * PAGE);
+        let known: Known = Default::default();
+        let dirty: Vec<usize> = (0..11).map(|k| base + k * PAGE).collect();
+        let look = |dirty: &[usize]| unsafe { changed(&[Written { src, size, dirty, known: &known, pages: None }], true).0 };
+        all_sent(&known, src, size);
+        assert_eq!(look(&dirty), vec![Change::Parts(vec![(0, size)])]);
+        assert_eq!(look(&dirty), vec![Change::None]);
+        // bytes on the fourth and fifth pages of the texture (one of them in part)
+        unknown_parts(&known, src, size, &[(3 * PAGE, 3 * PAGE + 0x900)]);
+        assert_eq!(look(&dirty), vec![Change::Parts(vec![(2 * PAGE + 0x800, 4 * PAGE + 0x800)])]);
+        assert_eq!(look(&dirty), vec![Change::None]);
+        // (nothing past the texture)
+        unknown_parts(&known, src, size, &[(size, size + PAGE), (2 * PAGE, 2 * PAGE)]);
+        assert_eq!(look(&dirty), vec![Change::None]);
+        let forgotten = known.lock().unwrap().forgotten;
+        let out = std::mem::take(&mut known.lock().unwrap().hashes);
+        unknown_parts(&known, src, size, &[(0, 1)]);
+        assert_eq!(known.lock().unwrap().forgotten, forgotten + 1, "a comparison going on is not kept");
+        drop(out);
+        assert_eq!(look(&dirty), vec![Change::All]);
     }
 
     /// The default adapter's device, else WARP's (`XCL_ADAPTER=warp`: WARP's); None, the test
