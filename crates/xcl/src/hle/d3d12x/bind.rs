@@ -1226,6 +1226,39 @@ pub(super) fn want_root_views(layout: Option<&Layout>, args: &[u8], path: super:
     }
 }
 
+/// A dispatch or draw of `pso` (0: shaders not known) with the root arguments `args` (packed by
+/// `layout`): when its shaders may store to memory (`real::pso_may_store`), what they could
+/// write by address in a sparse window gets its video memory before the list runs
+/// (`sparse::gpu_write`, `XCL_SPARSE_LAZY`): its root views (CBV, SRV and UAV alike: a console
+/// shader stores through any buffer address it has) and the 64-bit addresses among its root
+/// constants. A view in a descriptor table asks when it is made, if a UAV (`real::uav_writes`).
+pub(super) fn shader_store_writes(layout: Option<&Layout>, args: &[u8], pso: usize) {
+    if !super::sparse::lazy_on() {
+        return;
+    }
+    let Some(l) = layout else { return };
+    if !super::real::pso_may_store(pso) {
+        return;
+    }
+    for va in store_addresses(l, args) {
+        super::sparse::gpu_write(super::sparse::WriteRoute::ShaderStore, va as usize, 1);
+    }
+}
+
+/// The addresses a shader may store through among `args` (packed by `l`): the root views, and
+/// each 4-byte aligned 64-bit value at a constant (one in a sparse window is taken for an
+/// address: `sparse::gpu_write` drops the rest with one compare).
+fn store_addresses<'a>(l: &'a Layout, args: &'a [u8]) -> impl Iterator<Item = u64> + 'a {
+    let constants = l.params.iter().flat_map(move |p| {
+        let (at, count) = match *p {
+            Param::Constants { at, count } => (at as usize, count as usize),
+            _ => (0, 0),
+        };
+        (0..count.saturating_sub(1)).filter_map(move |k| args.get(at + 4 * k..at + 4 * k + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())))
+    });
+    console_list::root_views(l, args).chain(constants).filter(|&va| va != 0 && va % 4 == 0)
+}
+
 /// command signatures that change root arguments (they need the title's root signature)
 static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
@@ -2640,6 +2673,7 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
     let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     want_root_views(layout.as_deref(), &args, super::view_want::Path::MeshStage);
+    shader_store_writes(layout.as_deref(), &args, 0);
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -3992,6 +4026,20 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
     put(this, i, 0, &va.to_le_bytes());
 }
 
+/// #45 SetComputeRootUnorderedAccessView: `set_compute_root_descriptor`, and the GPU writes at
+/// `va`: in a sparse window its tiles get video memory before the list runs
+/// (`sparse::gpu_write`, `XCL_SPARSE_LAZY`; a root view has no size)
+pub(super) unsafe extern "system" fn set_compute_root_uav(this: *mut c_void, i: u32, va: u64) {
+    super::sparse::gpu_write(super::sparse::WriteRoute::RootUav, va as usize, 1);
+    set_compute_root_descriptor(this, i, va)
+}
+
+/// #46 SetGraphicsRootUnorderedAccessView: as `set_compute_root_uav`
+pub(super) unsafe extern "system" fn set_graphics_root_uav(this: *mut c_void, i: u32, va: u64) {
+    super::sparse::gpu_write(super::sparse::WriteRoute::RootUav, va as usize, 1);
+    set_graphics_root_descriptor(this, i, va)
+}
+
 /// #25 SetPipelineState: noted, then bound as on the PC (`XCL_TWO_PASS_BATCH=2`: with deferred
 /// draws on the list, a two-pass pipeline is bound in the run, between the mesh passes where it
 /// came, `on_pipeline`; another records the run first)
@@ -4409,6 +4457,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         (layout.clone(), args.clone(), s.heaps)
     });
     want_root_views(layout.as_deref(), &args, super::view_want::Path::RootView);
+    shader_store_writes(layout.as_deref(), &args, pso);
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or_else(|| {

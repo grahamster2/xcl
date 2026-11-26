@@ -530,6 +530,11 @@ unsafe extern "system" fn cl_set_root_constants(this: *mut c_void, i: u32, n: u3
 unsafe extern "system" fn cl_set_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     push(this as usize, &[header(i as usize), va as u32, (va >> 32) as u32]);
 }
+/// #45 SetComputeRootUnorderedAccessView: the GPU writes there (`sparse::gpu_write`)
+unsafe extern "system" fn cl_set_root_uav(this: *mut c_void, i: u32, va: u64) {
+    super::sparse::gpu_write(super::sparse::WriteRoute::RootUav, va as usize, 1);
+    cl_set_root_descriptor(this, i, va)
+}
 /// #32 SetDescriptorHeaps(n, heaps)
 unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
     let mut w = vec![HEAPS_MARKER, n];
@@ -653,7 +658,7 @@ fn list_vtable() -> usize {
             (39, cl_set_root_constants as usize),
             (41, cl_set_root_descriptor as usize),
             (43, cl_set_root_descriptor as usize),
-            (45, cl_set_root_descriptor as usize),
+            (45, cl_set_root_uav as usize),
             (146, cl_barrier as usize),
             (148, cl_allocate_upload_memory as usize),
         ] {
@@ -981,6 +986,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let user_sgprs = super::real::pso_user_sgprs(real);
                         // (the list is submitted after this: its root views in a GPU view get their tiles there)
                         super::bind::want_root_views(layout.as_deref(), &table, super::view_want::Path::RootView);
+                        super::bind::shader_store_writes(layout.as_deref(), &table, real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {

@@ -196,6 +196,17 @@ pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
     UMA_BUFFERS.lock().unwrap().as_ref()?.get(&res).map(|&(p, n, _)| (p, n))
 }
 
+/// (tests) `res` taken for a console buffer of `bytes` at `p` (None: forgotten again).
+#[cfg(test)]
+pub(super) fn console_buffer_for_test(res: usize, at: Option<(usize, usize)>) {
+    let mut g = UMA_BUFFERS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    match at {
+        Some((p, bytes)) => m.insert(res, (p, bytes, false)),
+        None => m.remove(&res),
+    };
+}
+
 /// Number of live console buffers in unified memory.
 pub fn console_buffers() -> usize {
     UMA_BUFFERS.lock().unwrap().as_ref().map_or(0, |m| m.len())
@@ -1202,7 +1213,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (40, b::set_graphics_root_constants as usize),
                 (42, b::set_graphics_root_descriptor as usize),
                 (44, b::set_graphics_root_descriptor as usize),
-                (46, b::set_graphics_root_descriptor as usize),
+                (46, b::set_graphics_root_uav as usize),
                 (26, l::resource_barrier_x as usize),
                 (25, b::set_pipeline_state as usize),
                 (33, b::set_compute_root_signature as usize),
@@ -1211,7 +1222,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (39, b::set_compute_root_constants as usize),
                 (41, b::set_compute_root_descriptor as usize),
                 (43, b::set_compute_root_descriptor as usize),
-                (45, b::set_compute_root_descriptor as usize),
+                (45, b::set_compute_root_uav as usize),
                 (10, l::reset_x as usize),
                 (28, l::begin_query_x as usize),
                 (29, l::end_query_x as usize),
@@ -1497,7 +1508,7 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
 /// stride = element size, num_records in elements); empty when the buffer is not in UMA. A
 /// buffer placed in a GPU view asks for the tiles of the range viewed (`view_want`).
-fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+pub(super) fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
         note_buffer_view();
         return [0; 4];
@@ -1516,6 +1527,43 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
     let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
     super::view_want::want(super::view_want::Path::BufferView, base, if stride == 0 { records } else { records * stride as u64 });
     crate::gpu::desc::buffer_words(base, stride, records as u32, fmt)
+}
+
+/// A UAV of `res` (described by `desc`, None: all of it) with the counter `counter` (0: none):
+/// what it lets the GPU write of a console buffer in a sparse window gets its video memory
+/// before the GPU writes there (`sparse::gpu_write`, `XCL_SPARSE_LAZY`). A texture is a PC
+/// resource of its own: nothing to do.
+pub(super) fn uav_writes(res: usize, counter: usize, desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, rd: Option<&D3D12_RESOURCE_DESC>) {
+    if !super::sparse::lazy_on() {
+        return;
+    }
+    let buffer = match desc {
+        Some(v) => v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER,
+        None => rd.is_some_and(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER),
+    };
+    if !buffer {
+        return;
+    }
+    if let Some((at, bytes)) = console_buffer(res) {
+        let (at, bytes) = (at as u64, bytes as u64);
+        let (start, len) = match desc {
+            Some(v) => {
+                let b = unsafe { &v.Anonymous.Buffer };
+                let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+                let (_, start, len) = buffer_words_at(at, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+                let start = start.min(at + bytes);
+                (start, len.min(at + bytes - start))
+            }
+            None => (at, bytes),
+        };
+        super::sparse::gpu_write(super::sparse::WriteRoute::Uav, start as usize, len as usize);
+    }
+    if counter != 0 {
+        if let Some((at, _)) = console_buffer(counter) {
+            let off = desc.map_or(0, |v| unsafe { v.Anonymous.Buffer.CounterOffsetInBytes } as usize);
+            super::sparse::gpu_write(super::sparse::WriteRoute::Uav, at + off, 4);
+        }
+    }
 }
 
 /// Console buffer → a placed resource in the unified memory heap, so its console address is
@@ -2107,6 +2155,30 @@ pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
     PSO_SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
+/// translated pipelines whose console shaders store to no memory (`gpu::effects::may_write_memory`;
+/// noted with `XCL_SPARSE_LAZY` only)
+static NO_STORES: Sharded<()> = Sharded::new();
+
+/// `pso` (as made) is noted in `NO_STORES` when none of its console shaders `blobs` may store to
+/// memory.
+fn note_stores(pso: usize, blobs: &[&[u8]]) {
+    if pso != 0 && super::sparse::lazy_on() && !blobs.is_empty() && !blobs.iter().any(|b| crate::gpu::effects::may_write_memory(b)) {
+        NO_STORES.insert(pso, ());
+    }
+}
+
+/// Whether the shaders of `pso` (a stand-in resolved) may store to memory: true unless they were
+/// read and store to none (`note_stores`). What a dispatch or draw may write by address in a
+/// sparse window gets video memory first (`bind::shader_store_writes`).
+pub fn pso_may_store(pso: usize) -> bool {
+    pso == 0 || !(NO_STORES.contains(pso) || NO_STORES.contains(super::pso_async::resolve(pso)))
+}
+
+#[cfg(test)]
+pub(super) fn register_no_stores_for_test(pso: usize) {
+    NO_STORES.insert(pso, ());
+}
+
 pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.contains(pso)
 }
@@ -2187,6 +2259,7 @@ fn forget_pso(pso: usize) {
     super::dred::forget_pso(pso);
     dispatch_chain::forget(pso);
     TRANSLATED_COMPUTE.remove(pso);
+    NO_STORES.remove(pso);
     if let Some(s) = CONSOLE_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
@@ -2872,6 +2945,10 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
+        // the GPU writes what the view covers, and its counter (`sparse::gpu_write`)
+        super::sparse::gpu_write(super::sparse::WriteRoute::Uav, at as usize, len as usize);
+        let counter = (view.add(0x30) as *const u64).read_unaligned();
+        super::sparse::gpu_write(super::sparse::WriteRoute::Uav, counter as usize, 4);
         return super::console_heap::write(&slot, &words);
     }
     dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
@@ -3105,6 +3182,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
+    uav_writes(res as usize, counter as usize, desc.as_ref(), rd_opt.as_ref());
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     if super::present::trace_frame() {
         if rd_opt.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
@@ -5095,6 +5173,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
                 PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
             note_translated_compute(0, ppv);
+            note_stores(*ppv as usize, &[cs]);
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
             if super::gpu_profile::on() || super::gpu_times::enabled() {
                 super::gpu_profile::note_compute(record, cs, dxil.len(), wave32_only(this));
@@ -5136,6 +5215,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
     note_translated_compute(hr, ppv);
+    note_stores(*ppv as usize, &[cs]);
     PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
     if super::gpu_profile::on() || super::gpu_times::enabled() {
         super::gpu_profile::note_compute(record, cs, dxil.len(), wave32_only(this));
@@ -6436,6 +6516,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.insert(*ppv as usize, ());
+    // (a console HS / DS / GS is not looked at: such a pipeline may store)
+    if d.HS.pShaderBytecode.is_null() && d.DS.pShaderBytecode.is_null() && d.GS.pShaderBytecode.is_null() {
+        note_stores(*ppv as usize, &[Some(vs), shader_bytes(&d.PS)].into_iter().flatten().collect::<Vec<_>>());
+    }
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if (super::gpu_profile::on() || super::gpu_times::enabled()) && !super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);

@@ -104,9 +104,44 @@ pub fn big_and_image_only(blob: &[u8]) -> bool {
     code.len() >= BIG_CODE && of(&code).is_some_and(|e| !e.memory)
 }
 
+/// Whether a console shader `blob` (compute, or one graphics stage) may write memory
+/// (`Effects::memory`) in any of its programs. True for anything that cannot be read: what
+/// asks this (`hle::d3d12x::sparse::gpu_write`, `XCL_SPARSE_LAZY`) must not miss a write.
+pub fn may_write_memory(blob: &[u8]) -> bool {
+    if let Some(f) = recomp::pso::fspx(blob) {
+        return of(&f.code).is_none_or(|e| e.memory);
+    }
+    let Some(sh) = xbox::parse(blob) else { return true };
+    let mut programs = 0;
+    for f in &sh.fssm {
+        if f.error.is_some() {
+            return true;
+        }
+        for p in &f.programs {
+            let Some(code) = p.offset.checked_add(p.len).and_then(|end| f.data.get(p.offset..end)) else { return true };
+            if of(code).is_none_or(|e| e.memory) {
+                return true;
+            }
+            programs += 1;
+        }
+    }
+    programs == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn may_write_memory_tells_stores_from_loads() {
+        let load: (&str, &str, &[(&str, u64)]) = ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2)]);
+        let store: (&str, &str, &[(&str, u64)]) = ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2)]);
+        let reads = xbox::tests::sample(5, &[xbox::tests::fssm(&asm(&[MOV, load, IMAGE_STORE, END]), &[(6, 0)])]);
+        assert!(!may_write_memory(&reads), "loads and image stores write no memory");
+        let writes = xbox::tests::sample(5, &[xbox::tests::fssm(&asm(&[MOV, store, END]), &[(6, 0)])]);
+        assert!(may_write_memory(&writes));
+        assert!(may_write_memory(b"not a shader"), "what cannot be read may write");
+    }
 
     fn asm(insts: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
         insts.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap_or_else(|e| panic!("{n}: {e}"))).collect()

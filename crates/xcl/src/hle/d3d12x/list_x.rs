@@ -1167,7 +1167,16 @@ fn note_write(list: usize, va: u64, size: u64) {
 /// read them through a pointer they keep mapped, without another Map), or placed in a GPU view
 /// (what the GPU writes there is its tiles', and the title reads it at the CPU view): the bytes
 /// come back to the CPU's view after the submit, like the lists' own memory writes.
-fn note_copy_into(list: usize, dst: usize, offset: u64, n: u64) {
+pub(super) fn note_copy_into(list: usize, dst: usize, offset: u64, n: u64) {
+    // a console buffer in a sparse window: what is copied there gets its tiles' video memory
+    // before the list runs (`sparse::gpu_write`, `XCL_SPARSE_LAZY`; a placed buffer has them
+    // from its placement on, unless the title's memory under it was committed again since)
+    if super::sparse::lazy_on() {
+        if let Some((p, bytes)) = real::console_buffer(dst) {
+            let offset = offset.min(bytes as u64);
+            super::sparse::gpu_write(super::sparse::WriteRoute::CopyInto, p + offset as usize, n.min(bytes as u64 - offset) as usize);
+        }
+    }
     let Some(u) = crate::gpu::uma::get().filter(|u| u.shadowed() || super::bind::view_span().1 != 0) else { return };
     let Some((p, bytes)) = real::console_buffer(dst).filter(|&(p, _)| (u.shadowed() && u.is_committed(p)) || u.is_view(p)) else { return };
     let offset = offset.min(bytes as u64);

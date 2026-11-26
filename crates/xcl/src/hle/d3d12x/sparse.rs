@@ -1500,6 +1500,8 @@ impl State {
         }
         if new {
             MAPPED_GEN.fetch_add(1, Ordering::Release);
+            // a GPU write asked for before is asked for again (`write_asked_lately`)
+            LAZY_GEN.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1543,14 +1545,47 @@ impl State {
         (got, left)
     }
 
-    /// The title's lists about to be submitted write `ranges` on the GPU (`will_write`): their
+    /// The title's lists about to be submitted write `asks` on the GPU (`gpu_write`): their
     /// tiles listed with no video memory get it, cleared at this submit before the lists run.
-    unsafe fn give_memory(&mut self, ranges: &[(usize, usize)]) {
+    /// Taken as a placed buffer takes them (`force`): a write to a tile with no memory is dropped
+    /// (tiled resources tier 2), so a moment short of memory is no reason to wait. A range of no
+    /// known size (`WriteRoute::sized`) reaches as far as the tiles after it are committed.
+    unsafe fn give_memory(&mut self, asks: &[(usize, usize, WriteRoute)]) {
         let mut reused = Vec::new();
-        for &(a, n) in ranges {
-            self.materialize(a, n, false, &mut reused);
+        for &(a, n, route) in asks {
+            let n = if route.sized() { n } else { self.committed_reach(a, n) };
+            let (got, left) = self.materialize(a, n, true, &mut reused);
+            if got > 0 {
+                GPU_WRITE_TILES.fetch_add(got as u64, Ordering::Relaxed);
+                // bytes the CPU wrote there that found no memory before go up at this submit,
+                // before the GPU writes, not after them (`starved`)
+                if self.starved.iter().any(|&t| t + TILE > a && t < a.saturating_add(n)) {
+                    STARVED_NOW.store(true, Ordering::Relaxed);
+                }
+                note_write_route(route, a, n, got, false);
+            }
+            if left > 0 {
+                GPU_WRITE_LOST.fetch_add(left as u64, Ordering::Relaxed);
+                // asked again by the next bind of it (`write_asked_lately`)
+                LAZY_GEN.fetch_add(1, Ordering::Relaxed);
+                note_write_route(route, a, n, left, true);
+            }
         }
         self.to_zero.extend(reused);
+    }
+
+    /// The bytes of `[a, a + n)` from `a` on whose tiles are committed (listed in `mapped`, or
+    /// over a CPU view) without a break: where a GPU write of no known size from `a` can land.
+    fn committed_reach(&self, a: usize, n: usize) -> usize {
+        let end = a.saturating_add(n);
+        let mut t = a & !(TILE - 1);
+        while t < end && (self.mapped.contains_key(&t) || self.mirror_src.contains_key(&t)) {
+            match t.checked_add(TILE) {
+                Some(next) => t = next,
+                None => return n,
+            }
+        }
+        t.min(end).saturating_sub(a)
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -4159,7 +4194,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         take_remaps(&mut s.remaps, &mut REMAPS.lock().unwrap());
     }
     if WRITE_ASKING.swap(false, Ordering::AcqRel) {
-        let asks = std::mem::take(&mut *WRITE_ASKS.lock().unwrap_or_else(|e| e.into_inner()));
+        let asks = take_write_asks();
         s.give_memory(&asks);
     }
     let waited = t0.elapsed().as_micros() as u64;
@@ -4173,22 +4208,150 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.before_execute_on(queue, dirty, page);
 }
 
-/// What the title's lists being recorded will write on the GPU in the sparse windows (address,
-/// bytes; `will_write`), taken by the next submit: with `lazy_commits` a tile there may have no
-/// video memory yet, and the write would go nowhere.
-static WRITE_ASKS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
-static WRITE_ASKING: AtomicBool = AtomicBool::new(false);
+/// What reaches the sparse windows' memory as a GPU write (`gpu_write`): with `lazy_commits` a
+/// tile there may have no video memory yet, and on tiled resources tier 2 a write to it is
+/// dropped (a shader's store, a copy, a fence value: what the title waits for never comes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WriteRoute {
+    /// a memory operation recorded on a list: immediates, fills, copies by address, timestamps
+    MemoryOp = 0,
+    /// an unordered access view of a buffer, or its counter
+    Uav,
+    /// a root UAV (its size is not known)
+    RootUav,
+    /// a copy or a query resolve into a buffer
+    CopyInto,
+    /// a root view or a 64-bit address among the root constants of a shader that may store to
+    /// memory (`gpu::effects::may_write_memory`; its size is not known)
+    ShaderStore,
+}
 
-/// A list being recorded writes `[va, va + len)` on the GPU with a memory operation (an
-/// immediate, a fill, a copy, a timestamp): with `lazy_commits`, its tiles get their video memory
-/// at the next submit, which comes before the list's (`State::give_memory`). Never waits for the
-/// state.
-pub(super) fn will_write(va: usize, len: usize) {
-    if len == 0 || !lazy_commits() {
+const ROUTES: usize = 5;
+const ROUTE_NAMES: [&str; ROUTES] = ["memory operation", "UAV", "root UAV", "copy destination", "shader store"];
+
+impl WriteRoute {
+    /// whether the route gives the bytes written (else: an address, `UNSIZED_WRITE_REACH`)
+    fn sized(self) -> bool {
+        !matches!(self, WriteRoute::RootUav | WriteRoute::ShaderStore)
+    }
+}
+
+/// Bytes a GPU write of no known size (a root UAV, a shader's root view) is taken to reach from
+/// its address, as far as the tiles there are committed (`State::committed_reach`).
+const UNSIZED_WRITE_REACH: usize = 4 << 20;
+
+/// The GPU writes asked for since the last submit (`gpu_write`), taken by the next one, which
+/// comes before the list's (`State::give_memory`).
+static WRITE_ASKS: Mutex<Vec<(usize, usize, WriteRoute)>> = Mutex::new(Vec::new());
+static WRITE_ASKING: AtomicBool = AtomicBool::new(false);
+/// so far: tiles given video memory for a GPU write (`give_memory`), and tiles a GPU write found
+/// none for (what the GPU wrote there was lost)
+static GPU_WRITE_TILES: AtomicU64 = AtomicU64::new(0);
+static GPU_WRITE_LOST: AtomicU64 = AtomicU64::new(0);
+/// bumped when tiles come to be listed with no video memory (`ensure_listed`) or a GPU write
+/// found none: what a thread remembers having asked for (`write_asked_lately`) is asked again
+static LAZY_GEN: AtomicU64 = AtomicU64::new(0);
+/// a GPU write gave memory to a tile whose CPU bytes are owed (`starved`): they go up at this
+/// submit, short of memory or not
+static STARVED_NOW: AtomicBool = AtomicBool::new(false);
+
+/// Tile spans a thread remembers having asked for as GPU writes (`write_asked_lately`).
+const WRITES_LATELY: usize = 16;
+
+type WriteSpans = ([(usize, usize); WRITES_LATELY], u64, usize);
+
+thread_local! {
+    /// The tile spans (first and last tile) this thread asked for last as GPU writes, the
+    /// `LAZY_GEN` they were asked in and where the next goes. A title binds the same UAVs and
+    /// root views draw after draw.
+    static WRITES_ASKED: std::cell::Cell<WriteSpans> = const { std::cell::Cell::new(([(usize::MAX, 0); WRITES_LATELY], u64::MAX, 0)) };
+}
+
+/// Whether every tile of `[va, va + len)` lies in a tile span this thread asked for lately in
+/// this `LAZY_GEN`; its span is remembered if not.
+fn write_asked_lately(va: usize, len: usize) -> bool {
+    let span = (va / TILE, va.saturating_add(len - 1) / TILE);
+    let gen = LAZY_GEN.load(Ordering::Relaxed);
+    WRITES_ASKED.with(|a| {
+        let (mut spans, asked_in, mut next) = a.get();
+        if asked_in != gen {
+            (spans, next) = ([(usize::MAX, 0); WRITES_LATELY], 0);
+        } else if spans.iter().any(|&(first, last)| first <= span.0 && span.1 <= last) {
+            return true;
+        }
+        spans[next] = span;
+        a.set((spans, gen, (next + 1) % WRITES_LATELY));
+        false
+    })
+}
+
+/// The sparse window `va` lies in (start, bytes).
+fn sparse_window_of(va: usize) -> Option<(usize, usize)> {
+    #[cfg(test)]
+    if let Some(w) = tests::SPARSE_FOR_TEST.with(|c| c.get()) {
+        return (va >= w.0 && va - w.0 < w.1).then_some(w);
+    }
+    let u = crate::gpu::uma::get()?;
+    let k = u.window_of(va)?;
+    u.is_sparse_window(k).then(|| u.window(k))
+}
+
+/// The GPU may write `[va, va + len)` on `route` (a list that does is being recorded, or a view
+/// that lets it was made): with `lazy_commits`, its tiles in a sparse window that have no video
+/// memory get it at the next submit, before the list runs. Never waits for the state; nothing
+/// but a compare without `XCL_SPARSE_LAZY`, and a thread that asked for the same tiles lately
+/// asks once (`write_asked_lately`).
+pub(super) fn gpu_write(route: WriteRoute, va: usize, len: usize) {
+    if va == 0 || len == 0 || !lazy_commits() {
         return;
     }
-    WRITE_ASKS.lock().unwrap_or_else(|e| e.into_inner()).push((va, len));
+    let Some((start, size)) = sparse_window_of(va) else { return };
+    let len = if route.sized() { len } else { len.max(UNSIZED_WRITE_REACH) }.min(start + size - va);
+    if write_asked_lately(va, len) {
+        return;
+    }
+    #[cfg(test)]
+    if tests::SPARSE_FOR_TEST.with(|c| c.get()).is_some() {
+        return tests::WRITE_ASKS_FOR_TEST.with(|w| w.borrow_mut().push((va, len, route)));
+    }
+    WRITE_ASKS.lock().unwrap_or_else(|e| e.into_inner()).push((va, len, route));
     WRITE_ASKING.store(true, Ordering::Release);
+}
+
+/// The GPU writes asked for so far (`gpu_write`; in a test, its own thread's).
+fn take_write_asks() -> Vec<(usize, usize, WriteRoute)> {
+    #[cfg(test)]
+    if tests::SPARSE_FOR_TEST.with(|c| c.get()).is_some() {
+        return tests::WRITE_ASKS_FOR_TEST.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    }
+    std::mem::take(&mut *WRITE_ASKS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `XCL_SPARSE_LAZY=1` is in effect: what may write on the GPU asks for its tiles (`gpu_write`).
+pub(super) fn lazy_on() -> bool {
+    lazy_commits()
+}
+
+/// A list being recorded writes `[va, va + len)` on the GPU with a memory operation (an
+/// immediate, a fill, a copy, a timestamp): `gpu_write`.
+pub(super) fn will_write(va: usize, len: usize) {
+    gpu_write(WriteRoute::MemoryOp, va, len);
+}
+
+/// The safety net's log (the first ones of each kind): a GPU write on `route` reached `tiles`
+/// tiles of `[a, a + n)` with no video memory, which got it before the submit; or (`lost`) found
+/// none, and what the GPU writes there is dropped.
+fn note_write_route(route: WriteRoute, a: usize, n: usize, tiles: usize, lost: bool) {
+    static GIVEN: [AtomicU64; ROUTES] = [const { AtomicU64::new(0) }; ROUTES];
+    static LOST: AtomicU64 = AtomicU64::new(0);
+    let name = ROUTE_NAMES[route as usize];
+    if lost {
+        if LOST.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_warn!("sparse windows: a GPU write ({name}) at {a:#x} ({n:#x} bytes) found no video memory for {tiles} of its tiles (XCL_SPARSE_LAZY): what the GPU writes there is lost");
+        }
+    } else if GIVEN[route as usize].fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!("sparse windows: a GPU write ({name}) at {a:#x} ({n:#x} bytes) touched {tiles} tiles with no video memory (XCL_SPARSE_LAZY): made resident before the submit");
+    }
 }
 
 /// microseconds in `before_execute`, the wait for the state's lock with it
@@ -4410,7 +4573,8 @@ impl State {
         // tiles whose bytes found no video memory at an upload: all that is committed there, once
         // a moment went by since (the upload gives them their tile, or leaves them here again)
         let mut again = false;
-        if !s.starved.is_empty() && !s.short_of_memory() {
+        let forced = STARVED_NOW.swap(false, Ordering::Relaxed);
+        if !s.starved.is_empty() && (forced || !s.short_of_memory()) {
             let mut starved = std::mem::take(&mut s.starved);
             starved.sort_unstable();
             starved.dedup();
@@ -4508,7 +4672,7 @@ impl State {
                 let listed = s.mapped.values().filter(|e| e.pool == LAZY).count();
                 crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len() - listed);
                 let (own, unsent) = never_sent(&s.mapped);
-                crate::xlog_info!("sparse windows: {unsent} of the windows' own {own} mapped tiles ({} of {} MB) never got a byte from the CPU (zeros, or what the GPU wrote); {listed} listed with no video memory (XCL_SPARSE_LAZY)", unsent * TILE >> 20, own * TILE >> 20);
+                crate::xlog_info!("sparse windows: {unsent} of the windows' own {own} mapped tiles ({} of {} MB) never got a byte from the CPU (zeros, or what the GPU wrote); {listed} listed with no video memory (XCL_SPARSE_LAZY), {} tiles made resident for GPU writes ({} found none)", unsent * TILE >> 20, own * TILE >> 20, GPU_WRITE_TILES.load(Ordering::Relaxed), GPU_WRITE_LOST.load(Ordering::Relaxed));
                 let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
                 let c = &s.counts;
                 crate::xlog_info!(
@@ -4736,6 +4900,10 @@ mod tests {
         pub(super) static LAZY_COMMITS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
         /// `take_tile` finds no video memory on this thread
         pub(super) static NO_TILES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The range `gpu_write` takes for a sparse window on this thread (start, bytes; None: as
+        /// unified memory says), and the asks it made there: a test's own, apart from the others'.
+        pub(super) static SPARSE_FOR_TEST: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+        pub(super) static WRITE_ASKS_FOR_TEST: std::cell::RefCell<Vec<(usize, usize, WriteRoute)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// The runs of the tiles mapped, made from all of them (but those over a CPU view: their
@@ -6111,13 +6279,135 @@ mod tests {
         unsafe {
             let Some((base, mut s, _queue)) = lazy_state(2) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
             s.commit_range(base, 2 * TILE);
-            s.give_memory(&[(base + 8, 8)]);
+            s.give_memory(&[(base + 8, 8, WriteRoute::MemoryOp)]);
             assert_ne!(s.mapped[&base].pool, LAZY, "the recorded write's tile got memory");
             assert_eq!(s.mapped[&(base + TILE)].pool, LAZY, "the other did not");
             lazy.no_tiles(true);
             let tiles = s.buffer_tiles(base, 2 * TILE);
             assert!(tiles.iter().all(|&(_, tile)| tile != LAZY), "no tile of a buffer is the sentinel: {tiles:?}");
             assert!(tiles.iter().any(|&(t, _)| t == base), "the tile with memory is the buffer's");
+        }
+        drop(lazy);
+    }
+
+    /// `SPARSE_FOR_TEST` for this thread while it lives: `gpu_write` takes `[start, start + bytes)`
+    /// for a sparse window and keeps its asks on the thread (`WRITE_ASKS_FOR_TEST`).
+    struct SparseFor;
+    impl SparseFor {
+        fn range(start: usize, bytes: usize) -> SparseFor {
+            SPARSE_FOR_TEST.with(|c| c.set(Some((start, bytes))));
+            WRITE_ASKS_FOR_TEST.with(|w| w.borrow_mut().clear());
+            SparseFor
+        }
+    }
+    impl Drop for SparseFor {
+        fn drop(&mut self) {
+            SPARSE_FOR_TEST.with(|c| c.set(None));
+            WRITE_ASKS_FOR_TEST.with(|w| w.borrow_mut().clear());
+        }
+    }
+
+    /// A raw buffer UAV of `n` bytes from byte `first`.
+    fn raw_uav(first: usize, n: usize) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV { FirstElement: (first / 4) as u64, NumElements: (n / 4) as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW } },
+        }
+    }
+
+    /// A UAV of a console buffer over tiles listed with no video memory: the tiles it covers get
+    /// it at the next submit (the GPU's writes there would be dropped), the others do not. A root
+    /// UAV (no size) reaches from its address as far as the tiles are committed.
+    #[test]
+    fn a_uav_on_a_lazy_range_makes_it_resident() {
+        let lazy = Lazy::on(true);
+        unsafe {
+            let Some((base, mut s, _queue)) = lazy_state(3) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
+            s.commit_range(base, 3 * TILE);
+            let sparse = SparseFor::range(base, 3 * TILE);
+            let res = 0x7E57_0A00usize;
+            super::super::real::console_buffer_for_test(res, Some((base, 3 * TILE)));
+            super::super::real::uav_writes(res, 0, Some(&raw_uav(TILE, TILE)), None);
+            super::super::real::console_buffer_for_test(res, None);
+            let asks = take_write_asks();
+            assert_eq!(asks, vec![(base + TILE, TILE, WriteRoute::Uav)], "the UAV's range is asked for");
+            let before = GPU_WRITE_TILES.load(Ordering::Relaxed);
+            s.give_memory(&asks);
+            assert_eq!(s.mapped[&base].pool, LAZY, "the tile before the view has none");
+            assert_ne!(s.mapped[&(base + TILE)].pool, LAZY, "the tile the UAV covers is resident");
+            assert_eq!(s.mapped[&(base + 2 * TILE)].pool, LAZY, "the tile after it has none");
+            assert!(GPU_WRITE_TILES.load(Ordering::Relaxed) > before, "counted");
+            // a root UAV: its tile and on, as far as the window's tiles are committed
+            super::super::sparse::gpu_write(WriteRoute::RootUav, base + 2 * TILE + 16, 1);
+            s.give_memory(&take_write_asks());
+            assert_ne!(s.mapped[&(base + 2 * TILE)].pool, LAZY, "the root UAV's tile is resident");
+            assert_eq!(s.mapped[&base].pool, LAZY);
+            drop(sparse);
+        }
+        drop(lazy);
+    }
+
+    /// A copy into a console buffer over tiles listed with no video memory: its destination
+    /// bytes get it before the list runs.
+    #[test]
+    fn a_copy_destination_makes_it_resident() {
+        let lazy = Lazy::on(true);
+        unsafe {
+            let Some((base, mut s, _queue)) = lazy_state(2) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
+            s.commit_range(base, 2 * TILE);
+            let sparse = SparseFor::range(base, 2 * TILE);
+            let res = 0x7E57_0B00usize;
+            super::super::real::console_buffer_for_test(res, Some((base, 2 * TILE)));
+            super::super::list_x::note_copy_into(0x7E57_0B80, res, TILE as u64 + 256, 256);
+            // a copy past the buffer's end asks for nothing
+            super::super::list_x::note_copy_into(0x7E57_0B80, res, 4 * TILE as u64, 256);
+            super::super::real::console_buffer_for_test(res, None);
+            let asks = take_write_asks();
+            assert_eq!(asks, vec![(base + TILE + 256, 256, WriteRoute::CopyInto)]);
+            s.give_memory(&asks);
+            assert_eq!(s.mapped[&base].pool, LAZY, "the tile not copied into has none");
+            assert_ne!(s.mapped[&(base + TILE)].pool, LAZY, "the copy's destination is resident");
+            drop(sparse);
+        }
+        drop(lazy);
+    }
+
+    /// A read-only SRV of a console buffer over tiles listed with no video memory asks for
+    /// nothing; nor does a root SRV of a dispatch whose shaders store to no memory. One whose
+    /// shaders may store does.
+    #[test]
+    fn a_read_only_srv_does_not_make_a_lazy_range_resident() {
+        let lazy = Lazy::on(true);
+        unsafe {
+            let Some((base, mut s, _queue)) = lazy_state(2) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
+            s.commit_range(base, 2 * TILE);
+            let sparse = SparseFor::range(base, 2 * TILE);
+            let res = 0x7E57_0C00usize;
+            super::super::real::console_buffer_for_test(res, Some((base, 2 * TILE)));
+            let words = super::super::real::buffer_view(res, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS, 0, (2 * TILE / 4) as u32, 0, true);
+            super::super::real::console_buffer_for_test(res, None);
+            assert_ne!(words, [0; 4], "a V# of the buffer");
+            // a root SRV of a pipeline whose shaders store to no memory
+            let layout = super::super::console_list::Layout { params: vec![super::super::console_list::Param::Descriptor { at: 0 }], size: 8, ..Default::default() };
+            let args = (base as u64).to_le_bytes();
+            let pso = 0x7E57_0C80usize;
+            super::super::real::register_no_stores_for_test(pso);
+            super::super::bind::shader_store_writes(Some(&layout), &args, pso);
+            super::super::real::forget_pso_for_test(pso);
+            assert!(take_write_asks().is_empty(), "nothing asked for");
+            s.give_memory(&[]);
+            assert_eq!(s.mapped[&base].pool, LAZY, "read only: still no video memory");
+            assert_eq!(s.mapped[&(base + TILE)].pool, LAZY);
+            // the same root view of shaders that may store: asked for
+            super::super::bind::shader_store_writes(Some(&layout), &args, pso);
+            let asks = take_write_asks();
+            assert_eq!(asks.len(), 1);
+            assert_eq!((asks[0].0, asks[0].2), (base, WriteRoute::ShaderStore));
+            s.give_memory(&asks);
+            assert_ne!(s.mapped[&base].pool, LAZY, "a shader that may store through it: resident");
+            assert_ne!(s.mapped[&(base + TILE)].pool, LAZY, "as far as the tiles are committed");
+            drop(sparse);
         }
         drop(lazy);
     }
