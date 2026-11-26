@@ -992,8 +992,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         // submission (`d3d12x::sparse`). In the coherent window the GPU reads them over the bus,
         // uncached, and on NVIDIA its writes that do not fill whole lines run at ~0.1 GB/s
         // (#505). Costs a second copy in video memory and the write-watch scan of it.
-        if sparse_heaps_min().is_some_and(|min| size >= min) {
-            let rounded = size.max(1).div_ceil(align) * align;
+        let rounded = size.max(1).div_ceil(align) * align;
+        let sparse_first = heap_sparse_first(size, sparse_heaps_min());
+        if sparse_first {
             if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
                 crate::xlog_info!("kernelx: a GPU heap of {} MB in the sparse windows (XCL_COHERENT_HEAPS)", size >> 20);
                 trace_mem("VirtualAlloc (graphics heap, sparse VRAM)", 0, rounded, t as u64, p, q);
@@ -1006,22 +1007,37 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
         crate::gpu::uma::note_coherent_need(asked);
         if let Some(u) = uma {
-            // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
-            // a pool of their own)
-            const KEEP: usize = 96 << 20;
-            let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
+            let fits = heap_fits_coherent(u.size(), u.used(), size);
             if let Some(q) = fits.then(|| u.alloc(size, align)).flatten() {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
-            // diagnostic: a GPU heap the coherent window has no room for (plain memory from here)
+            // diagnostic: a GPU heap the coherent window has no room for
             static UNFIT: AtomicUsize = AtomicUsize::new(0);
             static UNFIT_BYTES: AtomicUsize = AtomicUsize::new(0);
             let k = UNFIT.fetch_add(1, Ordering::Relaxed) + 1;
             let total = UNFIT_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-            if k <= 8 || k.is_power_of_two() {
-                let (free, _, used, _) = u.committed_state();
+            let (free, _, used, _) = u.committed_state();
+            let say = k <= 8 || k.is_power_of_two();
+            if say {
                 crate::xlog_warn!("kernelx: a GPU heap of {} MB does not fit in the coherent window ({} MB used, {} MB free): #{k}, {} MB in all", size >> 20, used >> 20, free >> 20, total >> 20);
+            }
+            // then the sparse windows (video memory, kept in step with the CPU's writes) rather
+            // than plain memory: buffers placed in plain memory are no console buffers, and the
+            // title's ExecuteIndirect arguments in them were never read (a black world). Every
+            // runtime layout (4, 8 or 16 windows) has 3 sparse windows; with none, or no room
+            // in them, `sparse::alloc` says None and the heap is plain memory as before.
+            if !sparse_first {
+                if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+                    if say {
+                        crate::xlog_info!("kernelx: a GPU heap of {} MB does not fit in the coherent window ({} MB free): placed in the sparse windows instead of plain memory", size >> 20, free >> 20);
+                    }
+                    trace_mem("VirtualAlloc (graphics heap, sparse VRAM, coherent window full)", 0, rounded, t as u64, p, q);
+                    return q as *mut c_void;
+                }
+                if say {
+                    crate::xlog_warn!("kernelx: a GPU heap of {} MB fits neither the coherent window nor the sparse windows: plain memory", size >> 20);
+                }
             }
         }
     }
@@ -1042,6 +1058,22 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
+}
+
+/// What XCL keeps of the coherent window for itself (readback heaps; its per-draw arguments
+/// have a pool of their own): a GPU heap goes there only with this much left after it.
+const COHERENT_KEEP: usize = 96 << 20;
+
+/// Whether a GPU heap of `size` bytes goes to the sparse windows before the coherent window
+/// (`XCL_COHERENT_HEAPS=sparse[:N]`, read as `sparse_heaps_min`).
+fn heap_sparse_first(size: usize, sparse_min: Option<usize>) -> bool {
+    sparse_min.is_some_and(|min| size >= min)
+}
+
+/// Whether a GPU heap of `size` bytes fits a coherent window of `window` bytes, `used` of them
+/// taken, with `COHERENT_KEEP` left over.
+fn heap_fits_coherent(window: usize, used: usize, size: usize) -> bool {
+    size.checked_add(COHERENT_KEEP).is_some_and(|need| window.saturating_sub(used) >= need)
 }
 
 /// `XCL_COHERENT_HEAPS=sparse` (every GPU heap) or `sparse:N` (heaps of at least N MB): the
@@ -3265,6 +3297,32 @@ mod tests {
         assert_eq!(parse_sparse_heaps("sparse:big"), None);
         assert_eq!(parse_sparse_heaps("sparsex"), None);
         assert_eq!(parse_sparse_heaps(&format!("sparse:{}", usize::MAX)), None, "no overflow");
+    }
+
+    /// Where a GPU heap goes: the sparse windows first only with `XCL_COHERENT_HEAPS=sparse[:N]`
+    /// (else they are tried after the coherent window, when it has no room for the heap)
+    #[test]
+    fn gpu_heap_sparse_first() {
+        assert!(!heap_sparse_first(1277 << 20, None), "the default: the coherent window first");
+        assert!(heap_sparse_first(1, Some(0)), "`sparse`: every heap");
+        assert!(heap_sparse_first(1162 << 20, Some(1024 << 20)));
+        assert!(heap_sparse_first(1024 << 20, Some(1024 << 20)), "at least N MB");
+        assert!(!heap_sparse_first(1023 << 20, Some(1024 << 20)));
+    }
+
+    /// A GPU heap fits the coherent window with `COHERENT_KEEP` left after it: a title's heaps of
+    /// 1162 and 1277 MB do not fit a 1024 MB window (they went to plain memory, and every
+    /// two-pass mesh ExecuteIndirect of the title was skipped)
+    #[test]
+    fn gpu_heap_coherent_fit() {
+        const MB: usize = 1 << 20;
+        assert!(!heap_fits_coherent(1024 * MB, 0, 1162 * MB));
+        assert!(!heap_fits_coherent(1024 * MB, 0, 1277 * MB));
+        assert!(heap_fits_coherent(1024 * MB, 0, 1024 * MB - COHERENT_KEEP), "exactly the room");
+        assert!(!heap_fits_coherent(1024 * MB, 1, 1024 * MB - COHERENT_KEEP), "one byte used too many");
+        assert!(heap_fits_coherent(5120 * MB, 0, 1277 * MB));
+        assert!(!heap_fits_coherent(1024 * MB, 2048 * MB, MB), "used past the size: no room, no underflow");
+        assert!(!heap_fits_coherent(usize::MAX, 0, usize::MAX), "no overflow");
     }
 
     /// The setting the coherent window's size is kept for: what goes there

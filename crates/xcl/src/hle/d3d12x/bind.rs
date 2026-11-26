@@ -423,9 +423,13 @@ pub(super) enum Cause {
     DrawBindError,
     DispatchUntranslated,
     DispatchError,
+    /// a two-pass ExecuteIndirect whose argument buffer is no console buffer
+    EiArgsNotConsole,
+    /// a two-pass ExecuteIndirect whose `max` commands run past its console argument buffer
+    EiArgsShort,
 }
-const CAUSE_NAMES: [&str; 17] = ["DispatchDropped", "MeshStandIn", "MeshError", "MeshNoRootSig", "EiStandIn", "EiNoMeshSig", "EiMeshError", "EiTwoPass", "EiDispatchUntranslated", "EiNoRootSig", "EiWholeComputeError", "EiDrawError", "EiDispatchError", "DrawTwoPass", "DrawBindError", "DispatchUntranslated", "DispatchError"];
-static CAUSES: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+const CAUSE_NAMES: [&str; 19] = ["DispatchDropped", "MeshStandIn", "MeshError", "MeshNoRootSig", "EiStandIn", "EiNoMeshSig", "EiMeshError", "EiTwoPass", "EiDispatchUntranslated", "EiNoRootSig", "EiWholeComputeError", "EiDrawError", "EiDispatchError", "DrawTwoPass", "DrawBindError", "DispatchUntranslated", "DispatchError", "EiArgsNotConsole", "EiArgsShort"];
+static CAUSES: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
 
 /// A skipped draw or dispatch, counted by its cause (LOCAL DIAG).
 fn skip(k: usize, why: Cause) {
@@ -2163,6 +2167,36 @@ unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
     }
 }
 
+/// Why the arguments of a two-pass ExecuteIndirect cannot be read
+#[derive(Debug, PartialEq, Eq)]
+enum ArgsUnfit {
+    /// the argument resource is no console buffer in unified memory
+    NotConsole,
+    /// it is one, but `max * stride` bytes from the offset run past its end
+    Short { need: usize, have: usize },
+}
+
+/// Where the `commands` bytes of a two-pass ExecuteIndirect's arguments are in unified memory,
+/// `commands_at` the console buffer's address and bytes from the arguments' offset (None: the
+/// resource is no console buffer).
+fn ei_args_source(commands_at: Option<(usize, usize)>, commands: usize) -> Result<usize, ArgsUnfit> {
+    match commands_at {
+        None => Err(ArgsUnfit::NotConsole),
+        Some((p, n)) if commands <= n => Ok(p),
+        Some((_, n)) => Err(ArgsUnfit::Short { need: commands, have: n }),
+    }
+}
+
+/// The log line of an `ArgsUnfit`, for the argument resource `args` at title address `title`
+/// (None: unknown).
+fn args_unfit_message(why: &ArgsUnfit, args: usize, args_off: u64, title: Option<usize>) -> String {
+    let at = title.map_or_else(|| "no title address".to_string(), |va| format!("title address {va:#x}"));
+    match why {
+        ArgsUnfit::NotConsole => format!("args resource {args:#x} ({at}, offset {args_off:#x}) is not a console buffer"),
+        ArgsUnfit::Short { need, have } => format!("args resource {args:#x} ({at}, offset {args_off:#x}) is registered but max*stride runs past its end (need {need}, have {have})"),
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -2185,6 +2219,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pso = super::pso_async::resolve_wait(raw_pso);
     // where the commands are in unified memory (a console buffer's offsets are the title's)
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
+    let title_args_off = args_off;
     let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
     if super::targets::enabled() && signature_dispatches(sig) {
         super::targets::note_indirect_compute(raw_pso, commands_at, count_at, count_buf != 0, max, super::indirect_guard::plain_dispatch(sig));
@@ -2242,16 +2277,36 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         flush_two_pass(this, RunEnd::Draw);
         {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+            let commands = max as usize * msig.byte_stride as usize;
+            let src = if max == 0 || args == 0 {
+                None
+            } else {
+                match ei_args_source(commands_at, commands) {
+                    Ok(p) => Some(p),
+                    Err(why) => {
+                        mesh_work(this, super::targets::SKIPPED);
+                        let (cause, n) = match why {
+                            ArgsUnfit::NotConsole => {
+                                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                (Cause::EiArgsNotConsole, &N)
+                            }
+                            ArgsUnfit::Short { .. } => {
+                                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                (Cause::EiArgsShort, &N)
+                            }
+                        };
+                        skip(DRAWS_SKIPPED, cause);
+                        if n.fetch_add(1, Ordering::Relaxed) < 8 {
+                            let e = args_unfit_message(&why, args, title_args_off, super::real::title_address(args));
+                            crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {e}");
+                        }
+                        return;
+                    }
+                }
+            };
             super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [max, 0, 0], true);
             let run = (|| -> Result<(), String> {
-                if max == 0 || args == 0 {
-                    return Ok(());
-                }
-                let commands = max as usize * msig.byte_stride as usize;
-                let src = match commands_at {
-                    Some((p, n)) if commands <= n => p,
-                    _ => return Err("its arguments are not in a console buffer in unified memory".into()),
-                };
+                let Some(src) = src else { return Ok(()) };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let batch = two_pass_batch();
                 let (res_buf, res_va, region, records) = records_for(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record), batch)?;
@@ -3520,6 +3575,23 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// A two-pass ExecuteIndirect's arguments: no console buffer, and one too short for `max`
+    /// commands, are told apart (they were one message, and one cause)
+    #[test]
+    fn two_pass_args_unfit_causes() {
+        assert_eq!(ei_args_source(Some((0x1000, 64)), 64), Ok(0x1000));
+        assert_eq!(ei_args_source(Some((0x1000, 64)), 0), Ok(0x1000));
+        assert_eq!(ei_args_source(None, 16), Err(ArgsUnfit::NotConsole));
+        assert_eq!(ei_args_source(Some((0x1000, 63)), 64), Err(ArgsUnfit::Short { need: 64, have: 63 }));
+        let m = args_unfit_message(&ArgsUnfit::NotConsole, 0xab, 0x10, Some(0x7_0000_0000));
+        assert!(m.contains("is not a console buffer") && m.contains("title address 0x700000000") && m.contains("0xab"), "{m}");
+        let m = args_unfit_message(&ArgsUnfit::Short { need: 64, have: 63 }, 0xab, 0, None);
+        assert!(m.contains("registered but max*stride runs past its end (need 64, have 63)") && m.contains("no title address"), "{m}");
+        assert_eq!(CAUSE_NAMES[Cause::EiArgsNotConsole as usize], "EiArgsNotConsole");
+        assert_eq!(CAUSE_NAMES[Cause::EiArgsShort as usize], "EiArgsShort");
+        assert_eq!(CAUSE_NAMES.len(), CAUSES.len());
+    }
 
     /// Counts D3D12 takes are dispatched as they are; more than 65 535 in X with 1 in Y are
     /// folded into Y with the console's count kept (a retail game's 72 512 × 1 × 1); others past

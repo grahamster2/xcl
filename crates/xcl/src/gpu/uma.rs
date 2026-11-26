@@ -1407,6 +1407,26 @@ mod tests {
         n != 0 && m.State == MEM_FREE
     }
 
+    /// GPU heaps the coherent window has no room for go to the sparse windows
+    /// (`kernelx::VirtualAlloc`): every runtime layout has them, a 1 GB coherent window or not,
+    /// and they hold a title's two big heaps (1162 and 1277 MB) side by side.
+    #[test]
+    fn sparse_windows_take_heaps_the_coherent_window_cannot() {
+        for windows in [MAX_WINDOWS, 8, MAX_HEAP_WINDOWS] {
+            let u = Uma::for_runtime_windows(16 << 20, 1024 << 20, windows).expect("UMA aperture");
+            assert!(u.has_sparse(), "{windows} windows: sparse windows");
+            assert!((0..MAX_RUNTIME_SPARSE_WINDOWS).all(|k| u.is_sparse_window(k)), "{windows} windows");
+            let a = u.sparse_alloc(1162 << 20, 2 << 20).expect("the first heap");
+            let b = u.sparse_alloc(1277 << 20, 2 << 20).expect("the second heap");
+            for (at, n) in [a, b] {
+                assert!(u.is_sparse(at) && u.is_sparse(at + n - 1), "{windows} windows: {at:#x}+{n:#x}");
+                assert_eq!(u.window_of(at), u.window_of(at + n - 1), "never across a window boundary");
+            }
+            assert!(a.0 + a.1 <= b.0 || b.0 + b.1 <= a.0, "apart");
+            assert!(u.sparse_release(a.0).is_some() && u.sparse_release(b.0).is_some());
+        }
+    }
+
     #[test]
     fn runtime_layout_supports_eight_and_sixteen_heap_windows() {
         for windows in [8usize, MAX_HEAP_WINDOWS] {
