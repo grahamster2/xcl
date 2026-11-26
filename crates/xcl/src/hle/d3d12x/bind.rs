@@ -98,38 +98,24 @@ impl TwoPassBuf {
     /// that asked is skipped.
     unsafe fn make(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<Self, String> {
         let cap = two_pass_cap();
-        if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
-            // (counted with `FREE_RES` locked, so its bytes are in the load; none go when they
-            // cannot make the room: the draw is skipped either way, and the recordings after it
-            // can still take them)
-            // (a recording's fence may have passed since `take_free` drained `FENCED_RES`: its
-            // buffers count against the cap all the same, so they go to `FREE_RES` to make room)
-            let passed = take_fenced_done();
-            let (evicted, gone) = {
-                let mut free = FREE_RES.lock().unwrap();
-                let now = std::time::Instant::now();
-                let mut evicted = Vec::new();
-                for b in passed {
-                    evicted.extend(free.put(now, b.bytes, b.dev, b));
-                }
-                let over = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
-                (evicted, free.take_room(over))
-            };
-            // (the GPU is done with those: let go outside the lock)
-            let made_room = gone.is_some() || !evicted.is_empty();
-            drop((evicted, gone));
-            if !made_room || !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
-                note_two_pass(TP_REFUSED);
-                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::xlog_warn!(
-                        "D3D12.X: a {what} of {} KiB would take the two-pass buffers alive past {} MiB (XCL_TWO_PASS_MB): its draw is skipped",
-                        bytes >> 10,
-                        cap >> 20
-                    );
-                }
-                return Err(format!("the two-pass buffers alive are at {} MiB (XCL_TWO_PASS_MB)", cap >> 20));
+        // (a recording's fence may have passed since `take_free` drained `FENCED_RES`: its
+        // buffers count against the cap all the same, so they go to `FREE_RES` to make room)
+        let passed = || take_fenced_done().into_iter().map(|b| (b.bytes, b.dev, b)).collect();
+        if let Err(free_bytes) = reserve_with_room(&TWO_PASS[TP_ALIVE], &FREE_RES, passed, bytes, cap) {
+            note_two_pass(TP_REFUSED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                // (what is alive and not kept for reuse is mostly held by lists until their
+                // next reset: a closed list may be submitted again, so its buffers stay)
+                crate::xlog_warn!(
+                    "D3D12.X: a {what} of {} KiB would take the two-pass buffers alive past {} MiB (XCL_TWO_PASS_MB): its draw is skipped ({} MiB alive, {} MiB of them kept for reuse)",
+                    bytes >> 10,
+                    cap >> 20,
+                    TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) >> 20,
+                    free_bytes >> 20
+                );
             }
+            return Err(format!("the two-pass buffers alive are at {} MiB (XCL_TWO_PASS_MB)", cap >> 20));
         }
         let res = match default_uav_buffer(dev, bytes, what) {
             Ok(r) => r,
@@ -140,6 +126,38 @@ impl TwoPassBuf {
         };
         note_two_pass(TP_MADE);
         Ok(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize })
+    }
+}
+
+/// `bytes` more counted in `alive` within `cap` (`reserve`). When they do not fit, the oldest
+/// buffers of `free`, of any size and device, are let go first to make the room (with `passed`,
+/// (bytes, device, buffer) the GPU is done with, put there first) – none when all of them cannot
+/// make it: the draw is skipped either way, and the recordings after it can still take them.
+/// Err: not counted, with the bytes `free` kept then. Dropping a `T` takes its bytes off `alive`.
+fn reserve_with_room<T>(alive: &AtomicU64, free: &Mutex<FreePool<T>>, passed: impl FnOnce() -> Vec<(u64, usize, T)>, bytes: u64, cap: u64) -> Result<(), u64> {
+    if reserve(alive, bytes, cap) {
+        return Ok(());
+    }
+    let passed = passed();
+    // (counted with `free` locked, so its bytes are in the load)
+    let (evicted, gone, kept) = {
+        let mut free = free.lock().unwrap();
+        let now = std::time::Instant::now();
+        let mut evicted = Vec::new();
+        for (b, d, t) in passed {
+            evicted.extend(free.put(now, b, d, t));
+        }
+        let over = alive.load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
+        let gone = free.take_room(over);
+        (evicted, gone, free.bytes)
+    };
+    // (the GPU is done with those: let go outside the lock)
+    let made_room = gone.is_some() || !evicted.is_empty();
+    drop((evicted, gone));
+    if made_room && reserve(alive, bytes, cap) {
+        Ok(())
+    } else {
+        Err(kept)
     }
 }
 
@@ -215,13 +233,16 @@ fn note_two_pass(k: usize) {
     }
     let [made, reused, gone, alive, refused] = std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
     crate::xlog_info!(
-        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB), {} MiB waiting for fences, {} MiB waiting for allocator resets, {} MiB for no known allocator; {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
+        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB), {} MiB waiting for fences, {} MiB waiting for allocator resets, {} MiB for no known allocator, {} MiB held by lists until their next reset; {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
         made.saturating_sub(gone),
         alive >> 20,
         kept_bytes >> 20,
         fenced_bytes >> 20,
         held_bytes >> 20,
         unknown_bytes >> 20,
+        // (the rest: the buffers of recordings, and of closed lists, which may be submitted
+        // again – none of them can go to make room)
+        alive.saturating_sub(kept_bytes + fenced_bytes + held_bytes + unknown_bytes) >> 20,
         two_pass_cap() >> 20
     );
 }
@@ -5126,6 +5147,75 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(p.take_room(mib), Some(vec!["1"]), "all there are, when they make it");
         assert_eq!((p.bytes, p.free.len()), (0, 0));
         assert!(two_pass_cap() > 0);
+    }
+
+    /// At the cap, a record buffer that would pass it is still made when the buffers kept for
+    /// reuse can make the room: the oldest of them go, of any size (scratch blocks of 1 MiB for a
+    /// 32 MiB record buffer), and their bytes come off the count as they go. A request takes a
+    /// kept buffer as big or bigger than it needs before any is made.
+    #[test]
+    fn a_buffer_past_the_cap_is_made_by_letting_kept_ones_go() {
+        let mib = 1u64 << 20;
+        let cap = 2048 * mib;
+        static ALIVE: AtomicU64 = AtomicU64::new(0);
+        struct Buf(u64);
+        impl Drop for Buf {
+            fn drop(&mut self) {
+                ALIVE.fetch_sub(self.0, Ordering::Relaxed);
+            }
+        }
+        let make = |bytes: u64| {
+            assert!(reserve(&ALIVE, bytes, cap));
+            Buf(bytes)
+        };
+        let free: Mutex<FreePool<Buf>> = Mutex::new(FreePool::new(1 << 30));
+        let none = Vec::new;
+        // lists hold 1500 MiB until their reset; 532 MiB of idle buffers are kept: 20 scratch
+        // blocks of 1 MiB, then 32 of 16 MiB – 2032 MiB alive
+        let held: Vec<Buf> = (0..75).map(|_| make(20 * mib)).collect();
+        let now = std::time::Instant::now();
+        for _ in 0..20 {
+            assert!(free.lock().unwrap().put(now, mib, 1, make(mib)).is_empty());
+        }
+        for _ in 0..32 {
+            assert!(free.lock().unwrap().put(now, 16 * mib, 1, make(16 * mib)).is_empty());
+        }
+        assert_eq!(ALIVE.load(Ordering::Relaxed), 2032 * mib);
+        // no kept one is 32 MiB or more: a new one, 16 MiB past the cap
+        assert!(free.lock().unwrap().take(1, 32 * mib, u64::MAX).is_none());
+        assert_eq!(reserve_with_room(&ALIVE, &free, none, 32 * mib, cap), Ok(()));
+        let made = Buf(32 * mib);
+        // 16 of the scratch blocks made the 16 MiB, no more went: at the cap itself
+        assert_eq!(ALIVE.load(Ordering::Relaxed), cap);
+        assert_eq!(free.lock().unwrap().bytes, 516 * mib);
+        // again and again, while the kept ones last (the last 4 blocks and 16 MiB ones go)
+        let mut more = vec![made];
+        while reserve_with_room(&ALIVE, &free, none, 32 * mib, cap).is_ok() {
+            more.push(Buf(32 * mib));
+            assert!(ALIVE.load(Ordering::Relaxed) <= cap);
+        }
+        assert_eq!(free.lock().unwrap().bytes, 0, "refused only when none are left");
+        assert_eq!(more.len(), 17);
+        assert_eq!(ALIVE.load(Ordering::Relaxed), 2044 * mib);
+        // refused: not counted, and the kept ones (here none) stay
+        assert_eq!(reserve_with_room(&ALIVE, &free, none, 32 * mib, cap), Err(0));
+        assert_eq!(ALIVE.load(Ordering::Relaxed), 2044 * mib);
+        // two let go, and the GPU passed a 64 MiB one since: put there first, it makes the room
+        more.truncate(15);
+        assert!(reserve(&ALIVE, 64 * mib, cap));
+        let passed = || vec![(64 * mib, 1usize, Buf(64 * mib))];
+        assert_eq!(reserve_with_room(&ALIVE, &free, passed, 32 * mib, cap), Ok(()));
+        more.push(Buf(32 * mib));
+        assert_eq!(ALIVE.load(Ordering::Relaxed), 2012 * mib);
+        assert_eq!(free.lock().unwrap().bytes, 0);
+        // a kept one bigger than asked is taken again, before any is made
+        more.truncate(14);
+        let big = make(64 * mib);
+        assert!(free.lock().unwrap().put(now, 64 * mib, 1, big).is_empty());
+        let taken = free.lock().unwrap().take(1, 32 * mib, u64::MAX);
+        assert_eq!(taken.as_ref().map(|b| b.0), Some(64 * mib), "as big as asked or bigger");
+        drop((held, more, taken));
+        assert_eq!(ALIVE.load(Ordering::Relaxed), 0);
     }
 
     /// A recording takes the smallest freed buffer that is large enough, of its device and within
