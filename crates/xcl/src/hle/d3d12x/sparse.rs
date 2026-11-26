@@ -4876,7 +4876,7 @@ mod tests {
             assert_eq!(windows_sys::Win32::System::Memory::ResetWriteWatch(home as *const c_void, n * TILE), 0);
             super::super::title_textures::refresh(queue.as_raw());
             std::ptr::write_bytes(home as *mut u8, 0xdd, n * TILE);
-            readback_after_execute(&queue, &[(home, n * TILE)]);
+            readback_after_execute(&queue, &[(home, n * TILE)], &[]);
             let result = std::slice::from_raw_parts(home as *const u8, n * TILE);
             assert_eq!(&result[..TILE], &first);
             assert!(result[TILE..2 * TILE].iter().all(|&b| b == 0));
