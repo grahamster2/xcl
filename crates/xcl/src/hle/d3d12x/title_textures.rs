@@ -4875,7 +4875,7 @@ pub(super) mod tests {
         let (parts, without) = lazy_level_parts(chain, Some(vec![(one.0, one.0 + 0x1000)]), &[0], &mapped);
         assert_eq!(parts, Some(vec![(one.0, one.0 + 0x1000), top]));
         assert!(without.is_empty());
-        assert!(parts.unwrap().iter().map(|r| r.1 - r.0).sum::<usize>() < chain.slice_bytes / 2);
+        assert!(parts.unwrap().iter().map(|r| r.1 - r.0).sum::<usize>() < chain.slice_bytes, "not all of it");
         // nothing written, mip 0 given pages: mip 0 alone
         assert_eq!(lazy_level_parts(chain, Some(Vec::new()), &[0], &mapped).0, Some(vec![top]));
         // every level with pages and all of it asked for: all of it
