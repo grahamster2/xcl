@@ -116,6 +116,20 @@ struct TileEntry {
     gen: u32,
 }
 
+/// The mapped tiles of the windows' own (not GPU views), and how many of them hold video memory
+/// no CPU write was ever sent to: every committed page still has no `sent` hashes. Such a tile
+/// holds zeros unless the GPU wrote to it.
+fn never_sent(mapped: &FxHashMap<usize, TileEntry>) -> (usize, usize) {
+    let (mut own, mut unsent) = (0, 0);
+    for e in mapped.values().filter(|e| e.src == 0) {
+        own += 1;
+        if e.sent.iter().all(|p| p.is_none()) {
+            unsent += 1;
+        }
+    }
+    (own, unsent)
+}
+
 /// the last `TileEntry::gen` given out
 static TILE_GEN: AtomicU32 = AtomicU32::new(0);
 
@@ -4242,6 +4256,8 @@ impl State {
             let us = SUBMIT_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
             if n.is_power_of_two() && n >= 16 {
                 crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
+                let (own, unsent) = never_sent(&s.mapped);
+                crate::xlog_info!("sparse windows: {unsent} of the windows' own {own} mapped tiles ({} of {} MB) never got a byte from the CPU (zeros, or what the GPU wrote)", unsent * TILE >> 20, own * TILE >> 20);
                 let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
                 let c = &s.counts;
                 crate::xlog_info!(
