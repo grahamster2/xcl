@@ -78,7 +78,13 @@ struct Chain {
     first_bytes: u64,
     tail_bytes: u64,
     whole_bytes: AtomicU64,
+    /// a thread of its own builds the whole form (`whole_ready`)
+    whole_sent: std::sync::atomic::AtomicBool,
 }
+
+/// A chain for the thread that builds its whole form (D3D12 objects are free-threaded).
+struct ChainRef(Arc<Chain>);
+unsafe impl Send for ChainRef {}
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
@@ -192,7 +198,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let (first_bytes, tail_bytes) = (blob_bytes(&first), tail.iter().map(|p| blob_bytes(p)).sum());
     let chain = Arc::new(Chain { builder, tail: Mutex::new(Some(tail)), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()),
-        first_bytes, tail_bytes, whole_bytes: AtomicU64::new(0) });
+        first_bytes, tail_bytes, whole_bytes: AtomicU64::new(0), whole_sent: Default::default() });
     let programs = PROGRAMS.fetch_add(1, Ordering::Relaxed) + 1;
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -211,6 +217,48 @@ pub(super) fn forget(pso: usize) {
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     chain.map(|c| c.whole()).transpose()
+}
+
+/// The whole form of a split program for an indirect dispatch, which runs no chain (its group
+/// counts are the GPU's).
+pub(in crate::hle::d3d12x) enum Whole {
+    /// no split program: the pipeline as it is
+    Plain,
+    Ready(ID3D12PipelineState),
+    /// still being built on a thread of its own: this dispatch goes without it
+    Late,
+}
+
+/// `whole` where a compute pipeline's dispatches go on without it while it is built
+/// (`pso_async::cs_goes_on`): the whole form, the largest program the driver compiles, is built
+/// by a thread of its own, once, and until it is there its dispatches are left out as those of
+/// any late compute pipeline. Built in the call, a retail title's render thread stood in the
+/// driver's compiler for it (1.1 MB of DXIL) and every other thread that dispatched it stood
+/// behind `build_whole`: no frame for over two minutes after its first world frame.
+pub(in crate::hle::d3d12x) unsafe fn whole_ready(pso: usize) -> Result<Whole, String> {
+    let chain = CHAINS.lock().unwrap().get(&pso).cloned();
+    let Some(chain) = chain else { return Ok(Whole::Plain) };
+    if let Some(p) = chain.whole.get() {
+        return Ok(Whole::Ready(p.clone()));
+    }
+    if !super::super::pso_async::cs_goes_on() {
+        return chain.whole().map(Whole::Ready);
+    }
+    if !chain.whole_sent.swap(true, Ordering::AcqRel) {
+        let job = ChainRef(chain.clone());
+        // (named as the pipeline workers: a huge compile takes its turn at the gate)
+        let spawned = std::thread::Builder::new().name("xcl-pso-whole".into()).stack_size(64 << 20).spawn(move || {
+            let job = job;
+            if let Err(e) = unsafe { job.0.whole() } {
+                crate::xlog_warn!("D3D12.X: the whole form of a split compute program was not built ({e}): its indirect dispatches stay left out");
+            }
+        });
+        if spawned.is_err() {
+            chain.whole_sent.store(false, Ordering::Release);
+            return chain.whole().map(Whole::Ready);
+        }
+    }
+    Ok(Whole::Late)
 }
 
 struct Scratch {
@@ -398,6 +446,7 @@ mod tail_tests {
             let chain = Chain {
                 builder, tail: Mutex::new(Some(tail)), words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
                 build_whole: Mutex::new(()), first_bytes: 0, tail_bytes: 0, whole_bytes: AtomicU64::new(0),
+                whole_sent: Default::default(),
             };
             // no whole form yet: the pieces are all there is
             assert!(chain.release_tail().is_none());

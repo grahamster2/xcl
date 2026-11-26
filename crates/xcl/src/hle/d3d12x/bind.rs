@@ -3310,8 +3310,19 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx, None, 0) {
         Ok(b) => {
             let whole = if compute {
-                match super::real::dispatch_chain::whole(pso) {
-                    Ok(w) => w,
+                match super::real::dispatch_chain::whole_ready(pso) {
+                    Ok(super::real::dispatch_chain::Whole::Plain) => None,
+                    Ok(super::real::dispatch_chain::Whole::Ready(w)) => Some(w),
+                    Ok(super::real::dispatch_chain::Whole::Late) => {
+                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 4 || n.is_power_of_two() {
+                            crate::xlog_warn!("D3D12.X: ExecuteIndirect of a split compute program whose whole form is still being built skipped ({n} so far)");
+                        }
+                        ei_work(this, sig, super::targets::SKIPPED);
+                        count(DISPATCHES_SKIPPED);
+                        return;
+                    }
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         ei_work(this, sig, super::targets::SKIPPED);
