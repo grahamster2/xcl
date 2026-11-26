@@ -9,7 +9,7 @@
 //!
 //! A console title's window is the screen: no caption or frame, its client area the whole
 //! window, 1920x1080 (GetClientRect gives that on every console; titles pick 4K output
-//! themselves). On the PC a 1920x1080 overlapped window has a 1904x1041 client area, and a title
+//! themselves) – or the `XCL_DISPLAY` mode's size (`hle::display`). On the PC a 1920x1080 overlapped window has a 1904x1041 client area, and a title
 //! that sizes its back buffer from it (Minecraft) resolved its 1920x1080 scene past the end of
 //! it – the list failed to close and the device was removed. So the title's top-level windows
 //! are made frameless, the console's size, kept frameless through style changes
@@ -114,9 +114,6 @@ extern "system" {
     fn DwmSetWindowAttribute(hwnd: *mut c_void, attr: u32, value: *const c_void, size: u32) -> i32;
 }
 
-/// the console's screen as a title's window sees it
-const CONSOLE_W: i32 = 1920;
-const CONSOLE_H: i32 = 1080;
 const WS_CHILD: u32 = 0x4000_0000;
 const WS_POPUP: u32 = 0x8000_0000;
 /// caption, border, sizing frame, system menu, minimize / maximize boxes
@@ -136,7 +133,8 @@ const DWMWA_CLOAK: u32 = 13;
 /// the window procedure each console window had (hwnd → procedure)
 static PROCS: std::sync::Mutex<Vec<(usize, isize)>> = std::sync::Mutex::new(Vec::new());
 
-/// A console title's top-level window: frameless, 1920x1080, cloaked (see the module notes).
+/// A console title's top-level window: frameless, 1920x1080 (or the `XCL_DISPLAY` size),
+/// cloaked (see the module notes).
 #[allow(clippy::too_many_arguments)]
 unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void {
     if style & WS_CHILD != 0 {
@@ -144,7 +142,9 @@ unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, st
     }
     let style = style & !WS_FRAME | WS_POPUP;
     let ex_style = ex_style & !WS_EX_FRAME & !WS_EX_APPWINDOW | WS_EX_TOOLWINDOW;
-    let hwnd = CreateWindowExW(ex_style, class, title, style, 0, 0, CONSOLE_W, CONSOLE_H, parent, menu, instance, param);
+    // the console's screen as a title's window sees it
+    let (console_w, console_h) = crate::hle::display::window_size();
+    let hwnd = CreateWindowExW(ex_style, class, title, style, 0, 0, console_w, console_h, parent, menu, instance, param);
     if hwnd.is_null() {
         return hwnd;
     }
@@ -156,7 +156,7 @@ unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, st
         // SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
         SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, 0x2 | 0x1 | 0x4 | 0x10 | 0x20);
     }
-    crate::xlog_info!("user: the title's window {hwnd:p} is the console's screen ({CONSOLE_W}x{CONSOLE_H}, no frame, cloaked)");
+    crate::xlog_info!("user: the title's window {hwnd:p} is the console's screen ({console_w}x{console_h}, no frame, cloaked)");
     hwnd
 }
 
@@ -170,12 +170,13 @@ unsafe extern "system" fn console_wndproc(hwnd: *mut c_void, msg: u32, wp: usize
         WM_NCCALCSIZE => 0,
         WM_GETMINMAXINFO => {
             let r = CallWindowProcW(orig, hwnd, msg, wp, lp);
+            let (console_w, console_h) = crate::hle::display::window_size();
             // MINMAXINFO: ptMaxSize (+8), ptMaxTrackSize (+24)
             if let Some(m) = (lp as *mut [i32; 10]).as_mut() {
-                m[2] = m[2].max(CONSOLE_W);
-                m[3] = m[3].max(CONSOLE_H);
-                m[6] = m[6].max(CONSOLE_W);
-                m[7] = m[7].max(CONSOLE_H);
+                m[2] = m[2].max(console_w);
+                m[3] = m[3].max(console_h);
+                m[6] = m[6].max(console_w);
+                m[7] = m[7].max(console_h);
             }
             r
         }

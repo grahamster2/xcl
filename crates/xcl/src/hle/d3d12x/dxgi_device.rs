@@ -3,6 +3,8 @@
 //! as Microsoft's public GDK samples do). A PC D3D12 device is not, so a small object answers
 //! IDXGIDevice / 1 / 2 with the device's real adapter; every other interface is the device's.
 //! Console code only (`real::dev_qi_x`): DXGI asks the device the same and needs the PC answer.
+//! With `XCL_DISPLAY` the adapter is `dxgi_output`'s, whose one output is the console's TV in
+//! that mode.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -122,7 +124,10 @@ unsafe extern "system" fn get_parent(p: *mut c_void, riid: *const GUID, out: *mu
         return E_POINTER;
     }
     match adapter(p) {
-        Ok(a) => a.query(&*riid, out).0,
+        Ok(a) => match crate::hle::display::mode() {
+            Some(m) => IDXGIAdapter::from_raw(super::dxgi_output::wrap_adapter(&a, m)).query(&*riid, out).0,
+            None => a.query(&*riid, out).0,
+        },
         Err(hr) => hr,
     }
 }
@@ -133,7 +138,10 @@ unsafe extern "system" fn get_adapter(p: *mut c_void, out: *mut *mut c_void) -> 
     }
     match adapter(p) {
         Ok(a) => {
-            *out = a.into_raw();
+            *out = match crate::hle::display::mode() {
+                Some(m) => super::dxgi_output::wrap_adapter(&a, m),
+                None => a.into_raw(),
+            };
             S_OK
         }
         Err(hr) => {

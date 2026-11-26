@@ -437,6 +437,11 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     interval (`SetFrameIntervalX`) is kept. `0`, `off` or `uncapped` removes the cap, so
     `WaitFrameEventX` returns at once with a fresh token. A number of microseconds is an upper
     bound on the interval, never below 1000: `8333` for 120 Hz, `4167` for 240 Hz.
+  - `XCL_DISPLAY`: the display mode the title is told about, `<width>x<height>[@<hz>]`
+    (`1920x1080`, `2560x1440`, `1920x1080@120`; 60 Hz by default). Unset, the title's window
+    is 1920x1080 and its device's DXGI output is the PC's monitor. Set, the window is that
+    size and the output has a desktop of that size and that one display mode. Titles that pick
+    their output size from the console model ignore it.
   - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the

@@ -190,11 +190,14 @@ fn ticks(us: i64) -> i64 {
     us * qpf() / 1_000_000
 }
 
-/// the monitor runs at 120 Hz or more
+/// the display runs at 120 Hz or more (the `XCL_DISPLAY` mode's rate, else the monitor's)
 fn high_refresh() -> bool {
     use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
     static HIGH: OnceLock<bool> = OnceLock::new();
     *HIGH.get_or_init(|| unsafe {
+        if let Some(m) = crate::hle::display::mode() {
+            return m.refresh_hz >= 119;
+        }
         let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
         EnumDisplaySettingsW(windows::core::PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() && dm.dmDisplayFrequency >= 119
     })

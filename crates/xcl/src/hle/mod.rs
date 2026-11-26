@@ -16,6 +16,7 @@ pub mod bcpack;
 pub mod bink;
 pub mod d3d12_layout;
 pub mod d3d12x;
+pub mod display;
 pub mod dstorage;
 pub mod dxcompiler;
 pub mod gameinput;

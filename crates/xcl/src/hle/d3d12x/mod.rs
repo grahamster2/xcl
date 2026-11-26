@@ -20,6 +20,7 @@ pub mod cs_trace;
 mod depth_uav;
 pub mod device_x;
 pub mod dxgi_device;
+pub mod dxgi_output;
 mod cpu_writes;
 pub mod dred;
 mod fence_x;
