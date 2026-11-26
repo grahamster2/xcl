@@ -350,6 +350,9 @@ struct ListState {
     uma: Vec<usize>,
     /// where the next draw's argument table and io go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// where the next AllocateUploadMemory piece goes with `XCL_UPLOAD_SPARSE` (sparse blocks,
+    /// in `uma` too)
+    upload: crate::gpu::uma::Arena,
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
@@ -477,6 +480,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
         st.chunks.clear();
         st.arena = Default::default();
+        st.upload = Default::default();
         (st.pc, std::mem::replace(&mut st.allocator, allocator as usize), std::mem::take(&mut st.uma))
     }) else {
         return crate::util::E_FAIL;
@@ -586,22 +590,33 @@ unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *con
 }
 unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
     let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
+    use super::cs_trace::{note_upload, Upload};
     let size = size.max(16);
     let align = align.max(16);
     if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
+        // `XCL_UPLOAD_SPARSE=1`: the list's arena of sparse blocks (video memory) first
+        if super::cs_trace::upload_sparse() && u.has_sparse() {
+            if let Some(p) = super::cs_trace::sparse_upload_piece(align, |block| with_list(this as usize, |st| st.upload.take_with(size, align, &mut st.uma, block)).flatten()) {
+                note_upload(p as usize, size, Upload::SparseArena);
+                return p;
+            }
+        }
         if let Some(p) = with_list(this as usize, |st| st.arena.take(u, size, align, &mut st.uma)).flatten() {
+            note_upload(p as usize, size, Upload::Arena);
             return p;
         }
     }
     if u.has_sparse() {
         if let Some((p, _)) = super::sparse::alloc(size, align) {
             with_list(this as usize, |st| st.uma.push(p));
+            note_upload(p, size, Upload::Sparse);
             return p as *mut u8;
         }
     }
     match u.alloc(size, align) {
         Some(p) => {
             with_list(this as usize, |st| st.uma.push(p as usize));
+            note_upload(p as usize, size, Upload::Coherent);
             p
         }
         None => std::ptr::null_mut(),
@@ -658,7 +673,7 @@ pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
 pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> *mut c_void {
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
-    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default() };
+    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default(), upload: Default::default() };
     new_chunk(obj, &mut st);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
@@ -683,6 +698,11 @@ pub fn pc_pso(pso: *mut c_void) -> *mut c_void {
 unsafe fn free_uma(blocks: &[usize]) {
     if let Some(u) = crate::gpu::uma::get() {
         for &b in blocks {
+            // (`XCL_TRACE_CS`: upload pieces in the block are forgotten)
+            if super::cs_trace::on() {
+                let bytes = if u.is_sparse(b) { u.sparse_reservation(b).map(|r| r.1) } else { u.block_len(b) };
+                super::cs_trace::note_freed(b, bytes.unwrap_or(crate::gpu::uma::ARENA_BLOCK));
+            }
             if u.is_sparse(b) {
                 super::sparse::free(b);
             } else {

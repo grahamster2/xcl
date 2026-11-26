@@ -37,6 +37,9 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// where the next AllocateUploadMemory piece goes with `XCL_UPLOAD_SPARSE` (sparse blocks,
+    /// in `uma` too)
+    upload: crate::gpu::uma::Arena,
     /// a heap of views is bound (`list_x::ensure_view_heap`)
     heap_bound: bool,
     res_buf: Option<TwoPassBuf>,
@@ -869,6 +872,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let (old, blocks, res_bufs, res_marks, res_untracked, had_fb) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.upload = Default::default();
         s.heap_bound = false;
         s.pso = initial_pso;
         s.layout = None;
@@ -933,6 +937,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (old, blocks, res_bufs, res_marks, res_untracked, had_fb) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.upload = Default::default();
         s.heap_bound = false;
         s.layout = layout;
         s.args = args;
@@ -1040,8 +1045,8 @@ pub(super) fn dispatch_dropped() {
 
 /// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
 pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
-    let arena = with(from, |s| std::mem::take(&mut s.arena));
-    with(to, |s| s.arena = arena);
+    let (arena, upload) = with(from, |s| (std::mem::take(&mut s.arena), std::mem::take(&mut s.upload)));
+    with(to, |s| (s.arena, s.upload) = (arena, upload));
 }
 
 /// The list is gone.
@@ -4189,22 +4194,33 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     let Some(u) = crate::gpu::uma::get() else {
         return std::ptr::null_mut();
     };
+    use super::cs_trace::{note_upload, Upload};
     let size = size.max(16);
     let align = align.max(16);
     if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
+        // `XCL_UPLOAD_SPARSE=1`: the list's arena of sparse blocks (video memory) first
+        if super::cs_trace::upload_sparse() && u.has_sparse() {
+            if let Some(p) = super::cs_trace::sparse_upload_piece(align, |block| with(this, |s| s.upload.take_with(size, align, &mut s.uma, block))) {
+                note_upload(p as usize, size, Upload::SparseArena);
+                return p;
+            }
+        }
         if let Some(p) = with(this, |s| s.arena.take(u, size, align, &mut s.uma)) {
+            note_upload(p as usize, size, Upload::Arena);
             return p;
         }
     }
     if u.has_sparse() {
         if let Some((p, _)) = super::sparse::alloc(size, align) {
             with(this, |s| s.uma.push(p));
+            note_upload(p, size, Upload::Sparse);
             return p as *mut u8;
         }
     }
     match u.alloc(size, align) {
         Some(p) => {
             with(this, |s| s.uma.push(p as usize));
+            note_upload(p as usize, size, Upload::Coherent);
             p
         }
         None => std::ptr::null_mut(),
@@ -4233,6 +4249,11 @@ fn note_arena_full(u: &crate::gpu::uma::Uma, asked: usize) {
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
+    }
+    // `XCL_TRACE_CS`: what a named program's dispatch binds, and where that memory is
+    if super::cs_trace::on() {
+        let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+        super::cs_trace::dispatch(pso, [x, y, z], layout.as_deref(), &args);
     }
     if super::real::skip_named_cs(pso) {
         return Ok(());

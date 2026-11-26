@@ -1594,6 +1594,25 @@ fn note_sparse_readback(res: usize) {
     SPARSE_READBACK.lock().unwrap().get_or_insert_with(HashSet::new).insert(res);
 }
 
+/// Whether `Map(0, NULL)` of `res` reads its range back from video memory (diagnostics).
+pub fn is_sparse_readback(res: usize) -> bool {
+    SPARSE_READBACK.lock().unwrap().as_ref().is_some_and(|s| s.contains(&res))
+}
+
+/// Diagnostics (`XCL_TRACE_CS`): the console resource in unified memory that holds `va` – the
+/// smallest, if several do: (resource, address, bytes, whether XCL allocated the memory).
+pub fn console_resource_at(va: usize) -> Option<(usize, usize, usize, bool)> {
+    let g = UMA_BUFFERS.lock().unwrap();
+    g.as_ref()?.iter().filter(|(_, &(p, n, _))| va >= p && va - p < n.max(1)).map(|(&r, &(p, n, xcl))| (r, p, n, xcl)).min_by_key(|x| x.2)
+}
+
+/// Diagnostics (`XCL_TRACE_CS`): the heap whose block of unified memory (`heap_block`) holds
+/// `va`: (heap, block, bytes, whether it is a CPU-readback heap).
+pub fn heap_block_at(va: usize) -> Option<(usize, usize, usize, bool)> {
+    let g = HEAP_UMA.lock().unwrap();
+    g.as_ref()?.iter().find_map(|(&h, e)| e.block.filter(|&b| va >= b && va - b < e.size).map(|b| (h, b, e.size, e.cpu_readback)))
+}
+
 /// Whether `props` asks for CPU-cached readback memory. On Xbox UMA, `D3D12_HEAP_TYPE_CUSTOM`
 /// with `D3D12_CPU_PAGE_PROPERTY_WRITE_BACK` is the general CPU-cached graphics pool (used for
 /// hundreds of MB of VBs/IBs/CBs/UAVs), so only explicit `D3D12_HEAP_TYPE_READBACK` heaps — or

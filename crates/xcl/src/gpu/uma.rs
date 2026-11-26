@@ -1048,6 +1048,48 @@ impl Arena {
         self.end = p + ARENA_BLOCK;
         Some(p as *mut u8)
     }
+
+    /// `take` with blocks from `block(bytes, align)` (an address, or None: no room) in place of
+    /// the committed window: an arena of other memory (`XCL_UPLOAD_SPARSE`: the sparse windows).
+    /// A piece larger than half a block gets a block of its own (the current one stays in use);
+    /// the blocks go to `blocks` as with `take`.
+    pub fn take_with(&mut self, n: usize, align: usize, blocks: &mut Vec<usize>, block: impl FnOnce(usize, usize) -> Option<usize>) -> Option<*mut u8> {
+        let align = align.max(16).next_power_of_two();
+        let n = n.max(1);
+        let at = (self.at + align - 1) & !(align - 1);
+        if self.at != 0 && at + n <= self.end {
+            self.at = at + n;
+            return Some(at as *mut u8);
+        }
+        let own = n > ARENA_BLOCK / 2;
+        let bytes = if own { n.checked_next_multiple_of(GRAIN)? } else { ARENA_BLOCK };
+        let p = block(bytes, align.max(GRAIN))?;
+        blocks.push(p);
+        if !own {
+            self.at = p + n;
+            self.end = p + ARENA_BLOCK;
+        }
+        Some(p as *mut u8)
+    }
+}
+
+impl Uma {
+    /// Whether `p` is in XCL's arena pool (`reserve_pool`).
+    pub fn in_pool(&self, p: usize) -> bool {
+        let g = self.pool.lock().unwrap();
+        p >= g.0 && p < g.1
+    }
+
+    /// The block handed out in a committed window that holds `p`: (start, bytes). Diagnostics
+    /// (`XCL_TRACE_CS`): XCL's pool is one block here.
+    pub fn block_at(&self, p: usize) -> Option<(usize, usize)> {
+        if !self.is_committed(p) {
+            return None;
+        }
+        let off = p - self.base;
+        let g = self.inner.lock().unwrap();
+        g.used.range(..=off).next_back().filter(|(&o, &l)| off < o + l).map(|(&o, &l)| (self.base + o, l))
+    }
 }
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
@@ -1292,6 +1334,56 @@ mod tests {
         }
         let mut a = Arena::default();
         assert!(a.take(&u, 200, 256, &mut blocks).is_some(), "freed blocks are back in the pool");
+    }
+
+    /// `take_with` cuts blocks of the memory it is given (`XCL_UPLOAD_SPARSE`'s sparse blocks)
+    /// as `take` cuts the committed window's: small pieces share a block, a large one has its own
+    /// and the current block goes on; no block, no piece.
+    #[test]
+    fn an_arena_of_other_memory_cuts_its_blocks_into_aligned_pieces() {
+        let mut next = 0x40_0000_0000usize;
+        let mut asked: Vec<(usize, usize)> = Vec::new();
+        let (mut a, mut blocks) = (Arena::default(), Vec::new());
+        let mut block = |n: usize, al: usize, asked: &mut Vec<(usize, usize)>| {
+            asked.push((n, al));
+            let p = next.next_multiple_of(al);
+            next = p + n;
+            Some(p)
+        };
+        let mut got = Vec::new();
+        for k in 0..600usize {
+            let n = 16 + (k % 5) * 100;
+            let p = a.take_with(n, 64, &mut blocks, |n, al| block(n, al, &mut asked)).unwrap() as usize;
+            assert_eq!(p % 64, 0);
+            got.push((p, n));
+        }
+        got.sort_unstable();
+        assert!(got.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "pieces overlap");
+        assert!(asked.iter().all(|&(n, al)| n == ARENA_BLOCK && al == GRAIN), "{asked:?}");
+        assert_eq!(blocks.len(), asked.len());
+        let last = *blocks.last().unwrap();
+        let big = a.take_with(ARENA_BLOCK / 2 + 1, 256, &mut blocks, |n, al| block(n, al, &mut asked)).unwrap() as usize;
+        assert_eq!(asked.last(), Some(&(ARENA_BLOCK / 2 + GRAIN, GRAIN)), "a large piece: a block of its own, whole grains");
+        assert_eq!(blocks.last(), Some(&big));
+        let small = a.take_with(16, 16, &mut blocks, |_, _| panic!("the current block has room")).unwrap() as usize;
+        assert!(small > last && small < last + ARENA_BLOCK, "the current block goes on after a large piece");
+        let mut empty = Arena::default();
+        assert!(empty.take_with(16, 16, &mut blocks, |_, _| None).is_none());
+    }
+
+    /// `block_at` names the committed block that holds an address, `in_pool` XCL's pool.
+    #[test]
+    fn the_block_that_holds_an_address() {
+        let u = Uma::with_windows(1, 8 << 20).unwrap();
+        u.reserve_pool(4 * ARENA_BLOCK);
+        let p = u.alloc(3 * GRAIN, GRAIN).unwrap() as usize;
+        assert_eq!(u.block_at(p + GRAIN + 5), Some((p, 3 * GRAIN)));
+        assert_eq!(u.block_at(p + 3 * GRAIN), None, "past the block: free memory");
+        assert!(!u.in_pool(p));
+        let pool_end = u.base() + (8 << 20);
+        assert!(u.in_pool(pool_end - 1) && !u.in_pool(pool_end));
+        assert_eq!(u.block_at(pool_end - 1), Some((pool_end - 4 * ARENA_BLOCK, 4 * ARENA_BLOCK)));
+        assert_eq!(u.block_at(u.base() - 1), None);
     }
 
     /// Many small pieces share a block (aligned, disjoint); a large one gets its own.
