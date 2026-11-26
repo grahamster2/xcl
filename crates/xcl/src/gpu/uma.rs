@@ -260,6 +260,12 @@ fn give_back(g: &mut (BTreeMap<usize, usize>, BTreeMap<usize, usize>), p: usize)
     Some(size)
 }
 
+/// The free bytes of `[lo, hi)`: in all and the largest run.
+fn free_runs_in(g: &(BTreeMap<usize, usize>, BTreeMap<usize, usize>), lo: usize, hi: usize) -> (usize, usize) {
+    let runs = g.0.iter().map(|(&o, &l)| (o.max(lo), (o + l).min(hi))).filter(|&(a, e)| a < e).map(|(a, e)| e - a);
+    runs.fold((0, 0), |(all, big), n| (all + n, big.max(n)))
+}
+
 /// The reservation of `take_sparse_in` holding `p`: (start, bytes).
 fn reservation_at(g: &(BTreeMap<usize, usize>, BTreeMap<usize, usize>), p: usize) -> Option<(usize, usize)> {
     g.1.range(..=p).next_back().map(|(&a, &l)| (a, l)).filter(|&(a, l)| p < a + l)
@@ -670,23 +676,43 @@ impl Uma {
         self.sparse_alloc(size, align)
     }
 
+    /// Homes of physical pages (`kernelx::alloc_physical_home`): window 0 from its top down while
+    /// it keeps a free run of `w0_keep` bytes after the home, otherwise `sparse_alloc_above`
+    /// (windows 1+ from the top of the last one down, window 0 past the margin only when they
+    /// have no room). Window 0 first, because windows 1+ are where the title's own reservations
+    /// go (`sparse_reserve`): a retail game's page pool of 3977 MB, across windows 1 and 2, found
+    /// no room with 600 MB of homes at the top of window 2. From its top down and with a margin,
+    /// because its low addresses are where the title's 32-bit descriptor heaps go
+    /// (`sparse_alloc`, first fit; `console_heap::title_memory`): with homes first-fit there a
+    /// Series S run's 38 MB view heap found no room in window 0 (3292b096).
+    pub fn sparse_alloc_home(&self, size: usize, align: usize, w0_keep: usize) -> Option<(usize, usize)> {
+        if size <= WINDOW && self.is_sparse_window(0) {
+            let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+            let align = align.max(GRAIN).checked_next_power_of_two()?;
+            let (lo, hi) = (self.title_sparse_start(), self.base + WINDOW);
+            let mut g = self.sparse_free.lock().unwrap();
+            if let Some(at) = take_sparse_top_in(&mut g, lo, hi, size, align) {
+                if free_runs_in(&g, lo, hi).1 >= w0_keep {
+                    return Some((at, size));
+                }
+                give_back(&mut g, at);
+            }
+        }
+        self.sparse_alloc_above(size, align)
+    }
+
     /// Diagnostic: the free bytes of sparse window `k` the title may take (not `desc_range`), in
     /// all and the largest run.
     pub fn sparse_free_in(&self, k: usize) -> (usize, usize) {
         let (lo, hi) = (self.base + k * WINDOW, self.base + (k + 1) * WINDOW);
         let lo = if k == 0 { lo.max(self.title_sparse_start()) } else { lo };
-        let g = self.sparse_free.lock().unwrap();
-        let runs = g.0.iter().map(|(&o, &l)| (o.max(lo), (o + l).min(hi))).filter(|&(a, e)| a < e).map(|(a, e)| e - a);
-        runs.fold((0, 0), |(all, big), n| (all + n, big.max(n)))
+        free_runs_in(&self.sparse_free.lock().unwrap(), lo, hi)
     }
 
     /// Diagnostic: the free bytes of all the sparse windows the title may take (not
     /// `desc_range`), in all and the largest run (runs go across window boundaries).
     pub fn sparse_free_all(&self) -> (usize, usize) {
-        let (lo, hi) = (self.title_sparse_start(), self.sparse_end());
-        let g = self.sparse_free.lock().unwrap();
-        let runs = g.0.iter().map(|(&o, &l)| (o.max(lo), (o + l).min(hi))).filter(|&(a, e)| a < e).map(|(a, e)| e - a);
-        runs.fold((0, 0), |(all, big), n| (all + n, big.max(n)))
+        free_runs_in(&self.sparse_free.lock().unwrap(), self.title_sparse_start(), self.sparse_end())
     }
 
     /// The bytes of the sparse windows the title's memory may take (all of them less
