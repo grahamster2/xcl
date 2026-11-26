@@ -6515,9 +6515,42 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 /// The root signature pointer is kept as is (the translated paths replace it).
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Blob>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Blob>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Blob>),
+}
+
+/// A pipeline's copy of one of its console shaders, shared with every pipeline that copied the
+/// same bytes (`intern_blob`).
+type Blob = std::sync::Arc<[u8]>;
+
+/// The copies kept: (title address, length) → the copy, while a pipeline holds it; and the
+/// copies made since the map was last pruned of the ones no pipeline holds.
+static BLOBS: Mutex<Option<(HashMap<(usize, usize), std::sync::Weak<[u8]>>, usize)>> = Mutex::new(None);
+
+/// The copy of the shader `bytes` a pipeline keeps until it is built: the one an earlier
+/// pipeline made of the same bytes at the same address, or a new one. A retail title makes
+/// ~80 000 pipelines in its first minute from a few thousand shaders, and every one waiting to
+/// be built (`pso_async::lazy`) held copies of its own (amd-dev 71b8e6e0: 318 MB of copies
+/// after). Equal bytes are checked: an address the title used again for another shader gets a
+/// copy of its own.
+fn intern_blob(bytes: &[u8]) -> Blob {
+    let key = (bytes.as_ptr() as usize, bytes.len());
+    let mut g = BLOBS.lock().unwrap();
+    let (m, since_prune) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if let Some(b) = m.get(&key).and_then(std::sync::Weak::upgrade) {
+        if *b == *bytes {
+            return b;
+        }
+    }
+    let b: Blob = std::sync::Arc::from(bytes);
+    m.insert(key, std::sync::Arc::downgrade(&b));
+    *since_prune += 1;
+    if *since_prune >= 4096 {
+        *since_prune = 0;
+        m.retain(|_, w| w.strong_count() > 0);
+    }
+    b
 }
 
 unsafe impl Send for OwnedDesc {}
@@ -6536,10 +6569,10 @@ pub(crate) fn shader_key_of_hash(hash: u64) -> u64 {
     ((0xcbf2_9ce4_8422_2325u64 ^ hash).wrapping_mul(0x0000_0100_0000_01b3)) | 1
 }
 
-pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+pub(crate) fn shaders_key<B: AsRef<[u8]>>(blobs: &[B]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }
@@ -6561,7 +6594,7 @@ mod shaders_key_tests {
         assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
         assert_ne!(key, super::shaders_key(&[a.clone()]));
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
-        assert_ne!(super::shaders_key(&[]), 0);
+        assert_ne!(super::shaders_key::<Vec<u8>>(&[]), 0);
     }
 }
 
@@ -6605,10 +6638,10 @@ impl OwnedDesc {
     }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+/// Copy a shader blob into `blobs` (`intern_blob`) and point `b` at the copy.
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Blob>) {
     if let Some(bytes) = shader_bytes(b) {
-        blobs.push(bytes.to_vec());
+        blobs.push(intern_blob(bytes));
         let v = blobs.last().unwrap();
         *b = bytecode(v);
     } else {
@@ -6661,7 +6694,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut blobs: Vec<Blob> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -6678,7 +6711,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                 if p == 0 || n == 0 {
                     buf[at..at + 16].fill(0);
                 } else if crate::gpu::shader::readable(p, n) {
-                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
+                    blobs.push(intern_blob(std::slice::from_raw_parts(p as *const u8, n)));
                     buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
                 } else {
                     return None;
@@ -10659,7 +10692,7 @@ mod mesh_stream_tests {
             let owned = own_stream(d_valid.as_ptr() as *const c_void).expect("valid stream");
             let OwnedDesc::Stream(_, buf, blobs) = owned else { panic!("expected Stream") };
             assert_eq!(blobs.len(), 1);
-            assert_eq!(blobs[0], shader);
+            assert_eq!(&*blobs[0], &shader[..]);
             let rebased = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
             assert_eq!(rebased, blobs[0].as_ptr() as usize);
             assert_ne!(rebased, shader.as_ptr() as usize);
