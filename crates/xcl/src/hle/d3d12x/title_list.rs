@@ -439,8 +439,9 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if let Some(b) = book {
             for seg in b.extra_active.into_iter().chain(b.spares.into_iter()).chain(b.first) {
                 let raw = seg as *mut c_void;
-                super::alloc_pool::forget_list(seg);
+                // (bind first: it asks for the segment's submit fences, which `forget_list` drops)
                 super::bind::forget(raw);
+                super::alloc_pool::forget_list(seg);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
                 rel(raw);
             }

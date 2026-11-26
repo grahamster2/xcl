@@ -8573,8 +8573,10 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        super::list_x::on_release(this as usize);
+        // (bind first: what its recording holds waits for the list's submit fences, which
+        // `on_release` forgets)
         super::bind::forget(this);
+        super::list_x::on_release(this as usize);
         super::dred::forget_list(this);
     }
     n

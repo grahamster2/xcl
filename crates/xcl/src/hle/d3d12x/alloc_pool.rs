@@ -59,6 +59,12 @@ struct State {
     /// PC list → recordings so far (a Reset or creation starts the next one)
     recordings: HashMap<usize, u64>,
     resubmits: u64,
+    /// PC list → queue → (fence, value after its last submit there): every queue a list went to,
+    /// as a recording can be submitted on more than one (`submit_fences`)
+    list_marks: HashMap<usize, HashMap<usize, (ID3D12Fence, u64)>>,
+    /// PC lists submitted once with no fence after it (no queue fence could be made or signalled):
+    /// no fence says when the GPU is done with what they recorded, until they go (`forget_list`)
+    unfenced: HashSet<usize>,
 }
 
 struct LastSubmit {
@@ -96,6 +102,8 @@ pub(super) fn forget_list(list: usize) {
     let Some(s) = g.as_mut() else { return };
     s.last_submit.remove(&list);
     s.recordings.remove(&list);
+    s.list_marks.remove(&list);
+    s.unfenced.remove(&list);
     unpin(s, list);
 }
 
@@ -285,27 +293,17 @@ pub fn in_flight(list: usize) -> bool {
 
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !enabled() || queue.is_null() {
+    if !enabled() {
         return;
     }
     // (every submit is marked, also of lists this module does not track – the PC lists behind
     // console lists – so note_resubmits sees them all)
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let key = queue as usize;
-    if !s.fences.contains_key(&key) {
-        let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
-        s.fences.insert(key, (f, 0));
-    }
-    let (fence, value) = {
-        let (f, v) = s.fences.get_mut(&key).unwrap();
-        if q.Signal(&*f, *v + 1).is_err() {
-            return;
-        }
-        *v += 1;
-        (f.clone(), *v)
+    let Some((key, fence, value)) = signal_after(s, queue) else {
+        // nothing says when the GPU is done with these submits (`submit_fences`)
+        s.unfenced.extend(lists.iter().map(|&l| l as usize));
+        return;
     };
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
@@ -313,7 +311,44 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         }
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
+        s.list_marks.entry(l as usize).or_default().insert(key, (fence.clone(), value));
     }
+}
+
+/// The next value of XCL's fence of `queue`, signalled on it: (queue, fence, value). None when
+/// there is no queue, no fence could be made or the Signal failed.
+unsafe fn signal_after(s: &mut State, queue: *mut c_void) -> Option<(usize, ID3D12Fence, u64)> {
+    if queue.is_null() {
+        return None;
+    }
+    let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
+    let key = queue as usize;
+    if !s.fences.contains_key(&key) {
+        let mut dev: Option<ID3D12Device> = None;
+        let f = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok())?;
+        s.fences.insert(key, (f, 0));
+    }
+    let (f, v) = s.fences.get_mut(&key).unwrap();
+    q.Signal(&*f, *v + 1).ok()?;
+    *v += 1;
+    Some((key, f.clone(), *v))
+}
+
+/// The fences that say when the GPU is done with every submit of the PC list `list` so far:
+/// (fence, value) for each queue it went to. Once each has reached its value, nothing the list
+/// recorded up to now runs on the GPU. None when this is off, the list was never submitted, or
+/// one of its submits got no fence (`executed`): then nothing here says.
+pub(super) fn submit_fences(list: usize) -> Option<Vec<(ID3D12Fence, u64)>> {
+    if !enabled() {
+        return None;
+    }
+    let g = STATE.lock().unwrap();
+    let s = g.as_ref()?;
+    if s.unfenced.contains(&list) {
+        return None;
+    }
+    let marks = s.list_marks.get(&list).filter(|m| !m.is_empty())?;
+    Some(marks.values().cloned().collect())
 }
 
 /// The lists recording on the PC allocators of `alloc` hold them no more: the allocator a title
@@ -850,6 +885,41 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    /// A list's submit fences: one a queue it went to, at its last submit there; none once a
+    /// submit of it got no fence (nothing then says when the GPU is done), or after it goes.
+    #[test]
+    fn a_list_has_the_fences_of_every_queue_it_was_submitted_to() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue = || -> ID3D12CommandQueue { dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap() };
+            let (q1, q2) = (queue(), queue());
+            let mut ids = Box::new([0u8; 2]);
+            let (list, other) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
+            let never = submit_fences(list);
+            executed(q1.as_raw(), &[list as *mut c_void]);
+            executed(q1.as_raw(), &[list as *mut c_void, other as *mut c_void]);
+            let one = submit_fences(list).map(|v| v.into_iter().map(|(f, v)| (f.as_raw() as usize, v)).collect::<Vec<_>>());
+            executed(q2.as_raw(), &[list as *mut c_void]);
+            let two = submit_fences(list).map(|v| v.len());
+            let other_before = submit_fences(other).map(|v| v.len());
+            executed(std::ptr::null_mut(), &[other as *mut c_void]);
+            let other_after = submit_fences(other).map(|v| v.len());
+            forget_list(list);
+            forget_list(other);
+            let gone = (submit_fences(list).is_none(), submit_fences(other).is_none());
+            assert!(never.is_none(), "never submitted: no fences");
+            let one = one.expect("submitted: its queue's fence");
+            assert_eq!(one.len(), 1, "one queue: one fence, at the last submit");
+            assert!(one[0].1 >= 2);
+            assert_eq!(two, Some(2), "every queue it went to");
+            assert_eq!(other_before, Some(1));
+            assert_eq!(other_after, None, "a submit with no fence: nothing says when the GPU is done");
+            assert_eq!(gone, (true, true));
         }
     }
 

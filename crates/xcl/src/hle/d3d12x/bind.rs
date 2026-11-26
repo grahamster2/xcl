@@ -78,6 +78,10 @@ const FREE_RES_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<TwoPassBuf>>>> = Mutex::new(None);
 static FREE_RES: Mutex<FreePool<TwoPassBuf>> = Mutex::new(FreePool::new(FREE_RES_CAP));
+/// The two-pass buffers of ended recordings of lists whose submits have fences
+/// (`alloc_pool::submit_fences`): they go to `FREE_RES` once the GPU has passed them, not at the
+/// allocator's next reset, which may be many frames on.
+static FENCED_RES: Mutex<Fenced<ID3D12Fence, TwoPassBuf>> = Mutex::new(Fenced::new());
 
 /// A two-pass buffer (records or argument scratch), its bytes and its device: counted from when
 /// it is made until it is let go (`TWO_PASS`).
@@ -191,6 +195,9 @@ fn note_two_pass(k: usize) {
     let Ok(held) = ALLOC_RES.try_lock() else { return };
     let held_bytes: u64 = held.as_ref().map_or(0, |m| m.values().flatten().map(|b| b.bytes).sum());
     drop(held);
+    let Ok(fenced) = FENCED_RES.try_lock() else { return };
+    let fenced_bytes = fenced.bytes;
+    drop(fenced);
     let Ok(unknown) = UNKNOWN_RES.try_lock() else { return };
     let unknown_bytes = unknown.bytes;
     drop(unknown);
@@ -199,18 +206,26 @@ fn note_two_pass(k: usize) {
     }
     let [made, reused, gone, alive, refused] = std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
     crate::xlog_info!(
-        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB), {} MiB waiting for allocator resets, {} MiB for no known allocator; {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
+        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB), {} MiB waiting for fences, {} MiB waiting for allocator resets, {} MiB for no known allocator; {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
         made.saturating_sub(gone),
         alive >> 20,
         kept_bytes >> 20,
+        fenced_bytes >> 20,
         held_bytes >> 20,
         unknown_bytes >> 20,
         two_pass_cap() >> 20
     );
 }
 
-fn hold_res_until_reset(allocator: usize, mut bufs: Vec<TwoPassBuf>) {
+/// The two-pass buffers `bufs` of an ended recording of `list` on the PC allocator `allocator`:
+/// kept until the GPU has passed the list's submits, when fences say so
+/// (`alloc_pool::submit_fences`), else until the allocator is reset (or for a time, with none).
+fn hold_res_until_reset(list: usize, allocator: usize, mut bufs: Vec<TwoPassBuf>) {
     if bufs.is_empty() {
+        return;
+    }
+    if let Some(fences) = super::alloc_pool::submit_fences(list) {
+        FENCED_RES.lock().unwrap().hold(fences, bufs.into_iter().map(|b| (b.bytes, b)).collect());
         return;
     }
     if allocator == 0 {
@@ -229,23 +244,46 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<TwoPassBuf>) {
 pub(super) fn release_allocator_res(allocator: usize) {
     let aged = UNKNOWN_RES.lock().unwrap().take_older(std::time::Instant::now(), UNKNOWN_RES_AGE);
     let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    let passed = take_fenced_done();
     // (let go outside the lock)
     let _gone = {
         let mut free = FREE_RES.lock().unwrap();
         let now = std::time::Instant::now();
         let mut gone = free.take_idle(now, FREE_RES_IDLE);
-        for b in bufs.into_iter().flatten().chain(aged) {
+        for b in bufs.into_iter().flatten().chain(aged).chain(passed) {
             gone.extend(free.put(now, b.bytes, b.dev, b));
         }
         gone
     };
 }
 
-/// A buffer of `FREE_RES` on the device `dev` of `min..=max` bytes, for a recording to take.
+/// The buffers of `FENCED_RES` the GPU is done with (`fence_completed`: XCL's own fences).
+fn take_fenced_done() -> Vec<TwoPassBuf> {
+    // (each fence read once: many recordings wait on the same few queues' fences)
+    let mut read: Vec<(usize, u64)> = Vec::new();
+    FENCED_RES.lock().unwrap().take_done(|f| {
+        let key = f.as_raw() as usize;
+        if let Some(&(_, v)) = read.iter().find(|&&(k, _)| k == key) {
+            return v;
+        }
+        let v = unsafe { super::real::fence_completed(f) };
+        read.push((key, v));
+        v
+    })
+}
+
+/// A buffer of `FREE_RES` on the device `dev` of `min..=max` bytes, for a recording to take
+/// (with those of `FENCED_RES` the GPU is done with put there first).
 fn take_free(dev: usize, min: u64, max: u64) -> Option<TwoPassBuf> {
+    let passed = take_fenced_done();
     let (gone, picked) = {
         let mut free = FREE_RES.lock().unwrap();
-        (free.take_idle(std::time::Instant::now(), FREE_RES_IDLE), free.take(dev, min, max))
+        let now = std::time::Instant::now();
+        let mut gone = free.take_idle(now, FREE_RES_IDLE);
+        for b in passed {
+            gone.extend(free.put(now, b.bytes, b.dev, b));
+        }
+        (gone, free.take(dev, min, max))
     };
     // (let go outside the lock)
     drop(gone);
@@ -296,6 +334,47 @@ impl<T> Aging<T> {
             let (_, b, t) = self.held.pop_front().unwrap();
             self.bytes -= b;
             out.push(t);
+        }
+        out
+    }
+}
+
+/// Things of `bytes` each kept until fences reach values: those of a recording with the fences
+/// of its list's submits, (fence, value) each, in the order handed over.
+struct Fenced<F, T> {
+    held: Vec<(Vec<(F, u64)>, Vec<(u64, T)>)>,
+    bytes: u64,
+}
+
+impl<F, T> Fenced<F, T> {
+    const fn new() -> Self {
+        Fenced { held: Vec::new(), bytes: 0 }
+    }
+
+    /// Keep `items` (bytes, item) until every fence of `fences` has reached its value.
+    fn hold(&mut self, fences: Vec<(F, u64)>, items: Vec<(u64, T)>) {
+        if items.is_empty() {
+            return;
+        }
+        self.bytes += items.iter().map(|&(b, _)| b).sum::<u64>();
+        self.held.push((fences, items));
+    }
+
+    /// What is kept whose fences have all reached their values (`completed`: a fence's value now),
+    /// in the order handed over. Fences of other queues pass out of order: all are looked at.
+    fn take_done(&mut self, mut completed: impl FnMut(&F) -> u64) -> Vec<T> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.held.len() {
+            if self.held[i].0.iter().all(|(f, v)| completed(f) >= *v) {
+                let (_, items) = self.held.remove(i);
+                for (b, t) in items {
+                    self.bytes -= b;
+                    out.push(t);
+                }
+            } else {
+                i += 1;
+            }
         }
         out
     }
@@ -491,7 +570,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     });
     unmark_deferring(list);
     console_list::hold_until_reset(old, blocks);
-    hold_res_until_reset(old, res_bufs);
+    hold_res_until_reset(list as usize, old, res_bufs);
 }
 
 impl State {
@@ -549,7 +628,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     });
     unmark_deferring(to);
     console_list::hold_until_reset(old, blocks);
-    hold_res_until_reset(old, res_bufs);
+    hold_res_until_reset(to as usize, old, res_bufs);
 }
 
 /// The title changed what descriptor heaps the list has: they are looked at again.
@@ -643,7 +722,7 @@ pub(super) fn forget(list: *mut c_void) {
             s.res_retired.push(b);
         }
         s.res_retired.extend(batch);
-        hold_res_until_reset(s.allocator, s.res_retired);
+        hold_res_until_reset(list as usize, s.allocator, s.res_retired);
     }
 }
 
@@ -1695,9 +1774,22 @@ unsafe fn held_pso(pso: usize) -> Option<ID3D12PipelineState> {
 /// (`SCRATCH_BLOCK`), so a freed one of either serves both.
 const RECORD_MIN: u64 = 1 << 20;
 const RECORD_MAX: u64 = 128 << 20;
-/// Record bytes an ExecuteIndirect of two-pass commands asks for: a command's groups are known on
-/// the GPU only (`SCALE_ARGS_HLSL` keeps them to what fits).
-const INDIRECT_RECORDS: u64 = 32 << 20;
+/// Record bytes an ExecuteIndirect of two-pass commands asks for (`XCL_TWO_PASS_RECORDS_MB`, 8 MiB
+/// by default): a command's groups are known on the GPU only (`SCALE_ARGS_HLSL` keeps them to what
+/// fits). Each recording with one holds a buffer of it until the GPU is done, in video memory
+/// under `two_pass_cap`. 8 MiB holds 176 groups of #304's records (47 632 B); a retail title's
+/// direct DispatchMesh draws of two-pass pipelines had 52 to 130.
+fn indirect_records() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| indirect_records_from(std::env::var("XCL_TWO_PASS_RECORDS_MB").ok().as_deref()))
+}
+
+/// `indirect_records` for the setting `mb` (MiB; absent or not a number: 8), as a record buffer's
+/// bytes (`record_buffer_bytes`: a power of two from `RECORD_MIN` to `RECORD_MAX`).
+fn indirect_records_from(mb: Option<&str>) -> u64 {
+    let mb = mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8);
+    record_buffer_bytes(mb.saturating_mul(1 << 20))
+}
 
 /// Bytes of a record buffer for `need` bytes of records: the power of two at or above it, from
 /// `RECORD_MIN` to `RECORD_MAX`. A few sizes go from recording to recording through `FREE_RES`; a
@@ -1706,10 +1798,10 @@ fn record_buffer_bytes(need: u64) -> u64 {
     need.clamp(RECORD_MIN, RECORD_MAX).next_power_of_two()
 }
 
-/// Record bytes a two-pass ExecuteIndirect asks for: `INDIRECT_RECORDS`, or less when a command's
+/// Record bytes a two-pass ExecuteIndirect asks for: `indirect_records`, or less when a command's
 /// groups (at most 65 535 / `split` in X, `record_groups`) need less – the same groups fit.
 fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
-    INDIRECT_RECORDS.min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
+    indirect_records().min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
 }
 
 /// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
@@ -4974,7 +5066,7 @@ void main(uint t : SV_GroupIndex) {
 
     /// Record buffers come in powers of two from 1 MiB, and a draw has as many groups with a record
     /// as with the sizes before (its need, at least 4 MiB, in MiB): none drops groups it drew
-    /// before. An ExecuteIndirect keeps the groups a command had with 32 MiB.
+    /// before. An ExecuteIndirect has the groups a command has with `indirect_records`.
     #[test]
     fn two_pass_record_buffers_fit_what_their_draws_need() {
         let mib = 1u64 << 20;
@@ -4994,13 +5086,56 @@ void main(uint t : SV_GroupIndex) {
                     assert!(new >= old, "{groups} groups of {record} B, split {split}: {new} < {old}");
                 }
                 let ei = record_buffer_bytes(indirect_record_need(record, split));
-                assert!(ei <= 32 * mib);
-                assert_eq!(record_groups(ei, record, split), record_groups(32 * mib, record, split), "{record} B, split {split}");
+                assert!(ei <= indirect_records());
+                assert_eq!(record_groups(ei, record, split), record_groups(indirect_records(), record, split), "{record} B, split {split}");
             }
         }
-        assert_eq!(indirect_record_need(64, 1), 65_535 * 64, "small records: their groups in X bound it");
-        assert_eq!(record_buffer_bytes(indirect_record_need(64, 1)), 4 * mib);
-        assert_eq!(indirect_record_need(47_632, 1), 32 * mib);
+        assert_eq!(indirect_record_need(64, 1), (65_535 * 64).min(indirect_records()), "small records: their groups in X bound it");
+        assert_eq!(indirect_record_need(47_632, 1), indirect_records());
+    }
+
+    /// `XCL_TWO_PASS_RECORDS_MB`: 8 MiB when absent or not a number, else rounded up to a power of
+    /// two from 1 MiB to 128 MiB, as a record buffer is.
+    #[test]
+    fn indirect_record_bytes_follow_the_setting() {
+        let mib = 1u64 << 20;
+        assert_eq!(indirect_records_from(None), 8 * mib);
+        assert_eq!(indirect_records_from(Some("x")), 8 * mib);
+        assert_eq!(indirect_records_from(Some("")), 8 * mib);
+        assert_eq!(indirect_records_from(Some(" 32 ")), 32 * mib);
+        assert_eq!(indirect_records_from(Some("5")), 8 * mib, "a power of two");
+        assert_eq!(indirect_records_from(Some("0")), mib, "at least RECORD_MIN");
+        assert_eq!(indirect_records_from(Some("4096")), 128 * mib, "at most RECORD_MAX");
+        assert_eq!(indirect_records_from(Some("18446744073709551615")), 128 * mib, "no wrap");
+        // #304's record: 176 groups at the default, 704 at the old 32 MiB
+        assert_eq!(record_groups(indirect_records_from(None), 47_632, 1), 176);
+        assert_eq!(record_groups(indirect_records_from(Some("32")), 47_632, 1), 704);
+    }
+
+    /// The buffers of an ended recording wait for every fence of its list's submits (one a
+    /// queue), not the first or last alone; recordings come back as their own fences pass, out of
+    /// order across queues, and the bytes waiting follow.
+    #[test]
+    fn fenced_two_pass_buffers_wait_for_every_queue_of_their_list() {
+        use std::cell::Cell;
+        let mib = 1u64 << 20;
+        let (direct, compute) = (Cell::new(0u64), Cell::new(0u64));
+        let completed = |f: &&Cell<u64>| f.get();
+        let mut p: Fenced<&Cell<u64>, &str> = Fenced::new();
+        p.hold(vec![(&direct, 3), (&compute, 2)], vec![(8 * mib, "a"), (mib, "a scratch")]);
+        p.hold(vec![(&compute, 1)], vec![(8 * mib, "b")]);
+        p.hold(vec![(&direct, 1)], vec![]);
+        assert_eq!(p.bytes, 17 * mib);
+        assert_eq!(p.held.len(), 2, "a recording with no buffers holds nothing");
+        assert!(p.take_done(completed).is_empty(), "no fence passed");
+        compute.set(2);
+        assert_eq!(p.take_done(completed), vec!["b"], "the later recording's one fence passed first");
+        assert_eq!(p.bytes, 9 * mib);
+        direct.set(2);
+        assert!(p.take_done(completed).is_empty(), "one queue of the list still runs it");
+        direct.set(u64::MAX);
+        assert_eq!(p.take_done(completed), vec!["a", "a scratch"]);
+        assert_eq!((p.bytes, p.held.len()), (0, 0));
     }
 
     /// Without `XCL_TWO_PASS_BATCH` a two-pass draw records what it did before: each command's
