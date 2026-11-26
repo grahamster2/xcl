@@ -93,22 +93,31 @@ struct TwoPassBuf {
 
 impl TwoPassBuf {
     /// A new buffer of `bytes`, if the two-pass buffers alive stay within `two_pass_cap` with it
-    /// (the free ones in `FREE_RES` go first to make room, when they are enough). Past it: an
-    /// error, and the draw that asked is skipped.
+    /// (the free ones in `FREE_RES` go first to make room, when they are enough, with those of
+    /// `FENCED_RES` the GPU has passed since put there first). Past it: an error, and the draw
+    /// that asked is skipped.
     unsafe fn make(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<Self, String> {
         let cap = two_pass_cap();
         if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
             // (counted with `FREE_RES` locked, so its bytes are in the load; none go when they
             // cannot make the room: the draw is skipped either way, and the recordings after it
             // can still take them)
-            let gone = {
+            // (a recording's fence may have passed since `take_free` drained `FENCED_RES`: its
+            // buffers count against the cap all the same, so they go to `FREE_RES` to make room)
+            let passed = take_fenced_done();
+            let (evicted, gone) = {
                 let mut free = FREE_RES.lock().unwrap();
+                let now = std::time::Instant::now();
+                let mut evicted = Vec::new();
+                for b in passed {
+                    evicted.extend(free.put(now, b.bytes, b.dev, b));
+                }
                 let over = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
-                free.take_room(over)
+                (evicted, free.take_room(over))
             };
             // (the GPU is done with those: let go outside the lock)
-            let made_room = gone.is_some();
-            drop(gone);
+            let made_room = gone.is_some() || !evicted.is_empty();
+            drop((evicted, gone));
             if !made_room || !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
                 note_two_pass(TP_REFUSED);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -224,6 +233,9 @@ fn hold_res_until_reset(list: usize, allocator: usize, mut bufs: Vec<TwoPassBuf>
     if bufs.is_empty() {
         return;
     }
+    // (safe only because every submit of a PC list goes through `alloc_pool::executed`, which
+    // records its fence: a submit made around it would leave these buffers free while the GPU
+    // still runs that one)
     if let Some(fences) = super::alloc_pool::submit_fences(list) {
         FENCED_RES.lock().unwrap().hold(fences, bufs.into_iter().map(|b| (b.bytes, b)).collect());
         return;
@@ -1774,20 +1786,34 @@ unsafe fn held_pso(pso: usize) -> Option<ID3D12PipelineState> {
 /// (`SCRATCH_BLOCK`), so a freed one of either serves both.
 const RECORD_MIN: u64 = 1 << 20;
 const RECORD_MAX: u64 = 128 << 20;
-/// Record bytes an ExecuteIndirect of two-pass commands asks for (`XCL_TWO_PASS_RECORDS_MB`, 8 MiB
-/// by default): a command's groups are known on the GPU only (`SCALE_ARGS_HLSL` keeps them to what
-/// fits). Each recording with one holds a buffer of it until the GPU is done, in video memory
-/// under `two_pass_cap`. 8 MiB holds 176 groups of #304's records (47 632 B); a retail title's
-/// direct DispatchMesh draws of two-pass pipelines had 52 to 130.
+/// Record bytes an ExecuteIndirect of two-pass commands asks for (`XCL_TWO_PASS_RECORDS_MB`, 32
+/// MiB by default): a command's groups are known on the GPU only (`SCALE_ARGS_HLSL` keeps them to
+/// what fits, and drops the rest without a word). Each recording with one holds a buffer of it
+/// until the GPU is done, in video memory under `two_pass_cap`. 32 MiB holds 704 groups of #304's
+/// records (47 632 B); a retail title's direct DispatchMesh draws of two-pass pipelines had 52 to
+/// 130, but the groups of its ExecuteIndirect commands were never measured, so the default is
+/// the size it had before; the setting lowers it (8 MiB: 176 groups) where that is known to do.
 fn indirect_records() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| indirect_records_from(std::env::var("XCL_TWO_PASS_RECORDS_MB").ok().as_deref()))
+    *BYTES.get_or_init(|| {
+        let bytes = indirect_records_from(std::env::var("XCL_TWO_PASS_RECORDS_MB").ok().as_deref());
+        crate::xlog_info!(
+            "D3D12.X: two-pass ExecuteIndirect record buffers of {} MiB (XCL_TWO_PASS_RECORDS_MB): {} groups per command of {} B records, the rest dropped on the GPU",
+            bytes >> 20,
+            record_groups(bytes, TYPICAL_RECORD_BYTES, 1),
+            TYPICAL_RECORD_BYTES
+        );
+        bytes
+    })
 }
 
-/// `indirect_records` for the setting `mb` (MiB; absent or not a number: 8), as a record buffer's
-/// bytes (`record_buffer_bytes`: a power of two from `RECORD_MIN` to `RECORD_MAX`).
+/// A two-pass record's bytes for the startup line of `indirect_records` (#304's).
+const TYPICAL_RECORD_BYTES: u64 = 47_632;
+
+/// `indirect_records` for the setting `mb` (MiB; absent or not a number: 32), as a record
+/// buffer's bytes (`record_buffer_bytes`: a power of two from `RECORD_MIN` to `RECORD_MAX`).
 fn indirect_records_from(mb: Option<&str>) -> u64 {
-    let mb = mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8);
+    let mb = mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(32);
     record_buffer_bytes(mb.saturating_mul(1 << 20))
 }
 
@@ -4901,7 +4927,7 @@ void main(uint t : SV_GroupIndex) {
         hold_res_until_reset(list, alloc, vec![buf]);
         let fenced = |r: usize| FENCED_RES.lock().unwrap().held.iter().any(|h| h.1.iter().any(|(_, b)| b.res.as_raw() as usize == r));
         let in_alloc = ALLOC_RES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&alloc));
-        let mut free_of_dev = || {
+        let free_of_dev = || {
             let mut v = Vec::new();
             while let Some(f) = FREE_RES.lock().unwrap().take(key, 0, u64::MAX) {
                 v.push(f.res.as_raw() as usize);
@@ -4909,7 +4935,8 @@ void main(uint t : SV_GroupIndex) {
             v
         };
         let waiting = fenced(raw);
-        let early = take_free(key, 1 << 30, u64::MAX);
+        // (any size: a buffer of this device's that the fence has not passed is not taken)
+        let early = take_free(key, 0, u64::MAX).map(|b| b.res.as_raw() as usize);
         let freed_early = free_of_dev();
         unsafe { gate.Signal(1).unwrap() };
         let done: ID3D12Fence = unsafe { dev.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
@@ -4923,7 +4950,7 @@ void main(uint t : SV_GroupIndex) {
         super::super::alloc_pool::forget_list(list);
         assert!(!in_alloc, "not held for the allocator's reset");
         assert!(waiting, "held while the GPU has not run the submit");
-        assert!(early.is_none() && !freed_early.contains(&raw), "not reused before the fence passes");
+        assert!(early != Some(raw) && !freed_early.contains(&raw), "not reused before the fence passes");
         assert!(!fenced(raw));
         assert!(taken == Some(raw) || freed_late.contains(&raw), "back for reuse once it passed, with no Reset");
     }
@@ -5153,22 +5180,22 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(indirect_record_need(47_632, 1), indirect_records());
     }
 
-    /// `XCL_TWO_PASS_RECORDS_MB`: 8 MiB when absent or not a number, else rounded up to a power of
+    /// `XCL_TWO_PASS_RECORDS_MB`: 32 MiB when absent or not a number, else rounded up to a power of
     /// two from 1 MiB to 128 MiB, as a record buffer is.
     #[test]
     fn indirect_record_bytes_follow_the_setting() {
         let mib = 1u64 << 20;
-        assert_eq!(indirect_records_from(None), 8 * mib);
-        assert_eq!(indirect_records_from(Some("x")), 8 * mib);
-        assert_eq!(indirect_records_from(Some("")), 8 * mib);
-        assert_eq!(indirect_records_from(Some(" 32 ")), 32 * mib);
+        assert_eq!(indirect_records_from(None), 32 * mib);
+        assert_eq!(indirect_records_from(Some("x")), 32 * mib);
+        assert_eq!(indirect_records_from(Some("")), 32 * mib);
+        assert_eq!(indirect_records_from(Some(" 8 ")), 8 * mib);
         assert_eq!(indirect_records_from(Some("5")), 8 * mib, "a power of two");
         assert_eq!(indirect_records_from(Some("0")), mib, "at least RECORD_MIN");
         assert_eq!(indirect_records_from(Some("4096")), 128 * mib, "at most RECORD_MAX");
         assert_eq!(indirect_records_from(Some("18446744073709551615")), 128 * mib, "no wrap");
-        // #304's record: 176 groups at the default, 704 at the old 32 MiB
-        assert_eq!(record_groups(indirect_records_from(None), 47_632, 1), 176);
-        assert_eq!(record_groups(indirect_records_from(Some("32")), 47_632, 1), 704);
+        // #304's record: 704 groups at the default, 176 at 8 MiB
+        assert_eq!(record_groups(indirect_records_from(None), TYPICAL_RECORD_BYTES, 1), 704);
+        assert_eq!(record_groups(indirect_records_from(Some("8")), TYPICAL_RECORD_BYTES, 1), 176);
     }
 
     /// The buffers of an ended recording wait for every fence of its list's submits (one a
