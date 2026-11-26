@@ -4307,7 +4307,7 @@ void main(uint t : SV_GroupIndex) {
             let buf = TwoPassBuf::make(&dev.unwrap(), 1 << 16, "test").unwrap();
             let raw = buf.res.as_raw() as usize;
             let kept = |r: usize| UNKNOWN_RES.lock().unwrap().held.iter().any(|h| h.2.res.as_raw() as usize == r);
-            hold_res_until_reset(0, vec![buf]);
+            hold_res_until_reset(0, 0, vec![buf]);
             assert!(kept(raw), "a buffer of a recording with no allocator is kept");
         }
     }
@@ -4847,8 +4847,8 @@ void main(uint t : SV_GroupIndex) {
         let a = unsafe { TwoPassBuf::make(&dev, 1 << 16, "record buffer") }.unwrap();
         let b = unsafe { TwoPassBuf::make(&dev, 1 << 16, "record buffer") }.unwrap();
         let (a_raw, b_raw) = (a.res.as_raw() as usize, b.res.as_raw() as usize);
-        hold_res_until_reset(done, vec![a]);
-        hold_res_until_reset(busy, vec![b]);
+        hold_res_until_reset(ended, done, vec![a]);
+        hold_res_until_reset(recording, busy, vec![b]);
         unsafe {
             super::super::alloc_pool::forget(done);
             super::super::alloc_pool::forget(busy);
@@ -4867,6 +4867,65 @@ void main(uint t : SV_GroupIndex) {
         assert!(held_done.is_empty(), "the released allocator's buffers do not wait for a Reset that never comes");
         assert_eq!(freed, vec![a_raw], "they are kept for reuse");
         assert_eq!(held_busy, vec![b_raw], "a list still records on the other: its buffers stay");
+    }
+
+    /// The two-pass buffers of an ended recording of a submitted list wait for its submit's fence,
+    /// not for its allocator's reset: kept while the GPU has not run the submit, kept for reuse
+    /// once it has, with no Reset of the allocator between. (A software device.)
+    #[test]
+    fn two_pass_buffers_of_a_submitted_list_go_back_when_its_fence_passes() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let dev = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            dev.unwrap()
+        };
+        let key = dev.as_raw() as usize;
+        let queue: ID3D12CommandQueue = unsafe { dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }) }.unwrap();
+        let ids = Box::new([0u8; 2]);
+        let (alloc, list) = (ids.as_ptr() as usize, ids.as_ptr() as usize + 1);
+        // the queue runs the list's submit only once `gate` is signalled
+        let gate: ID3D12Fence = unsafe { dev.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        unsafe {
+            queue.Wait(&gate, 1).unwrap();
+            super::super::alloc_pool::executed(queue.as_raw(), &[list as *mut c_void]);
+        }
+        let buf = unsafe { TwoPassBuf::make(&dev, 1 << 16, "record buffer") }.unwrap();
+        let raw = buf.res.as_raw() as usize;
+        hold_res_until_reset(list, alloc, vec![buf]);
+        let fenced = |r: usize| FENCED_RES.lock().unwrap().held.iter().any(|h| h.1.iter().any(|(_, b)| b.res.as_raw() as usize == r));
+        let in_alloc = ALLOC_RES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&alloc));
+        let mut free_of_dev = || {
+            let mut v = Vec::new();
+            while let Some(f) = FREE_RES.lock().unwrap().take(key, 0, u64::MAX) {
+                v.push(f.res.as_raw() as usize);
+            }
+            v
+        };
+        let waiting = fenced(raw);
+        let early = take_free(key, 1 << 30, u64::MAX);
+        let freed_early = free_of_dev();
+        unsafe { gate.Signal(1).unwrap() };
+        let done: ID3D12Fence = unsafe { dev.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        unsafe { queue.Signal(&done, 1).unwrap() };
+        let start = std::time::Instant::now();
+        while unsafe { done.GetCompletedValue() } < 1 && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let taken = take_free(key, 0, u64::MAX).map(|b| b.res.as_raw() as usize);
+        let freed_late = free_of_dev();
+        super::super::alloc_pool::forget_list(list);
+        assert!(!in_alloc, "not held for the allocator's reset");
+        assert!(waiting, "held while the GPU has not run the submit");
+        assert!(early.is_none() && !freed_early.contains(&raw), "not reused before the fence passes");
+        assert!(!fenced(raw));
+        assert!(taken == Some(raw) || freed_late.contains(&raw), "back for reuse once it passed, with no Reset");
     }
 
     /// Binds on XCL's ABI (`bind_abi`, both two-pass stages) take window 0 the same way: not
