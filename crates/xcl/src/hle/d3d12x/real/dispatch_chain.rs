@@ -16,6 +16,7 @@ static WANTED: AtomicU64 = AtomicU64::new(0);
 
 /// (only when a count changed since the last line: called every 10 s in every run)
 pub(crate) fn log_counts() {
+    log_residency("every 10 s");
     static LAST: Mutex<[u64; 7]> = Mutex::new([0; 7]);
     let now = [&PROGRAMS, &PIECES, &DISPATCHES, &SLABS, &LIVE, &PEAK, &WANTED].map(|c| c.load(Ordering::Relaxed));
     if std::mem::replace(&mut *LAST.lock().unwrap(), now) == now {
@@ -66,11 +67,17 @@ impl PipelineBuilder {
 
 struct Chain {
     builder: Arc<PipelineBuilder>,
-    tail: Vec<ID3D12PipelineState>,
+    /// the pieces after the first, until the whole form is built (`release_tail`); a recording
+    /// holds its own reference, so the pieces stay alive until the GPU is done with them
+    tail: Mutex<Option<Arc<[ID3D12PipelineState]>>>,
     words: u32,
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
+    /// driver blob bytes (`GetCachedBlob`) of the first piece, the tail and the whole form
+    first_bytes: u64,
+    tail_bytes: u64,
+    whole_bytes: AtomicU64,
 }
 
 impl Chain {
@@ -82,9 +89,81 @@ impl Chain {
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
+        self.whole_bytes.store(blob_bytes(&p), Ordering::Relaxed);
         let _ = self.whole.set(p.clone());
+        drop(_guard);
+        // (dropped here, with no lock held: a piece's Release goes through `forget_pso`)
+        drop(self.release_tail());
         Ok(p)
     }
+
+    /// The tail pieces while the chain keeps them.
+    fn tail(&self) -> Option<Arc<[ID3D12PipelineState]>> {
+        self.tail.lock().unwrap().clone()
+    }
+
+    /// Once the whole form is built, the chain stops holding its tail pieces: every later
+    /// dispatch takes the whole form, and the driver keeps one copy of the program's code (#2403,
+    /// NVIDIA's 512 MB shader-code heap). Recordings still on the GPU keep the pieces they use.
+    /// `XCL_CHAIN_KEEP_PIECES=1` keeps both forms, as before. The caller drops what this returns
+    /// with no lock held.
+    fn release_tail(&self) -> Option<Arc<[ID3D12PipelineState]>> {
+        if self.whole.get().is_none() || keep_pieces() {
+            return None;
+        }
+        let gone = self.tail.lock().unwrap().take();
+        if gone.is_some() {
+            TAILS_RELEASED.fetch_add(1, Ordering::Relaxed);
+        }
+        gone
+    }
+}
+
+fn keep_pieces() -> bool {
+    static K: OnceLock<bool> = OnceLock::new();
+    *K.get_or_init(|| std::env::var("XCL_CHAIN_KEEP_PIECES").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The size of the driver's blob of `p` (`GetCachedBlob`), 0 when it gives none: what the driver
+/// keeps of its code, near enough.
+unsafe fn blob_bytes(p: &ID3D12PipelineState) -> u64 {
+    read_pso_cached_blob(p.as_raw()).map_or(0, |b| b.len() as u64)
+}
+
+/// chains whose tail pieces were released (`Chain::release_tail`)
+static TAILS_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// What the chains hold: (pieces only, whole form only, both, driver blob bytes of all that).
+fn residency() -> (usize, usize, usize, u64) {
+    let chains: Vec<Arc<Chain>> = CHAINS.lock().unwrap().values().cloned().collect();
+    let (mut pieces, mut whole, mut both, mut bytes) = (0, 0, 0, 0u64);
+    for c in &chains {
+        let has_tail = c.tail.lock().unwrap().is_some();
+        let has_whole = c.whole.get().is_some();
+        bytes += c.first_bytes;
+        if has_tail {
+            bytes += c.tail_bytes;
+        }
+        if has_whole {
+            bytes += c.whole_bytes.load(Ordering::Relaxed);
+        }
+        match (has_tail, has_whole) {
+            (true, false) => pieces += 1,
+            (false, true) => whole += 1,
+            (true, true) => both += 1,
+            (false, false) => {}
+        }
+    }
+    (pieces, whole, both, bytes)
+}
+
+fn log_residency(why: &str) {
+    let (pieces, whole, both, bytes) = residency();
+    if pieces + whole + both == 0 {
+        return;
+    }
+    crate::xlog_info!("compute split residency ({why}): {} chains: {pieces} hold pieces only, {whole} the whole form only, {both} both; {} tails released; driver blobs of what the chains hold {} MiB",
+        pieces + whole + both, TAILS_RELEASED.load(Ordering::Relaxed), bytes >> 20);
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
@@ -109,12 +188,18 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         .map(|p| (p != 0).then(|| ID3D12PipelineState::from_raw(p as *mut c_void))).collect();
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
-    let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
-    PROGRAMS.fetch_add(1, Ordering::Relaxed);
+    let tail: Arc<[ID3D12PipelineState]> = pieces.collect();
+    let (first_bytes, tail_bytes) = (blob_bytes(&first), tail.iter().map(|p| blob_bytes(p)).sum());
+    let chain = Arc::new(Chain { builder, tail: Mutex::new(Some(tail)), words: plan.dwords_per_group,
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()),
+        first_bytes, tail_bytes, whole_bytes: AtomicU64::new(0) });
+    let programs = PROGRAMS.fetch_add(1, Ordering::Relaxed) + 1;
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
     CHAINS.lock().unwrap().insert(*result as usize, chain);
+    if programs % 2048 == 0 {
+        log_residency("every 2048 chains");
+    }
     Some(rs)
 }
 
@@ -142,6 +227,10 @@ impl Drop for Scratch {
 struct Recording {
     scratch: Arc<Scratch>,
     first: ID3D12PipelineState,
+    /// the tail pieces this recording runs (the chain may stop holding them before the GPU is done)
+    tail: Arc<[ID3D12PipelineState]>,
+    /// (only held: the chain lives as long as what was recorded with it, as before)
+    #[allow(dead_code)]
     chain: Arc<Chain>,
 }
 
@@ -246,22 +335,85 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let group = u64::from(chain.words) * 4;
     let needed = grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64));
     WANTED.fetch_max(needed, Ordering::Relaxed);
-    let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
+    // (no tail: the chain has its whole form, `Chain::release_tail`)
+    let tail = chain.tail();
+    let scratch = (tail.is_some() && allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
         .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
-    let Some((scratch, used)) = scratch else {
+    let (Some((scratch, used)), Some(tail)) = (scratch, tail) else {
         bind(list, &chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    let held = Arc::new(Recording { scratch, first, chain });
+    let held = Arc::new(Recording { scratch, first, tail, chain });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail), |p| bind(list, p));
+    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(held.tail.iter()), |p| bind(list, p));
     Ok(())
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    unsafe extern "system" fn no_create(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        E_INVALIDARG
+    }
+
+    /// A chain gives up its tail pieces only once its whole form is built, and a recording that
+    /// took them keeps them alive after that.
+    #[test]
+    fn a_chain_releases_its_tail_once_the_whole_form_is_built() {
+        unsafe {
+            if crate::gpu::recomp::dxc::location().is_err() {
+                return crate::gpu::recomp::runner::skip_test("no DXC");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                if let Ok(warp) = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) {
+                    let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+                }
+            }
+            let Some(dev) = dev else { return crate::gpu::recomp::runner::skip_test("no D3D12 device") };
+            let dxil = crate::gpu::recomp::dxc::compile(
+                "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 1); }",
+                "main", "cs_6_6", &[],
+            ).expect("DXC compile");
+            let rs = pso::dispatch_chain_root_signature(&dev, &[]).expect("dispatch chain RS");
+            let make = || {
+                let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                let p: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).expect("CreateComputePipelineState");
+                std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+                p
+            };
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: no_create, signature: rs.clone(), flags: Default::default(), node: 0, record: 0 });
+            let tail: Arc<[ID3D12PipelineState]> = vec![make(), make()].into();
+            let chain = Chain {
+                builder, tail: Mutex::new(Some(tail)), words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
+                build_whole: Mutex::new(()), first_bytes: 0, tail_bytes: 0, whole_bytes: AtomicU64::new(0),
+            };
+            // no whole form yet: the pieces are all there is
+            assert!(chain.release_tail().is_none());
+            let held = chain.tail().expect("the tail is kept without a whole form");
+            let _ = chain.whole.set(make());
+            let released = TAILS_RELEASED.load(Ordering::Relaxed);
+            let gone = chain.release_tail().expect("the tail goes once the whole form is built");
+            assert!(chain.tail().is_none(), "later dispatches take the whole form");
+            assert_eq!(TAILS_RELEASED.load(Ordering::Relaxed), released + 1);
+            drop(gone);
+            // a recording made before the release still has its pieces
+            assert_eq!(held.len(), 2);
+            assert_eq!(Arc::strong_count(&held), 1);
+            assert!(chain.release_tail().is_none(), "released once");
+        }
+    }
 }
 
 #[cfg(test)]
