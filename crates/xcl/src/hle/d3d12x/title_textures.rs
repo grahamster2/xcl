@@ -2305,15 +2305,52 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             device = d.device;
             bytes += n;
             let mut unmapped = false;
-            if super::vram::level_pages() && super::vram::has_lazy_levels(d.res.as_raw() as usize) {
+            // (the bytes of its levels with no pages, none of which is read: their pages' next
+            // write goes up)
+            let mut no_pages: Vec<(usize, usize)> = Vec::new();
+            let raw = d.res.as_raw() as usize;
+            if super::vram::level_pages() && super::vram::has_lazy_levels(raw) {
                 // (the queue waits for these mappings before the copies: `vram::before_execute`
-                // below; what a level's fresh pages held is another texture's, so all of it goes up)
-                if !map_levels_with_texels(&d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref())).is_empty() {
-                    changed = None;
+                // below)
+                let fresh = map_levels_with_texels(&d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref()));
+                let mapped = super::vram::mapped_levels(raw);
+                let one = d.tex.texels().filter(|s| s.array == 1 && s.depth == 0 && mapped.as_ref().is_some_and(|m| m.len() == s.chain.levels.len()));
+                match (one, mapped) {
+                    (Some(s), Some(m)) if upload_parts() && !d.target => {
+                        let whole = changed.is_none();
+                        let (parts, without) = lazy_level_parts(&s.chain, changed.clone(), &fresh, &m);
+                        if parts.as_ref().is_some_and(|p| pages_meet(d.src, p, &without)) {
+                            // (a page of a level with no pages is read with one that has them: as
+                            // all of it, below)
+                            if !fresh.is_empty() {
+                                changed = None;
+                            }
+                            unmapped = true;
+                        } else {
+                            if whole && parts.is_some() {
+                                // (before its bytes are read, as below)
+                                texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
+                            }
+                            changed = parts;
+                            no_pages = without;
+                        }
+                    }
+                    _ => {
+                        // what a level's fresh pages held is another texture's: all of it goes up
+                        if !fresh.is_empty() {
+                            changed = None;
+                        }
+                        unmapped = super::vram::has_unmapped_levels(raw);
+                    }
                 }
-                unmapped = super::vram::has_unmapped_levels(d.res.as_raw() as usize);
             }
-            if unmapped {
+            if !no_pages.is_empty() {
+                // A level left without pages (zeros when looked at above) may get its texels
+                // before the next look: what its pages hold is not taken for what the PC texture
+                // holds, so their next write goes up (and the level gets its pages then). The
+                // levels with pages keep theirs.
+                texture_upload::unknown_parts(&d.known, d.src, d.tex.size() as usize, &no_pages);
+            } else if unmapped {
                 // A level left without pages (zeros when looked at above) may get its texels
                 // before the copy reads them: the copy to its tiles is dropped, and what it read
                 // must not be kept as what the PC texture holds – the next write then looks the
@@ -2438,6 +2475,62 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Ve
     // (one slice: its subresources are its levels)
     let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
     super::vram::map_levels(r, Some(&present))
+}
+
+/// (`vram::level_pages`) What of a texture of one slice with lazy levels goes up, and the bytes of
+/// its levels with no pages. `changed` (None: all of it) goes up, and the levels `fresh` that just
+/// got their pages as a whole: what those pages held is another texture's. A level that had pages
+/// holds what went up to it, and gets what changed of it only. Nothing of a level with no pages
+/// goes up: its copy would go to tiles with no pages, which drops it. `mapped`: whether each level
+/// has pages now. None: all of it, every level having pages.
+fn lazy_level_parts(chain: &crate::gpu::tiling::Chain, changed: Option<Vec<(usize, usize)>>, fresh: &[u32], mapped: &[bool]) -> (Option<Vec<(usize, usize)>>, Vec<(usize, usize)>) {
+    let bytes = |i: usize| {
+        let r = chain.level_bytes(i);
+        (r.start, r.end)
+    };
+    let joined = |v: Vec<(usize, usize)>| match texture_upload::join(texture_upload::Change::Parts(Vec::new()), texture_upload::Change::Parts(v)) {
+        texture_upload::Change::Parts(p) => p,
+        _ => Vec::new(),
+    };
+    let levels = |pages: bool| joined((0..mapped.len().min(chain.levels.len())).filter(|&i| mapped[i] == pages).map(bytes).collect());
+    let without = levels(false);
+    if without.is_empty() && changed.is_none() {
+        return (None, without);
+    }
+    let mut parts = changed.unwrap_or_else(|| vec![(0, chain.slice_bytes)]);
+    parts.extend(fresh.iter().filter(|&&l| (l as usize) < chain.levels.len()).map(|&l| bytes(l as usize)));
+    let parts = joined(parts);
+    if without.is_empty() {
+        return (Some(parts), without);
+    }
+    (Some(intersect(&parts, &levels(true))), without)
+}
+
+/// The bytes in both `a` and `b` (from, to; each sorted and disjoint).
+fn intersect(a: &[(usize, usize)], b: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let (mut out, mut i, mut j) = (Vec::new(), 0, 0);
+    while i < a.len() && j < b.len() {
+        let (from, to) = (a[i].0.max(b[j].0), a[i].1.min(b[j].1));
+        if from < to {
+            out.push((from, to));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
+/// Whether bytes `a` and `b` of a texture at `src` (from, to) lie on a 4 KiB page together.
+fn pages_meet(src: usize, a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
+    const P: usize = 0x1000;
+    let pages = |r: &(usize, usize)| (src + r.0) / P..(src + r.1).div_ceil(P);
+    a.iter().filter(|r| r.0 < r.1).any(|x| b.iter().filter(|r| r.0 < r.1).any(|y| {
+        let (x, y) = (pages(x), pages(y));
+        x.start < y.end && y.start < x.end
+    }))
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
@@ -4748,6 +4841,52 @@ pub(super) mod tests {
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    /// A texture with lazy levels: the levels that just got pages go up whole, those that had them
+    /// only what changed of them, and nothing of a level with no pages. All of it only once every
+    /// level has pages.
+    #[test]
+    fn a_level_given_pages_goes_up_and_the_others_only_what_changed() {
+        // 1024x1024 RGBA8, 11 levels, 64 KiB blocks
+        let tex = xg::Texture::new(&console_desc(3, 1024, 1024, 1, 11, 28, 0x109)).unwrap();
+        let chain = &tex.texels().unwrap().chain;
+        let level = |i: usize| {
+            let r = chain.level_bytes(i);
+            (r.start, r.end)
+        };
+        // mip 0 is the last part of the slice, the levels below it come before
+        let top = level(0);
+        assert!(top.0 > 0 && top.1 == chain.slice_bytes);
+        let mut mapped = vec![true; 11];
+        mapped[0] = false;
+        let fresh: Vec<u32> = (1..11).collect();
+        // its first upload: the levels with texels (they just got pages), not mip 0
+        let (parts, without) = lazy_level_parts(chain, None, &fresh, &mapped);
+        assert_eq!(parts, Some(vec![(0, top.0)]));
+        assert_eq!(without, vec![top]);
+        assert!(!pages_meet(0x10_0000, parts.as_ref().unwrap(), &without));
+        // a write in level 1 and one in mip 0 (no pages): level 1's bytes only
+        let one = level(1);
+        let (parts, _) = lazy_level_parts(chain, Some(vec![(one.0, one.0 + 0x1000), (top.0, top.0 + 0x1000)]), &[], &mapped);
+        assert_eq!(parts, Some(vec![(one.0, one.0 + 0x1000)]));
+        // mip 0 gets its pages: all of it, and of level 1 what changed
+        mapped[0] = true;
+        let (parts, without) = lazy_level_parts(chain, Some(vec![(one.0, one.0 + 0x1000)]), &[0], &mapped);
+        assert_eq!(parts, Some(vec![(one.0, one.0 + 0x1000), top]));
+        assert!(without.is_empty());
+        assert!(parts.unwrap().iter().map(|r| r.1 - r.0).sum::<usize>() < chain.slice_bytes / 2);
+        // nothing written, mip 0 given pages: mip 0 alone
+        assert_eq!(lazy_level_parts(chain, Some(Vec::new()), &[0], &mapped).0, Some(vec![top]));
+        // every level with pages and all of it asked for: all of it
+        assert_eq!(lazy_level_parts(chain, None, &[0], &mapped), (None, Vec::new()));
+        // the levels in the mip tail share its block: one of them with no pages meets the others
+        let tail = (0..11).find(|&i| chain.levels[i].tail.is_some()).expect("a mip tail");
+        let mut mixed = vec![true; 11];
+        mixed[10] = false;
+        let (parts, without) = lazy_level_parts(chain, None, &[], &mixed);
+        assert!(tail < 10 && pages_meet(0, parts.as_ref().unwrap(), &without));
+        assert_eq!(intersect(&[(0, 10), (20, 30)], &[(5, 25)]), vec![(5, 10), (20, 25)]);
     }
 
     #[test]
