@@ -392,7 +392,9 @@ unsafe fn open_uma(device: &ID3D12Device) {
         };
         let mut heap: Option<ID3D12Heap> = None;
         super::title_textures::own_work(|| device.CreateHeap(&desc, &mut heap)).map_err(|e| format!("CreateHeap (window {k}, {} MB of video memory): {e}", u.window(k).1 >> 20))?;
-        heap.ok_or_else(|| "CreateHeap".to_string())
+        let heap = heap.ok_or_else(|| "CreateHeap".to_string())?;
+        super::residency::keep(&heap, desc.SizeInBytes, "shader window copy in video memory");
+        Ok(heap)
     };
     let n = u.shader_windows();
     let mut bufs: Vec<(usize, u64)> = vec![(0, 0); n];
@@ -3933,6 +3935,9 @@ struct HeapUma {
     /// `READBACK` or `CUSTOM + WRITE_BACK`: if backed by sparse VRAM, `COPY_DEST` buffers placed
     /// in it read back on `Map(0, NULL, ...)`.
     cpu_readback: bool,
+    /// A `DEFAULT` heap that denies both kinds of texture: once its buffers have a block, the
+    /// PC heap holds nothing (`XCL_RESIDENCY_LOW` lets it be paged first).
+    buffers_only: bool,
     block: Option<usize>,
 }
 
@@ -3968,6 +3973,7 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
             align: (d.Alignment as usize).max(0x1_0000),
             prefer_coherent: is_rb && size <= COHERENT_READBACK_MAX,
             cpu_readback: is_rb || is_custom_wb,
+            buffers_only: d.Properties.Type == D3D12_HEAP_TYPE_DEFAULT && d.Flags.0 & D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS.0 == D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS.0,
             block: None,
         },
     );
@@ -4028,7 +4034,11 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
         return Some((existing, cr));
     }
     e.block = Some(p);
+    let buffers_only = e.buffers_only;
     drop(g);
+    if buffers_only {
+        unsafe { super::residency::spare_raw(heap, rounded as u64, "title buffers-only heap, its buffers in unified memory") };
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 4 {
         let kind = if u.is_sparse(p) { "sparse VRAM" } else { "coherent RAM" };

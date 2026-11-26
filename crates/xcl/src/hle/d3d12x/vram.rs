@@ -572,6 +572,10 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device, adapter: Option<&windows::Win32::G
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
     }
+    // (a pool already in system memory has nowhere lower to go)
+    if let (Some(h), true) = (&heap, properties.Type == D3D12_HEAP_TYPE_DEFAULT) {
+        super::residency::spare(h, bytes, "pool heap of title texture pages");
+    }
     heap
 }
 
