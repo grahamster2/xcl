@@ -2786,9 +2786,7 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
-    // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
-    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    x[0x34..].fill(0);
+    let x = view_resource_key((desc as *const [u8; 0x38]).read_unaligned());
     if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
         return r as *mut c_void;
     }
@@ -2804,6 +2802,41 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     }
     MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
     r
+}
+
+/// The resource desc a view by address is known by (`resource_at`): the PC part of it, its
+/// padding cleared. The flags (@0x30) are its last dword, padding follows; and 0x04..0x08 is the
+/// padding between `Dimension` and `Alignment` (for every dimension: the desc is one struct),
+/// where the title leaves stack bytes: the same view at the same address made a second resource
+/// whenever they differed (amd-dev c093211e, upstream #2743).
+fn view_resource_key(mut x: [u8; 0x38]) -> [u8; 0x38] {
+    x[0x04..0x08].fill(0);
+    x[0x34..].fill(0);
+    x
+}
+
+#[cfg(test)]
+mod view_resource_key_tests {
+    #[test]
+    fn a_view_by_address_ignores_the_padding_of_its_desc() {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&3u32.to_le_bytes()); // Texture2D
+        x[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&256u32.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&28u32.to_le_bytes()); // R8G8B8A8_UNORM
+        let mut garbage = x;
+        garbage[0x04..0x08].copy_from_slice(&[0xd8, 0x7e, 0x3f, 0x01]);
+        garbage[0x34..0x38].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(super::view_resource_key(garbage), super::view_resource_key(x));
+        assert_eq!(super::view_resource_key(garbage)[0x04..0x08], [0u8; 4]);
+        // what is not padding still tells views apart
+        let mut other = x;
+        other[0x08] = 1; // Alignment
+        assert_ne!(super::view_resource_key(other), super::view_resource_key(x));
+        let mut other = x;
+        other[0x30] = 4; // Flags
+        assert_ne!(super::view_resource_key(other), super::view_resource_key(x));
+    }
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
