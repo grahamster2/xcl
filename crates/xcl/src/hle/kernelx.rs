@@ -1035,7 +1035,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     if gpu_visible_fallback(addr, t, p) {
         let q = reserve_watched(size, t, p);
         if !q.is_null() {
-            warn_plain_fallback(size);
+            // only the 64 KiB-page reservations tried the sparse windows (above): the committed
+            // GPU heaps here never did, and are no sign of a sparse window without room
+            if t & MEM_64K_PAGES == MEM_64K_PAGES && !mirrors::is_gpu_view_reservation(t, p) {
+                warn_plain_fallback(size);
+            }
             mirrors::reserved(q as usize, size, t, p);
             trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
             return q;
@@ -1112,31 +1116,47 @@ fn large_plain_fallback(u: &crate::gpu::uma::Uma, size: usize) -> bool {
     u.has_sparse() && size >= LARGE_PLAIN_FALLBACK && size <= u.sparse_title_capacity()
 }
 
-/// Warns once of a large GPU-visible reservation of the title that found no room in the sparse
+/// How many distinct sizes of large plain fallbacks are warned of (`warn_plain_fallback`).
+const PLAIN_FALLBACK_WARNINGS: usize = 4;
+
+/// Whether a large plain fallback of `size` bytes is one to warn of: the first
+/// `PLAIN_FALLBACK_WARNINGS` distinct sizes, each once, so a fallback that is by design (seen
+/// first) does not hide a later one of another size.
+fn first_plain_fallback_of_size(seen: &mut Vec<usize>, size: usize) -> bool {
+    if seen.len() >= PLAIN_FALLBACK_WARNINGS || seen.contains(&size) {
+        return false;
+    }
+    seen.push(size);
+    true
+}
+
+/// Warns of a large GPU-visible reservation of the title that found no room in the sparse
 /// windows and is plain write-watched memory (`large_plain_fallback`), with what the windows had
-/// free. A retail game's page pool (63632 pages of 64 KiB, the memory of its
-/// CopyPageMappingsBatchX) went there when physical page homes went first-fit into windows 1+,
-/// and its threads faulted on garbage pointers ~45 s into the world: this line is the sign of it.
+/// free: once per size, for the first few sizes (`first_plain_fallback_of_size`). A retail
+/// game's page pool (63632 pages of 64 KiB, the memory of its CopyPageMappingsBatchX) went there
+/// when physical page homes went first-fit into windows 1+, and its threads faulted on garbage
+/// pointers ~45 s into the world: this line is the sign of it.
 fn warn_plain_fallback(size: usize) {
     let Some(u) = crate::gpu::uma::get() else { return };
     if !large_plain_fallback(u, size) {
         return;
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let (free, largest) = u.sparse_free_all();
-        let windows: Vec<String> = (0..).take_while(|&k| u.is_sparse_window(k)).map(|k| {
-            let (f, l) = u.sparse_free_in(k);
-            format!("{k}: {} MB, {} MB in one run", f >> 20, l >> 20)
-        }).collect();
-        crate::xlog_warn!(
-            "kernelx: a GPU-visible reservation of {} MB ({size:#x} bytes) found no room in the sparse windows ({} MB free, {} MB at most in one run; window {}): plain write-watched memory, which the GPU sees only through copies",
-            size >> 20,
-            free >> 20,
-            largest >> 20,
-            windows.join(", window ")
-        );
-    });
+    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    if !first_plain_fallback_of_size(&mut SEEN.lock().unwrap(), size) {
+        return;
+    }
+    let (free, largest) = u.sparse_free_all();
+    let windows: Vec<String> = (0..).take_while(|&k| u.is_sparse_window(k)).map(|k| {
+        let (f, l) = u.sparse_free_in(k);
+        format!("{k}: {} MB, {} MB in one run", f >> 20, l >> 20)
+    }).collect();
+    crate::xlog_warn!(
+        "kernelx: a GPU-visible reservation of {} MB ({size:#x} bytes) found no room in the sparse windows ({} MB free, {} MB at most in one run; window {}): plain write-watched memory, which the GPU sees only through copies",
+        size >> 20,
+        free >> 20,
+        largest >> 20,
+        windows.join(", window ")
+    );
 }
 
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
@@ -2330,14 +2350,30 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
 /// run went past 380 s with no crash.
 const HOME_W0_KEEP_MB: usize = 64;
 
-/// `XCL_HOME_W0_KEEP_MB` as bytes: a whole number of MB, anything else the default.
+/// `XCL_HOME_W0_KEEP_MB` as bytes: a whole number of MB, anything else the default (with a
+/// warning).
 fn home_w0_keep_from(v: Option<&str>) -> usize {
-    v.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(HOME_W0_KEEP_MB).saturating_mul(1 << 20)
+    let mb = match v.map(|s| (s, s.trim().parse::<usize>())) {
+        None => HOME_W0_KEEP_MB,
+        Some((_, Ok(mb))) => mb,
+        Some((s, Err(_))) => {
+            crate::xlog_warn!("kernelx: XCL_HOME_W0_KEEP_MB={s:?} is not a whole number of MB: {HOME_W0_KEEP_MB} MB");
+            HOME_W0_KEEP_MB
+        }
+    };
+    mb.saturating_mul(1 << 20)
 }
 
+#[cfg(not(test))]
 fn home_w0_keep() -> usize {
     static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *KEEP.get_or_init(|| home_w0_keep_from(std::env::var("XCL_HOME_W0_KEEP_MB").ok().as_deref()))
+}
+
+/// Tests place homes with the default margin, whatever `XCL_HOME_W0_KEEP_MB` the shell has.
+#[cfg(test)]
+fn home_w0_keep() -> usize {
+    home_w0_keep_from(None)
 }
 
 /// Reserve home storage for `bytes` of title physical pages: sparse UMA first, coherent UMA
@@ -5501,6 +5537,20 @@ mod tests {
         assert!(!large_plain_fallback(&u, u.sparse_title_capacity() + PHYS_PAGE));
         let flat = crate::gpu::uma::Uma::with_windows(1, 16 << 20).unwrap();
         assert!(!large_plain_fallback(&flat, 1 << 30), "no sparse windows: nothing to compare with");
+    }
+
+    /// Large plain fallbacks are warned of once per size, for the first few sizes: one seen
+    /// first (by design) does not hide a later one of another size.
+    #[test]
+    fn plain_fallbacks_warn_for_the_first_few_sizes() {
+        let mut seen = Vec::new();
+        assert!(first_plain_fallback_of_size(&mut seen, 16 << 30));
+        assert!(!first_plain_fallback_of_size(&mut seen, 16 << 30), "a size once");
+        assert!(first_plain_fallback_of_size(&mut seen, 63632 * PHYS_PAGE), "another size after it");
+        assert!(first_plain_fallback_of_size(&mut seen, 300 << 20));
+        assert!(first_plain_fallback_of_size(&mut seen, 400 << 20));
+        assert!(!first_plain_fallback_of_size(&mut seen, 500 << 20), "no more than PLAIN_FALLBACK_WARNINGS sizes");
+        assert_eq!(seen.len(), PLAIN_FALLBACK_WARNINGS);
     }
 
     #[test]
