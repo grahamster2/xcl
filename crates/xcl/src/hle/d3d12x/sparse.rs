@@ -121,13 +121,66 @@ struct TileEntry {
 /// holds zeros unless the GPU wrote to it.
 fn never_sent(mapped: &FxHashMap<usize, TileEntry>) -> (usize, usize) {
     let (mut own, mut unsent) = (0, 0);
-    for e in mapped.values().filter(|e| e.src == 0) {
+    for e in mapped.values().filter(|e| e.src == 0 && e.pool != LAZY) {
         own += 1;
         if e.sent.iter().all(|p| p.is_none()) {
             unsent += 1;
         }
     }
     (own, unsent)
+}
+
+/// `TileEntry::pool` of a tile the title committed that has no video memory yet
+/// (`XCL_SPARSE_LAZY=1`): it gets a pool tile once the CPU's first bytes go up to it or a
+/// placed buffer or a copy back names it (`State::materialize`). Until then the window reads
+/// zeros there, as the title's freshly committed pages do.
+const LAZY: (u32, u32) = (u32::MAX, u32::MAX);
+
+/// `XCL_SPARSE_LAZY=1`: pages a title commits in a sparse window get their video memory at
+/// their first use, not at the commit. Off by default: a compute program that writes through a
+/// window to memory no buffer was placed on would write nothing there.
+fn lazy_commits() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::LAZY_COMMITS_FOR_TEST.with(|c| c.get()) {
+        return on;
+    }
+    lazy_asked() && !LAZY_REFUSED.load(Ordering::Relaxed)
+}
+
+/// `XCL_SPARSE_LAZY=1` was given
+fn lazy_asked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_LAZY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `XCL_SPARSE_LAZY=1` on a device whose unmapped tiles do not read zeros (`null_tiles_read_zero`):
+/// commits map at once, as without it
+static LAZY_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a tile of a reserved buffer with no video memory reads zeros and takes writes that go
+/// nowhere on `dev` (tiled resources tier 2). On tier 1 a touch of one is undefined.
+unsafe fn null_tiles_read_zero(dev: &ID3D12Device) -> bool {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0
+}
+
+/// The parts of `runs` (address, bytes) that lie in tiles `keep` holds for, cut where a tile
+/// ends; neighbours left together are one run.
+fn runs_where(runs: &[(usize, usize)], mut keep: impl FnMut(usize) -> bool) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for &(a, n) in runs {
+        let end = a.saturating_add(n);
+        let mut at = a;
+        while at < end {
+            let t = at & !(TILE - 1);
+            let stop = t.saturating_add(TILE).min(end);
+            if keep(t) {
+                push_run(&mut out, at, stop - at);
+            }
+            at = stop;
+        }
+    }
+    out
 }
 
 /// the last `TileEntry::gen` given out
@@ -291,7 +344,7 @@ fn decommit_tiles(
     }
     for &t in &unmapped {
         if let Some(entry) = mapped.remove(&t) {
-            if !pinned.contains_key(&entry.pool) {
+            if entry.pool != LAZY && !pinned.contains_key(&entry.pool) {
                 free.push(entry.pool);
             }
         }
@@ -560,6 +613,9 @@ struct State {
     /// others do not try to make a heap again (each tried, and logged it), and the refused ones
     /// wait
     no_memory: Option<std::time::Instant>,
+    /// tiles listed with no video memory (`LAZY`) whose CPU bytes found none at an upload
+    /// (`upload_dirty`): all that is committed there goes up at a submit once there is some
+    starved: Vec<usize>,
     counts: MirrorCounts,
     diag: ViewDiag,
     /// `XCL_VIEW_POISON`: the tile the windows' tiles without video memory show (`poison_windows`)
@@ -965,6 +1021,9 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
 }
 
 unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -> windows::core::Result<State> {
+    if lazy_asked() && !null_tiles_read_zero(dev) && !LAZY_REFUSED.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("sparse windows: XCL_SPARSE_LAZY=1 is left out - on this device a tile with no video memory does not read zeros (tiled resources tier under 2)");
+    }
     let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
@@ -1049,6 +1108,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         mirror_cap: mirror_cap(),
         refused: FxHashSet::default(),
         no_memory: None,
+        starved: Vec::new(),
         counts: MirrorCounts::default(),
         diag: ViewDiag { keep: view_switches().keep, stats: view_switches().stats, ..Default::default() },
         poison: None,
@@ -1163,6 +1223,10 @@ impl State {
     /// still `quarantined`, is not taken: a retired pool is taken back or a heap made instead.
     /// (Parked tiles are not flushed for it: freed now, they would wait and cool all the same.)
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+        #[cfg(test)]
+        if tests::NO_TILES.with(|c| c.get()) {
+            return None;
+        }
         self.drain_quarantined();
         if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now()) {
             return Some((t, true));
@@ -1241,6 +1305,7 @@ impl State {
             return;
         }
         let mut by_heap: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        debug_assert!(tiles.iter().all(|t| t.1 != LAZY), "a tile with no video memory is mapped nowhere");
         for &(a, (h, t)) in tiles {
             by_heap.entry(h).or_default().push((((a - res_base) / TILE) as u32, t));
         }
@@ -1402,6 +1467,83 @@ impl State {
         self.submit_slot(idx);
     }
 
+    /// `ensure_mapped` for a commit with `lazy_commits`: the tiles of `[a, a + n)` are listed
+    /// (watched, scanned, their holes kept) with no video memory (`LAZY`). A tile still mapped
+    /// from before (parked, or kept for a buffer) is taken back as it is.
+    unsafe fn ensure_listed(&mut self, a: usize, n: usize) {
+        let end = a.saturating_add(n);
+        let mut t = a & !(TILE - 1);
+        let mut new = false;
+        while t < end {
+            if !self.mapped.contains_key(&t) && !self.mirror_src.contains_key(&t) && self.window_index(t).is_some() {
+                if self.parked.contains_key(&t) || self.kept.contains_key(&t) {
+                    self.ensure_mapped(t, TILE, |_| 0xFFFF);
+                } else {
+                    self.mapped.insert(t, TileEntry::with_holes(LAZY, 0xFFFF));
+                    early_add(&mut self.runs, t, t + TILE);
+                    new = true;
+                }
+            }
+            match t.checked_add(TILE) {
+                Some(next) => t = next,
+                None => break,
+            }
+        }
+        if new {
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// The `LAZY` tiles of `[a, a + n)` get their video memory now (their mapping is pending,
+    /// as `ensure_mapped` leaves it): (the tiles that did, those left without). A tile used
+    /// before goes to `reused` as the run to clear, which the caller sees to before anything is
+    /// written there. A moment after no video memory was found (`no_memory`) only tiles at hand
+    /// are taken, as in `new_mirror`, but with `force` (a placed buffer maps its tiles once).
+    unsafe fn materialize(&mut self, a: usize, n: usize, force: bool, reused: &mut Vec<(usize, usize)>) -> (usize, usize) {
+        let end = a.saturating_add(n);
+        let mut t = a & !(TILE - 1);
+        let (mut got, mut left) = (0, 0);
+        while t < end {
+            if self.mapped.get(&t).is_some_and(|e| e.pool == LAZY) {
+                let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now()) || !self.retired.is_empty();
+                let wait = left > 0 || (!force && self.short_of_memory() && !at_hand);
+                match if wait { None } else { self.take_tile() } {
+                    Some((tile, used)) => {
+                        if let Some(e) = self.mapped.get_mut(&t) {
+                            e.pool = tile;
+                        }
+                        if used {
+                            reused.push((t, TILE));
+                        }
+                        self.pending.push(t);
+                        got += 1;
+                    }
+                    None => {
+                        if !wait {
+                            self.no_memory = Some(std::time::Instant::now());
+                        }
+                        left += 1;
+                    }
+                }
+            }
+            match t.checked_add(TILE) {
+                Some(next) => t = next,
+                None => break,
+            }
+        }
+        (got, left)
+    }
+
+    /// The title's lists about to be submitted write `ranges` on the GPU (`will_write`): their
+    /// tiles listed with no video memory get it, cleared at this submit before the lists run.
+    unsafe fn give_memory(&mut self, ranges: &[(usize, usize)]) {
+        let mut reused = Vec::new();
+        for &(a, n) in ranges {
+            self.materialize(a, n, false, &mut reused);
+        }
+        self.to_zero.extend(reused);
+    }
+
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
     /// the initial 16-bit hole mask for each newly mapped 64 KiB tile. Tiles over a CPU view
     /// (`mirror_src`) are left to `new_mirror`.
@@ -1462,7 +1604,7 @@ impl State {
         addrs.dedup();
         let mut by_window: FxHashMap<usize, Vec<(usize, (u32, u32))>> = FxHashMap::default();
         for t in addrs {
-            if let (Some(e), Some(wi)) = (self.mapped.get(&t), self.window_index(t)) {
+            if let (Some(e), Some(wi)) = (self.mapped.get(&t).filter(|e| e.pool != LAZY), self.window_index(t)) {
                 by_window.entry(wi).or_default().push((t, e.pool));
             } else if self.parked.contains_key(&t) || self.kept.contains_key(&t) {
                 self.pending.push(t);
@@ -1696,7 +1838,7 @@ impl State {
         let pg = va & !(PAGE - 1);
         let t = pg & !(TILE - 1);
         let idx = (pg - t) / PAGE;
-        let Some(entry) = self.mapped.get(&t) else { return false };
+        let Some(entry) = self.mapped.get(&t).filter(|e| e.pool != LAZY) else { return false };
         if entry.holes & (1u16 << idx) != 0 {
             return false;
         }
@@ -1720,7 +1862,8 @@ impl State {
             let t = pg & !(TILE - 1);
             let idx = (pg - t) / PAGE;
             let step = (pg + PAGE).min(end) - at;
-            if let Some(entry) = self.mapped.get_mut(&t) {
+            // (a tile with no video memory holds nothing the GPU wrote)
+            if let Some(entry) = self.mapped.get_mut(&t).filter(|e| e.pool != LAZY) {
                 let here = entry.cpu(t);
                 if entry.holes & (1u16 << idx) == 0 && entry.gen == gen {
                     let wrote = land_page(&mut entry.sent[idx], here + (pg - t), at - pg, p.add(src_off), step);
@@ -1884,7 +2027,8 @@ impl State {
                 let tile = cur & !(TILE - 1);
                 let Some(wi) = self.window_index(cur) else { break };
                 let to_tile_end = (tile + TILE) - cur;
-                let Some(gen) = self.mapped.get(&tile).map(|e| e.gen) else {
+                // (a tile with no video memory has nothing to copy back, like one not mapped)
+                let Some(gen) = self.mapped.get(&tile).filter(|e| e.pool != LAZY).map(|e| e.gen) else {
                     at += (n - at).min(to_tile_end);
                     continue;
                 };
@@ -1972,7 +2116,9 @@ impl State {
                 let Some(wi) = self.window_index(cur) else { break };
                 let b = self.windows[wi].0;
                 let to_tile_end = (tile + TILE) - cur;
-                let Some(gen) = self.mapped.get(&tile).map(|e| e.gen) else {
+                // (a tile with no video memory has nothing to copy back: the GPU's writes there went
+                // nowhere, and a tile it got now would hold what another address left in it)
+                let Some(gen) = self.mapped.get(&tile).filter(|e| e.pool != LAZY).map(|e| e.gen) else {
                     done += (n - done).min(to_tile_end);
                     continue;
                 };
@@ -2001,6 +2147,14 @@ impl State {
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
     unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) {
+        // (a tile with no video memory reads zeros already; a run goes on into its neighbours)
+        let kept: Vec<(usize, usize)>;
+        let runs = if lazy_commits() {
+            kept = runs_where(runs, |t| self.mapped.get(&t).is_none_or(|e| e.pool != LAZY));
+            &kept[..]
+        } else {
+            runs
+        };
         if runs.is_empty() || !self.ensure_zero_buf() {
             return;
         }
@@ -2037,6 +2191,44 @@ impl State {
     unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
         if runs.is_empty() {
             return;
+        }
+        // the CPU's first bytes for a tile listed with no video memory: it gets it now, and its
+        // mapping is sent before the copies that fill it. One used before is cleared first, here
+        // and not at the next submit (`to_zero`), which would clear these bytes with it
+        let kept: Vec<(usize, usize)>;
+        let mut runs = runs;
+        if lazy_commits() {
+            let mut reused = Vec::new();
+            let (mut got, mut left) = (0, 0);
+            for &(a, n) in runs {
+                let (g, l) = self.materialize(a, n, false, &mut reused);
+                got += g;
+                left += l;
+            }
+            if got > 0 {
+                self.flush_pending();
+                self.upload_zeros(&reused);
+            }
+            // none to be had: the bytes are not sent, whatever the scan noted, and all of the tile
+            // goes up once there is some (`starved`)
+            if left > 0 {
+                let mut starved: Vec<usize> = Vec::new();
+                kept = runs_where(runs, |t| {
+                    let has = self.mapped.get(&t).is_none_or(|e| e.pool != LAZY);
+                    if !has && starved.last() != Some(&t) {
+                        starved.push(t);
+                    }
+                    has
+                });
+                for &t in &starved {
+                    self.clear_sent_range(t, TILE);
+                }
+                self.starved.extend(starved);
+                runs = &kept[..];
+                if runs.is_empty() {
+                    return;
+                }
+            }
         }
         let Some(p) = self.staging_ptr() else { return };
         let mut open_slot: Option<usize> = None;
@@ -2696,7 +2888,11 @@ impl State {
                 }
             }
         }
-        self.ensure_mapped(a, n, |_| 0xFFFF);
+        if lazy_commits() {
+            self.ensure_listed(a, n);
+        } else {
+            self.ensure_mapped(a, n, |_| 0xFFFF);
+        }
         let mut pg = a & !(PAGE - 1);
         let end = a.saturating_add(n);
         while pg < end {
@@ -2744,7 +2940,7 @@ impl State {
         }
         let mut t = a & !(TILE - 1);
         while t < end {
-            if let Some(e) = self.mapped.get(&t) {
+            if let Some(e) = self.mapped.get(&t).filter(|e| e.pool != LAZY) {
                 pools.push((t, e.pool));
             }
             match t.checked_add(TILE) {
@@ -3777,8 +3973,13 @@ impl State {
                 self.new_mirror(t, c, h, true);
             }
         }
+        // tiles listed with no video memory get it for the buffer (before `ensure_mapped`, which
+        // sends what is pending or asks for it soon); one that finds none is left out
+        let mut reused = Vec::new();
+        self.materialize(start, len, true, &mut reused);
+        self.to_zero.extend(reused);
         self.ensure_mapped(start, len, |t| query_tile_holes(t));
-        (start..end).step_by(TILE).filter_map(|t| self.mapped.get(&t).map(|e| (t, e.pool))).collect()
+        (start..end).step_by(TILE).filter_map(|t| self.mapped.get(&t).filter(|e| e.pool != LAZY).map(|e| (t, e.pool))).collect()
     }
 
     /// `mapped_ranges` of this state
@@ -3791,7 +3992,8 @@ impl State {
     }
 }
 
-/// The sparse windows' tiles with video memory as sorted (start, end) runs, and the CPU memory
+/// The sparse windows' tiles listed (with video memory, or to get it at their first use,
+/// `LAZY`) as sorted (start, end) runs, and the CPU memory
 /// tiles of GPU views show (never the views' own addresses): where a CPU write has to reach the
 /// GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
@@ -3947,6 +4149,10 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     if REMAPPING.swap(false, Ordering::AcqRel) {
         take_remaps(&mut s.remaps, &mut REMAPS.lock().unwrap());
     }
+    if WRITE_ASKING.swap(false, Ordering::AcqRel) {
+        let asks = std::mem::take(&mut *WRITE_ASKS.lock().unwrap_or_else(|e| e.into_inner()));
+        s.give_memory(&asks);
+    }
     let waited = t0.elapsed().as_micros() as u64;
     PHASES[0].fetch_add(waited, Ordering::Relaxed);
     SUBMIT_US.fetch_add(waited, Ordering::Relaxed);
@@ -3956,6 +4162,24 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         HELD.add(HOLDERS + behind, (t_got - t0).as_micros() as u64);
     }
     s.before_execute_on(queue, dirty, page);
+}
+
+/// What the title's lists being recorded will write on the GPU in the sparse windows (address,
+/// bytes; `will_write`), taken by the next submit: with `lazy_commits` a tile there may have no
+/// video memory yet, and the write would go nowhere.
+static WRITE_ASKS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static WRITE_ASKING: AtomicBool = AtomicBool::new(false);
+
+/// A list being recorded writes `[va, va + len)` on the GPU with a memory operation (an
+/// immediate, a fill, a copy, a timestamp): with `lazy_commits`, its tiles get their video memory
+/// at the next submit, which comes before the list's (`State::give_memory`). Never waits for the
+/// state.
+pub(super) fn will_write(va: usize, len: usize) {
+    if len == 0 || !lazy_commits() {
+        return;
+    }
+    WRITE_ASKS.lock().unwrap_or_else(|e| e.into_inner()).push((va, len));
+    WRITE_ASKING.store(true, Ordering::Release);
 }
 
 /// microseconds in `before_execute`, the wait for the state's lock with it
@@ -4174,6 +4398,23 @@ impl State {
                 }
             }
         }
+        // tiles whose bytes found no video memory at an upload: all that is committed there, once
+        // a moment went by since (the upload gives them their tile, or leaves them here again)
+        let mut again = false;
+        if !s.starved.is_empty() && !s.short_of_memory() {
+            let mut starved = std::mem::take(&mut s.starved);
+            starved.sort_unstable();
+            starved.dedup();
+            for &t in &starved {
+                let Some(entry) = s.mapped.get_mut(&t).filter(|e| e.src == 0) else { continue };
+                again = true;
+                for idx in 0..PAGES_PER_TILE {
+                    if entry.holes & (1u16 << idx) == 0 {
+                        pages.push(PageSlot { cpu: t + idx * PAGE, win: t + idx * PAGE, slot: &mut entry.sent[idx] });
+                    }
+                }
+            }
+        }
         let mut i = 0;
         while i < dirty.len() {
             let a = dirty[i];
@@ -4215,7 +4456,7 @@ impl State {
                 x = end;
             }
         }
-        if !s.mirrors.is_empty() {
+        if !s.mirrors.is_empty() || again {
             // (in window order, for the runs; a page filled and written is one slot, scanned once)
             pages.sort_unstable_by_key(|p| p.win);
             pages.dedup_by_key(|p| p.win);
@@ -4255,9 +4496,10 @@ impl State {
             let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
             let us = SUBMIT_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
             if n.is_power_of_two() && n >= 16 {
-                crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
+                let listed = s.mapped.values().filter(|e| e.pool == LAZY).count();
+                crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len() - listed);
                 let (own, unsent) = never_sent(&s.mapped);
-                crate::xlog_info!("sparse windows: {unsent} of the windows' own {own} mapped tiles ({} of {} MB) never got a byte from the CPU (zeros, or what the GPU wrote)", unsent * TILE >> 20, own * TILE >> 20);
+                crate::xlog_info!("sparse windows: {unsent} of the windows' own {own} mapped tiles ({} of {} MB) never got a byte from the CPU (zeros, or what the GPU wrote); {listed} listed with no video memory (XCL_SPARSE_LAZY)", unsent * TILE >> 20, own * TILE >> 20);
                 let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
                 let c = &s.counts;
                 crate::xlog_info!(
@@ -4480,6 +4722,11 @@ mod tests {
         pub(super) static BETWEEN_FORGETS: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
         /// The asks `forget_ask` counted on this thread (`MIRROR_FORGOTTEN` is every test's)
         pub(super) static ASKS_FORGOTTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// `lazy_commits` for the test on this thread (`LazyCommits`; None: as the environment
+        /// says). A thread's own: the other tests' states run beside it in this process.
+        pub(super) static LAZY_COMMITS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        /// `take_tile` finds no video memory on this thread
+        pub(super) static NO_TILES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The runs of the tiles mapped, made from all of them (but those over a CPU view: their
@@ -4782,6 +5029,7 @@ mod tests {
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
                 no_memory: None,
+                starved: Vec::new(),
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
@@ -5171,6 +5419,7 @@ mod tests {
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
                 no_memory: None,
+                starved: Vec::new(),
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
@@ -5407,6 +5656,7 @@ mod tests {
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
                 no_memory: None,
+                starved: Vec::new(),
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
@@ -5532,6 +5782,7 @@ mod tests {
                 mirror_cap: mirror_cap(),
                 refused: FxHashSet::default(),
                 no_memory: None,
+                starved: Vec::new(),
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
@@ -5691,6 +5942,165 @@ mod tests {
         let reserved = reserved.expect("reserved buffer");
         let s = new_state(&dev, vec![(base, reserved)]).expect("state");
         (base, s)
+    }
+
+    /// `XCL_SPARSE_LAZY` on (or off) for this thread while it lives, and `take_tile` finding no
+    /// video memory while `no_tiles` is set.
+    struct Lazy;
+    impl Lazy {
+        fn on(on: bool) -> Lazy {
+            LAZY_COMMITS_FOR_TEST.with(|c| c.set(Some(on)));
+            Lazy
+        }
+        fn no_tiles(&self, none: bool) {
+            NO_TILES.with(|c| c.set(none));
+        }
+    }
+    impl Drop for Lazy {
+        fn drop(&mut self) {
+            LAZY_COMMITS_FOR_TEST.with(|c| c.set(None));
+            NO_TILES.with(|c| c.set(false));
+        }
+    }
+
+    /// A state of `tiles` tiles for the lazy tests, its window's CPU pages committed and the title's
+    /// queue. None: no GPU whose unmapped tiles read zeros (the lazy path is left out there).
+    unsafe fn lazy_state(tiles: usize) -> Option<(usize, State, ID3D12CommandQueue)> {
+        let dev = test_device();
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).ok()?;
+        if software(&dev) || o.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
+            return None;
+        }
+        let (base, s) = test_state_with_reserved(tiles);
+        assert!(!VirtualAlloc(base as *const c_void, tiles * TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+        let queue: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+        Some((base, s, queue))
+    }
+
+    /// `len` bytes of the window at `va` as the GPU has them, after what was sent to it.
+    unsafe fn window_bytes(s: &mut State, va: usize, len: usize) -> Vec<u8> {
+        let mut d = buffer_desc(len as u64);
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        let mut back: Option<ID3D12Resource> = None;
+        s.dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back).expect("readback buffer");
+        let back = back.expect("readback buffer");
+        let (base, window) = (s.windows[0].0, s.windows[0].1.clone());
+        let alloc: ID3D12CommandAllocator = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+        let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+        list.CopyBufferRegion(&back, 0, &window, (va - base) as u64, len as u64);
+        list.Close().expect("Close");
+        s.flush_pending();
+        s.queue.ExecuteCommandLists(&[Some(list.cast().expect("list"))]);
+        s.signal();
+        s.wait_for(s.value);
+        let mut p = std::ptr::null_mut();
+        back.Map(0, None, Some(&mut p)).expect("Map");
+        let out = std::slice::from_raw_parts(p as *const u8, len).to_vec();
+        back.Unmap(0, None);
+        out
+    }
+
+    /// Tile `t`'s CPU pages written with bytes made from `seed`; its pages, for a submit's dirty list.
+    unsafe fn write_tile(t: usize, seed: u64) -> Vec<usize> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        for i in 0..TILE / 8 {
+            *(t as *mut u64).add(i) = next(&mut x);
+        }
+        (t..t + TILE).step_by(PAGE).collect()
+    }
+
+    /// With `XCL_SPARSE_LAZY` a committed tile gets no video memory until the CPU's first bytes
+    /// go up to it; they reach the GPU, and a later submit with nothing written leaves them there
+    /// (a tile cleared one submit after its bytes went up would read zeros). A tile never written
+    /// keeps none and reads zeros.
+    #[test]
+    fn a_lazy_tile_gets_memory_at_its_first_bytes_and_keeps_them() {
+        let lazy = Lazy::on(true);
+        unsafe {
+            let Some((base, mut s, queue)) = lazy_state(2) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
+            s.commit_range(base, 2 * TILE);
+            assert_eq!(s.mapped[&base].pool, LAZY, "committed: listed with no video memory");
+            assert_eq!(s.mapped[&(base + TILE)].pool, LAZY);
+            // a used pool tile on hand, so that its old bytes would show if it were not cleared
+            s.no_memory = None;
+            let dirty = write_tile(base, 7);
+            s.before_execute_on(&queue, &dirty, PAGE);
+            assert_ne!(s.mapped[&base].pool, LAZY, "its first bytes gave it a pool tile");
+            assert_eq!(s.mapped[&(base + TILE)].pool, LAZY, "the tile never written has none");
+            let cpu = std::slice::from_raw_parts(base as *const u8, TILE).to_vec();
+            assert!(window_bytes(&mut s, base, TILE) == cpu, "the bytes reached the GPU");
+            s.before_execute_on(&queue, &[], PAGE);
+            s.before_execute_on(&queue, &[], PAGE);
+            assert!(window_bytes(&mut s, base, TILE) == cpu, "and are still there two submits later");
+            assert!(window_bytes(&mut s, base + TILE, TILE).iter().all(|&b| b == 0), "a tile with no memory reads zeros");
+        }
+        drop(lazy);
+    }
+
+    /// Bytes that found no video memory at an upload are owed and go up whole once there is some.
+    #[test]
+    fn bytes_that_found_no_memory_go_up_once_there_is_some() {
+        let lazy = Lazy::on(true);
+        unsafe {
+            let Some((base, mut s, queue)) = lazy_state(1) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
+            s.commit_range(base, TILE);
+            let dirty = write_tile(base, 11);
+            lazy.no_tiles(true);
+            s.before_execute_on(&queue, &dirty, PAGE);
+            assert_eq!(s.mapped[&base].pool, LAZY, "no video memory to be had: still none");
+            assert!(s.starved.contains(&base), "its bytes are owed");
+            lazy.no_tiles(false);
+            s.no_memory = None;
+            s.before_execute_on(&queue, &[], PAGE);
+            assert_ne!(s.mapped[&base].pool, LAZY, "a submit with nothing written gives it its memory");
+            let cpu = std::slice::from_raw_parts(base as *const u8, TILE).to_vec();
+            assert!(window_bytes(&mut s, base, TILE) == cpu, "and all its bytes");
+        }
+        drop(lazy);
+    }
+
+    /// A memory write the title records on a list gives the tile its memory before the list runs
+    /// (`give_memory`); a placed buffer over a tile that finds none leaves it out of its mapping
+    /// instead of mapping pool tile u32::MAX.
+    #[test]
+    fn a_recorded_write_gives_memory_and_a_buffer_never_maps_the_sentinel() {
+        let lazy = Lazy::on(true);
+        unsafe {
+            let Some((base, mut s, _queue)) = lazy_state(2) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
+            s.commit_range(base, 2 * TILE);
+            s.give_memory(&[(base + 8, 8)]);
+            assert_ne!(s.mapped[&base].pool, LAZY, "the recorded write's tile got memory");
+            assert_eq!(s.mapped[&(base + TILE)].pool, LAZY, "the other did not");
+            lazy.no_tiles(true);
+            let tiles = s.buffer_tiles(base, 2 * TILE);
+            assert!(tiles.iter().all(|&(_, tile)| tile != LAZY), "no tile of a buffer is the sentinel: {tiles:?}");
+            assert!(tiles.iter().any(|&(t, _)| t == base), "the tile with memory is the buffer's");
+        }
+        drop(lazy);
+    }
+
+    /// Decommitting a tile with no video memory frees and parks nothing; committed again it is
+    /// listed again. With the switch off a commit maps at once, as before.
+    #[test]
+    fn a_lazy_tile_decommits_without_a_pool_tile_and_off_maps_at_commit() {
+        unsafe {
+            let lazy = Lazy::on(true);
+            let Some((base, mut s, _queue)) = lazy_state(1) else { return crate::gpu::recomp::runner::skip_test("no GPU with tiled resources tier 2") };
+            s.commit_range(base, TILE);
+            let (free, parked) = (s.free.len(), s.parked.len());
+            s.decommit_range(base, TILE);
+            assert!(!s.mapped.contains_key(&base), "gone from the window");
+            assert_eq!((s.free.len(), s.parked.len()), (free, parked), "no pool tile freed or parked");
+            s.commit_range(base, TILE);
+            assert_eq!(s.mapped[&base].pool, LAZY, "listed again");
+            drop(lazy);
+            let off = Lazy::on(false);
+            let Some((base2, mut s2, _q2)) = lazy_state(1) else { return };
+            s2.commit_range(base2, TILE);
+            assert_ne!(s2.mapped[&base2].pool, LAZY, "off: mapped at the commit");
+            drop(off);
+        }
     }
 
     /// The tiles `flush_parked` quarantined, once the sparse queue and the title queues are past

@@ -769,6 +769,7 @@ impl ListState {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
             self.sparse_writes.push((va as usize, size as usize));
+            super::sparse::will_write(va as usize, size as usize);
         }
     }
 
@@ -789,6 +790,7 @@ impl ListState {
             SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
         }
         self.sparse_imm.push((va as usize, value, bytes));
+        super::sparse::will_write(va as usize, (bytes & 0x7f) as usize);
     }
 
     fn clear_sparse_writes(&mut self) -> (Vec<(usize, usize)>, Vec<(usize, u64, u8)>) {
