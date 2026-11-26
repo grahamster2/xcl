@@ -404,6 +404,39 @@ const DRAWS_PC: usize = 2;
 const DISPATCHES: usize = 3;
 const DISPATCHES_SKIPPED: usize = 4;
 
+#[derive(Clone, Copy)]
+pub(super) enum Cause {
+    DispatchDropped,
+    MeshStandIn,
+    MeshError,
+    MeshNoRootSig,
+    EiStandIn,
+    EiNoMeshSig,
+    EiMeshError,
+    EiTwoPass,
+    EiDispatchUntranslated,
+    EiNoRootSig,
+    EiWholeComputeError,
+    EiDrawError,
+    EiDispatchError,
+    DrawTwoPass,
+    DrawBindError,
+    DispatchUntranslated,
+    DispatchError,
+}
+const CAUSE_NAMES: [&str; 17] = ["DispatchDropped", "MeshStandIn", "MeshError", "MeshNoRootSig", "EiStandIn", "EiNoMeshSig", "EiMeshError", "EiTwoPass", "EiDispatchUntranslated", "EiNoRootSig", "EiWholeComputeError", "EiDrawError", "EiDispatchError", "DrawTwoPass", "DrawBindError", "DispatchUntranslated", "DispatchError"];
+static CAUSES: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+
+/// A skipped draw or dispatch, counted by its cause (LOCAL DIAG).
+fn skip(k: usize, why: Cause) {
+    CAUSES[why as usize].fetch_add(1, Ordering::Relaxed);
+    count(k);
+}
+
+fn cause_summary() -> String {
+    CAUSES.iter().zip(CAUSE_NAMES).filter_map(|(c, n)| { let v = c.load(Ordering::Relaxed); (v > 0).then(|| format!("{n}={v}")) }).collect::<Vec<_>>().join(" ")
+}
+
 fn count(k: usize) {
     use super::capture::Outcome;
     super::capture::outcome(match k {
@@ -418,8 +451,8 @@ fn count(k: usize) {
         let (coherent_used, coherent_total, sparse_used) = crate::gpu::uma::get()
             .map_or((0, 0, 0), |u| (u.used() >> 20, u.size() >> 20, u.sparse_used() >> 20));
         crate::xlog_info!(
-            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
-            c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
+            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators; skip causes: {}",
+            c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED], cause_summary(),
         );
     }
 }
@@ -587,7 +620,7 @@ pub(super) unsafe fn capture_work(this: *mut c_void, kind: impl FnOnce() -> supe
 
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
-    count(DISPATCHES_SKIPPED);
+    skip(DISPATCHES_SKIPPED, Cause::DispatchDropped);
 }
 
 /// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
@@ -2042,7 +2075,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         DrawPipeline::TwoPass(tp) => Some(tp),
         DrawPipeline::StandIn => {
             mesh_work(this, super::targets::STANDIN);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::MeshStandIn);
             return;
         }
         DrawPipeline::Other => None,
@@ -2100,7 +2133,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             }
             Err(e) => {
                 mesh_work(this, super::targets::SKIPPED);
-                count(DRAWS_SKIPPED);
+                skip(DRAWS_SKIPPED, Cause::MeshError);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
                     crate::xlog_warn!("D3D12.X: two-pass DispatchMesh skipped: {e}");
@@ -2113,7 +2146,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     if !bind_title_root_signature(this, list) {
         note_no_root_signature();
         mesh_work(this, super::targets::SKIPPED);
-        count(DRAWS_SKIPPED);
+        skip(DRAWS_SKIPPED, Cause::MeshNoRootSig);
         return;
     }
     mesh_work(this, super::targets::PC);
@@ -2167,7 +2200,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // dispatch of such a pipeline.
         DrawPipeline::StandIn => {
             ei_work(this, sig, super::targets::STANDIN);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::EiStandIn);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -2184,7 +2217,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // signature does not have.
         let Some(msig) = dispatch_mesh_sig_of(sig) else {
             ei_work(this, sig, super::targets::SKIPPED);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::EiNoMeshSig);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a two-pass pipeline and a signature that is not a plain DispatchMesh one (root arguments, or no companion Dispatch) skipped");
@@ -2261,7 +2294,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 Err(e) => {
                     mesh_work(this, super::targets::SKIPPED);
-                    count(DRAWS_SKIPPED);
+                    skip(DRAWS_SKIPPED, Cause::EiMeshError);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {e}");
@@ -2283,7 +2316,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // see as two-pass, e.g. a build that finished after the resolve.)
         if let Some(tp) = super::real::two_pass_of(pso) {
             ei_work(this, sig, super::targets::SKIPPED);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::EiTwoPass);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!(
@@ -2301,7 +2334,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // the driver pipeline `resolve_wait` returned.)
         if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
             super::targets::note_dispatch();
-            count(DISPATCHES_SKIPPED);
+            skip(DISPATCHES_SKIPPED, Cause::EiDispatchUntranslated);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({raw_pso:#x}) skipped");
@@ -2314,7 +2347,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if !bind_title_root_signature(this, list) && !signature_dispatches(sig) {
             note_no_root_signature();
             ei_work(this, sig, super::targets::SKIPPED);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::EiNoRootSig);
             return;
         }
         ei_work(this, sig, super::targets::PC);
@@ -2349,7 +2382,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         ei_work(this, sig, super::targets::SKIPPED);
-                        count(DISPATCHES_SKIPPED);
+                        skip(DISPATCHES_SKIPPED, Cause::EiWholeComputeError);
                         return;
                     }
                 }
@@ -2396,7 +2429,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         Err(e) => {
             ei_work(this, sig, super::targets::SKIPPED);
-            count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            if gfx { skip(DRAWS_SKIPPED, Cause::EiDrawError) } else { skip(DISPATCHES_SKIPPED, Cause::EiDispatchError) }
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
@@ -2623,7 +2656,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // (Close → E_INVALIDARG). It draws only through DispatchMesh.
         if let Some(tp) = super::real::two_pass_of(real) {
             super::targets::note_draw(this, super::targets::SKIPPED);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::DrawTwoPass);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!(
@@ -2674,7 +2707,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         Err(e) => {
             super::targets::note_draw(this, super::targets::SKIPPED);
             super::list_x::note_dropped_draw(this);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::DrawBindError);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: draw with a translated pipeline skipped: {e}");
@@ -3108,7 +3141,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
-        count(DISPATCHES_SKIPPED);
+        skip(DISPATCHES_SKIPPED, Cause::DispatchUntranslated);
         return;
     }
     let Some((groups, limits)) = launch else {
@@ -3136,7 +3169,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     match done {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
-            count(DISPATCHES_SKIPPED);
+            skip(DISPATCHES_SKIPPED, Cause::DispatchError);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
