@@ -181,6 +181,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                if pages != 0 {
+                    crate::xlog_info!("{}", crate::hle::d3d12x::vram::page_owners());
+                }
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also
                 // where the driver gave up (the guard script ends a run that stays there)

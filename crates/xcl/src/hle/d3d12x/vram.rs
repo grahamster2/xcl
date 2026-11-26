@@ -1407,6 +1407,30 @@ pub(super) fn tiles_unaccounted_for(device: usize) -> usize {
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
+/// Who holds the target pages, for the activity log: the textures on them by kind, the pages
+/// they stand for (shared pages count once for each texture on them) and the pages no texture
+/// uses any more that wait to go back to the pools (`sweep_idle`).
+pub fn page_owners() -> String {
+    let g = PAGES.lock().unwrap();
+    // (with every page, with pages by level): textures, pages held
+    let mut kinds = [(0usize, 0usize); 2];
+    let (mut pages, mut idle) = (0usize, 0usize);
+    for p in g.values().flatten() {
+        pages += p.pages.len() + p.extra_pages.len();
+        idle += p.idle.len();
+        for t in p.targets.values() {
+            let k = if t.levels.is_none() { 0 } else { 1 };
+            kinds[k].0 += 1;
+            kinds[k].1 += t.used.len() + t.used_extra.len();
+        }
+    }
+    let mb = |n: usize| n * PAGE >> 20;
+    format!(
+        "target pages by owner: {} textures with all their pages hold {} MB, {} sampled textures with pages by level hold {} MB (a shared page counts for each); {} MB of pages in all, {} MB of them idle",
+        kinds[0].0, mb(kinds[0].1), kinds[1].0, mb(kinds[1].1), mb(pages), mb(idle)
+    )
+}
+
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     g.values().flatten().fold((0, 0), |(used, pools), p| {
