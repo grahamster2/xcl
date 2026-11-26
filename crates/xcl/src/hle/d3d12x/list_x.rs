@@ -6257,6 +6257,9 @@ mod tests {
             let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let ca1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let ca2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            for a in [&da, &ca1, &ca2] {
+                super::super::alloc_pool::forget(a.as_raw() as usize);
+            }
             let dl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
             let cl1: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca1, None).unwrap();
             let cl2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca2, None).unwrap();
@@ -7216,6 +7219,9 @@ mod tests {
             rel_fn(wrap);
             pso_async::release(pso_async::released(standin));
             drop(made);
+            // the allocator's type must not outlive the test: a stale one makes a later list_x test
+            // reset a compute list on a direct backing allocator
+            super::super::alloc_pool::forget(alloc.as_raw() as usize);
 
             assert!(removed.is_ok());
             assert_eq!(labelled, LABEL, "the Write64 after the dispatch");
@@ -7256,6 +7262,9 @@ mod tests {
             let q_dir: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let a_comp: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let a_dir: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            // a freed allocator of an earlier test may have had these addresses: drop its stale type
+            super::super::alloc_pool::forget(a_comp.as_raw() as usize);
+            super::super::alloc_pool::forget(a_dir.as_raw() as usize);
             let raw_c: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_comp, None).unwrap();
             let raw_d: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a_dir, None).unwrap();
             let done_c: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
