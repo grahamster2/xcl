@@ -2320,21 +2320,40 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     Ok(true)
 }
 
+/// The free run, in MB, that physical page homes leave in sparse window 0 by default
+/// (`XCL_HOME_W0_KEEP_MB`). 3292b096 names no figure: it protected the title's 32-bit memory
+/// after the homes, of which the one case seen was a 38 MB view heap (1245184 slots). 256 MB
+/// leaves room for several such heaps and the title's other small window-0 allocations, and in
+/// The retail title's run (window 0: 1144 MB free after its GPU heaps, 874 MB at the page pool with no homes
+/// there) it still takes all ~600 MB of homes.
+const HOME_W0_KEEP_MB: usize = 256;
+
+/// `XCL_HOME_W0_KEEP_MB` as bytes: a whole number of MB, anything else the default.
+fn home_w0_keep_from(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(HOME_W0_KEEP_MB).saturating_mul(1 << 20)
+}
+
+fn home_w0_keep() -> usize {
+    static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| home_w0_keep_from(std::env::var("XCL_HOME_W0_KEEP_MB").ok().as_deref()))
+}
+
 /// Reserve home storage for `bytes` of title physical pages: sparse UMA first, coherent UMA
 /// only when this `Uma` has no sparse windows (so overflow on runtime layouts never eats the
 /// coherent window's `KEEP` headroom or creates non-lazy homes), and finally plain
 /// `MEM_RESERVE` memory committed on first use (`home_again`).
-/// In the sparse windows from window 1 on while they have room, from the top of the last one
-/// down (`sparse_alloc_above`): homes are
-/// never 32-bit addressed, window 0 is the console's low 4 GiB. A retail game on the Series S
-/// profile had 664+ MB of pages (its page numbers) before it made its view heap; with their homes
-/// first-fit in window 0, beside the GPU heaps of `XCL_COHERENT_HEAPS=sparse`, the memory it gave
-/// the heap was in window 1, which descriptor tables cannot reach (`console_heap::title_memory`),
-/// and it stopped on its own breakpoint. From the top, so the title's own reservations (first
-/// fit from window 1 up) keep one free run: with homes first-fit in windows 1+ a retail game's
-/// page pool of 3977 MB found none and was plain memory (`warn_plain_fallback`).
+/// In the sparse windows (`Uma::sparse_alloc_home`): window 0 from its top down while it keeps
+/// a free run of `home_w0_keep()` bytes, otherwise windows 1+ from the top of the last one down.
+/// Homes are never 32-bit addressed, window 0 is the console's low 4 GiB. A retail game on the
+/// Series S profile had 664+ MB of pages (its page numbers) before it made its view heap; with
+/// their homes first-fit in window 0, beside the GPU heaps of `XCL_COHERENT_HEAPS=sparse`, the
+/// memory it gave the heap was in window 1, which descriptor tables cannot reach
+/// (`console_heap::title_memory`), and it stopped on its own breakpoint: hence the margin. With
+/// all homes in windows 1+ (Build 16) a retail game's page pool of 3977 MB, which needs nearly all of
+/// windows 1 and 2, found no room and was plain memory (`warn_plain_fallback`): hence window 0
+/// first.
 unsafe fn alloc_physical_home(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> {
-    if let Some((p, _)) = u.sparse_alloc_above(bytes, PHYS_PAGE) {
+    if let Some((p, _)) = u.sparse_alloc_home(bytes, PHYS_PAGE, home_w0_keep()) {
         return Some(p);
     }
     if !u.has_sparse() {
@@ -5290,7 +5309,8 @@ mod tests {
         }
     }
 
-    /// Homes of physical pages come from the top of windows 1+ down, so the title's reservations
+    /// Homes of physical pages that window 0 has no room for (its margin) come from the top of
+    /// windows 1+ down, so the title's reservations
     /// (first fit from window 1 up) keep one free run between: a retail game's page pool (63632
     /// pages of 64 KiB, 3977 MB, across windows 1 and 2 in Build 15) was plain memory once homes
     /// went first-fit into windows 1+. Here first-fit homes would put the 1000 MB one at the end of
@@ -5307,16 +5327,93 @@ mod tests {
             assert!(heaps.iter().all(|&h| u.window_of(h) == Some(0)));
             let title = u.sparse_reserve(3000 << 20).unwrap();
             assert_eq!(title, b + WINDOW);
+            // 1144 MB free in window 0: the 1000 MB home would leave it less than its margin and
+            // goes to the top of window 2; the 200 MB one goes to the top of window 0
             let homes = [alloc_physical_home(&u, 1000 << 20).unwrap(), alloc_physical_home(&u, 200 << 20).unwrap()];
-            assert_eq!(homes, [b + 3 * WINDOW - (1000 << 20), b + 3 * WINDOW - (1200 << 20)], "from the top of window 2 down");
+            assert_eq!(homes, [b + 3 * WINDOW - (1000 << 20), b + WINDOW - (200 << 20)]);
             let pool_bytes = 63632 * PHYS_PAGE;
             let pool = u.sparse_reserve(pool_bytes).expect("the page pool in the sparse windows");
             assert_eq!(pool, title + (3000 << 20), "right after the title's reservation, across windows 1 and 2");
-            assert!(pool + pool_bytes <= homes[1]);
+            assert!(pool + pool_bytes <= homes[0]);
             for p in [pool, homes[1], homes[0], title, heaps[1], heaps[0]] {
                 assert!(u.sparse_release(p).is_some());
             }
         }
+    }
+
+    /// Build 16's run 49: GPU heaps of 1162 + 1277 MB in window 0, ~600 MB of physical pages,
+    /// the title's 3997 MB in window 1, then its page pool (63632 pages of 64 KiB, 3977 MB).
+    /// With the homes at the top of window 2 the pool found 99 MB in window 1 and 3394 MB in
+    /// window 2 at most and was plain memory; with the homes in window 0 (as Build 15's
+    /// first-fit ones were) it is right after the title's 3997 MB, across windows 1 and 2.
+    #[test]
+    fn physical_homes_in_window_0_leave_room_for_the_page_pool() {
+        use crate::gpu::uma::WINDOW;
+        let u = crate::gpu::uma::Uma::for_runtime(16 << 20).unwrap();
+        let b = u.base();
+        unsafe {
+            let heaps = [u.sparse_alloc(1162 << 20, 2 << 20).unwrap().0, u.sparse_alloc(1278 << 20, 2 << 20).unwrap().0];
+            assert!(heaps.iter().all(|&h| u.window_of(h) == Some(0)));
+            // ~600 MB of homes, in the batches a title asks for
+            let homes: Vec<usize> = [256usize, 128, 128, 64, 24].iter().map(|&mb| alloc_physical_home(&u, mb << 20).unwrap()).collect();
+            assert!(homes.iter().all(|&h| u.window_of(h) == Some(0)), "{homes:x?}");
+            assert_eq!(homes[0], b + WINDOW - (256 << 20), "from the top of window 0 down");
+            assert!(homes.iter().all(|&h| lazy_home(h)));
+            // the rest of window 0 is one run, after the heaps and below the homes
+            // (and the 1.9 MB before the 2 MB-aligned heaps)
+            let (free, run) = u.sparse_free_in(0);
+            assert_eq!(free, WINDOW - 0x2001_0000 - ((1162 + 1278 + 600) << 20));
+            assert_eq!(run, free - (0x2020_0000 - 0x2001_0000));
+            assert!(run >= home_w0_keep(), "{} MB", run >> 20);
+            let title = u.sparse_reserve(3997 << 20).unwrap();
+            assert_eq!(title, b + WINDOW);
+            let pool_bytes = 63632 * PHYS_PAGE;
+            let pool = u.sparse_reserve(pool_bytes).expect("the page pool in the sparse windows");
+            assert_eq!(pool, title + (3997 << 20), "across windows 1 and 2");
+            assert_eq!(u.window_of(pool + pool_bytes - 1), Some(2));
+            // a view heap still fits in window 0
+            let view_heap = u.sparse_alloc(0x260_0000, crate::gpu::uma::GRAIN).unwrap().0;
+            assert_eq!(u.window_of(view_heap), Some(0));
+            for p in [view_heap, pool, title].into_iter().chain(homes).chain(heaps) {
+                assert!(u.sparse_release(p).is_some());
+            }
+        }
+    }
+
+    /// Homes take window 0 only while it keeps a free run of `home_w0_keep()` after them: one
+    /// that would leave less goes to the top of window 2, and smaller ones still fill window 0
+    /// down to the margin, never past it while windows 1+ have room.
+    #[test]
+    fn physical_homes_keep_window_0_its_margin() {
+        use crate::gpu::uma::WINDOW;
+        let u = crate::gpu::uma::Uma::for_runtime(16 << 20).unwrap();
+        let b = u.base();
+        let keep = home_w0_keep();
+        assert_eq!(keep, HOME_W0_KEEP_MB << 20);
+        unsafe {
+            // window 0 with keep + 100 MB free
+            let (free0, _) = u.sparse_free_in(0);
+            let heaps = u.sparse_alloc(free0 - keep - (100 << 20), crate::gpu::uma::GRAIN).unwrap().0;
+            assert_eq!(heaps, u.base() + 0x2001_0000);
+            assert_eq!(u.sparse_free_in(0).1, keep + (100 << 20));
+            let big = alloc_physical_home(&u, 101 << 20).unwrap();
+            assert_eq!(big, b + 3 * WINDOW - (101 << 20), "past the margin: the top of window 2");
+            let mut small = Vec::new();
+            for _ in 0..12 {
+                small.push(alloc_physical_home(&u, 10 << 20).unwrap());
+            }
+            let in_0 = small.iter().filter(|&&h| u.window_of(h) == Some(0)).count();
+            assert_eq!(in_0, 10, "100 MB of them in window 0, the rest above");
+            assert!(small[10..].iter().all(|&h| u.window_of(h) == Some(2)));
+            assert_eq!(u.sparse_free_in(0), (keep, keep), "window 0 keeps its margin");
+            for p in small.into_iter().chain([big, heaps]) {
+                assert!(u.sparse_release(p).is_some());
+            }
+        }
+        assert_eq!(home_w0_keep_from(Some("0")), 0);
+        assert_eq!(home_w0_keep_from(Some(" 512 ")), 512 << 20);
+        assert_eq!(home_w0_keep_from(Some("lots")), HOME_W0_KEEP_MB << 20);
+        assert_eq!(home_w0_keep_from(None), HOME_W0_KEEP_MB << 20);
     }
 
     /// The plain-memory fallback is worth a warning for 256 MB or more that could have fit the
