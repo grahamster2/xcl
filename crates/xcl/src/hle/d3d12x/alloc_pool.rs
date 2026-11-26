@@ -292,6 +292,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         if !lists.is_empty() {
             super::bind::two_pass_submitted(queue, None, 0, lists);
         }
+        super::bind::poll_two_pass_feedback(queue);
         return;
     }
     // (every submit is marked, also of lists this module does not track – the PC lists behind
@@ -338,6 +339,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     drop(g);
     super::bind::two_pass_submitted(queue, Some(&fence), value, lists);
+    super::bind::poll_two_pass_feedback(queue);
 }
 
 /// The lists recording on the PC allocators of `alloc` hold them no more: the allocator a title
