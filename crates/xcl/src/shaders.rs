@@ -1384,22 +1384,25 @@ mod pipeline_cap_tests {
         let whole_chain_path = scratch.0.join(driver_cache::name_for(&whole, 0, true));
         assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
         assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
-        assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
+        // the whole program is built under the chain's root signature too, unless the cap
+        // (the larger piece's size) stops it: DXC's whole container need not be the larger
+        let whole_capped = whole.len() > max_piece;
+        let whole_made = usize::from(!whole_capped);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 2 + whole_made);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
-        // the whole program (also under the chain's root signature) is over the cap
-        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
-        assert!(!whole_chain_path.exists(), "a capped whole program gets no .chain.pso");
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), usize::from(whole_capped));
+        assert_eq!(whole_chain_path.exists(), !whole_capped, "the whole program's .chain.pso");
         assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
         assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "piece 1 .chain.pso missing");
         assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
 
         // Second pass reuses both cached piece blobs.
         pipelines.make(&compiled);
-        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2);
-        assert_eq!(pipelines.made.load(Ordering::Relaxed), 4);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2 + whole_made);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 2 * (2 + whole_made));
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
-        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 2);
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 2 * usize::from(whole_capped));
 
         // Runtime-side check: the dispatch-chain root signature accepts each cached .chain.pso blob.
         let chain_rs = recomp::pso::dispatch_chain_root_signature(&pipelines.dev, &[]).expect("dispatch chain RS");
@@ -1425,10 +1428,10 @@ mod pipeline_cap_tests {
         let capped_before = pipelines.capped.load(Ordering::Relaxed);
         pipelines.make(&compiled);
         assert!(!p1_path.exists(), "rejected over-cap .chain.pso should be removed");
-        // piece 1 and the whole program
-        assert_eq!(pipelines.capped.load(Ordering::Relaxed), capped_before + 2);
+        // piece 1, and the whole program when it has no blob (a built one is reused)
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), capped_before + 1 + usize::from(whole_capped));
         if piece0.len() <= pipelines.max_dxil {
-            assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
+            assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1 + whole_made);
         }
 
         // Without the cap the whole program is built under the chain's root signature as well,
