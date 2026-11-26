@@ -1381,12 +1381,15 @@ mod pipeline_cap_tests {
         let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
         let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
         let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
+        let whole_chain_path = scratch.0.join(driver_cache::name_for(&whole, 0, true));
         assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
         assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
         assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
-        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 0);
+        // the whole program (also under the chain's root signature) is over the cap
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
+        assert!(!whole_chain_path.exists(), "a capped whole program gets no .chain.pso");
         assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
         assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "piece 1 .chain.pso missing");
         assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
@@ -1396,6 +1399,7 @@ mod pipeline_cap_tests {
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2);
         assert_eq!(pipelines.made.load(Ordering::Relaxed), 4);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 2);
 
         // Runtime-side check: the dispatch-chain root signature accepts each cached .chain.pso blob.
         let chain_rs = recomp::pso::dispatch_chain_root_signature(&pipelines.dev, &[]).expect("dispatch chain RS");
@@ -1418,12 +1422,31 @@ mod pipeline_cap_tests {
         std::fs::write(&p1_path, b"corrupt chain blob").expect("corrupt piece1 blob");
         pipelines.max_dxil = piece1.len() - 1;
         let reused_before = pipelines.reused.load(Ordering::Relaxed);
+        let capped_before = pipelines.capped.load(Ordering::Relaxed);
         pipelines.make(&compiled);
         assert!(!p1_path.exists(), "rejected over-cap .chain.pso should be removed");
-        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
+        // piece 1 and the whole program
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), capped_before + 2);
         if piece0.len() <= pipelines.max_dxil {
             assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
         }
+
+        // Without the cap the whole program is built under the chain's root signature as well,
+        // where the runtime's lazily built whole form reads it; still no plain whole .pso.
+        pipelines.max_dxil = 0;
+        pipelines.make(&compiled);
+        assert!(whole_chain_path.is_file() && whole_chain_path.metadata().unwrap().len() > 0, "whole .chain.pso missing");
+        assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
+        let blob = std::fs::read(&whole_chain_path).expect("read whole .chain.pso");
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(chain_rs.clone())),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: whole.as_ptr().cast(), BytecodeLength: whole.len() },
+            CachedPSO: D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len() },
+            ..Default::default()
+        };
+        unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+            .expect("runtime dispatch_chain RS accepts the whole program's offline .chain.pso");
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
     }
 }
 
@@ -1471,7 +1494,9 @@ impl Pipelines {
     /// The compute pipeline of `c` (made and released). When direct translation split the program
     /// into a dispatch chain of at least two pieces, each piece is built and cached under the
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
-    /// instead of the unsplit whole container.
+    /// and so is the whole program, which the runtime builds lazily under that same root
+    /// signature for the dispatches it runs unsplit (`dispatch_chain`'s `whole`). The plain
+    /// whole container under the ABI root signature is not written for such a program.
     fn make(&self, c: &recomp::pso::Compiled) {
         self.make_with_cache_path(c, None);
     }
@@ -1481,10 +1506,14 @@ impl Pipelines {
             if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
                 self.split_programs.fetch_add(1, Ordering::Relaxed);
                 self.split_pieces.fetch_add(chain.pieces.len(), Ordering::Relaxed);
-                let workers = chain.pieces.len().min(self.most);
+                // LOCAL DIAG (22ac7716 ported): the whole program too, under the chain's root
+                // signature, or a world run compiles each (0.8 - 1.1 MB of DXIL) in the driver,
+                // 17 - 21 s apiece, the first time a dispatch of it runs unsplit.
+                let programs: Vec<&[u8]> = chain.pieces.iter().map(Vec::as_slice).chain([c.dxil.as_slice()]).collect();
+                let workers = programs.len().min(self.most);
                 if workers <= 1 {
-                    for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
+                    for dxil in &programs {
+                        self.make_one(dxil, &c.samplers, true, None);
                     }
                 } else {
                     let next = AtomicUsize::new(0);
@@ -1492,8 +1521,8 @@ impl Pipelines {
                         for _ in 0..workers {
                             s.spawn(|| loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
-                                let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
+                                let Some(dxil) = programs.get(i) else { break };
+                                self.make_one(dxil, &c.samplers, true, None);
                             });
                         }
                     });
