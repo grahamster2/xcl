@@ -214,6 +214,25 @@ fn format_own() -> String {
     )
 }
 
+/// The DXIL XCL handed the driver for the pipelines alive, by kind, and the driver's
+/// write-combined memory (`combined` bytes) set beside the pipelines alive (`live`, every adopted
+/// one) and that DXIL: what each sample shows of how the one follows the other.
+fn format_pipelines(combined: u64, live: u64, kinds: [(usize, u64); 5]) -> String {
+    use crate::hle::d3d12x::real::pso_dxil::KINDS;
+    let (n, bytes) = kinds.iter().fold((0usize, 0u64), |(n, b), k| (n + k.0, b + k.1));
+    let parts: Vec<String> = KINDS.iter().zip(kinds).map(|(k, (c, b))| format!("{} {c} ({:.1} MB)", k.name(), b as f64 / MB as f64)).collect();
+    let per = |d: u64| if d == 0 { "-".to_string() } else { format!("{:.2}", combined as f64 / MB as f64 / d as f64) };
+    format!(
+        "memory map: XCL's pipelines' DXIL handed to the driver: {n} pipelines ({:.1} MB) – {}; driver write-combined {} MB = {} MB per live pipeline ({live}), {} MB per XCL pipeline, {} MB per MB of DXIL",
+        bytes as f64 / MB as f64,
+        parts.join(", "),
+        combined / MB,
+        per(live),
+        per(n as u64),
+        if bytes == 0 { "-".to_string() } else { format!("{:.1}", combined as f64 / bytes as f64) }
+    )
+}
+
 /// The file mapped at `base`.
 fn mapped_file(base: usize) -> Option<String> {
     use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
@@ -353,8 +372,10 @@ fn log_memory_map() -> Vec<String> {
         graphics as u64 / MB,
         shaders as u64 / MB
     ));
+    let combined_bytes: u64 = combined.values().map(|&w| w as u64).sum();
     lines.push(format_combined(combined.into_values()));
     lines.push(format_own());
+    lines.push(format_pipelines(combined_bytes, crate::hle::d3d12x::real::pipeline_counts().0, crate::hle::d3d12x::real::pso_dxil::counts()));
     lines
 }
 
@@ -558,6 +579,15 @@ mod tests {
             "memory map: D3D12 driver's write-combined or uncached private allocations: 1 under 64 KB (0 MB), 2 of 1 – 16 MB (4 MB), 1 of 256 MB or more (512 MB)"
         );
         assert!(format_own().starts_with("memory map: XCL's own: fill pattern buffers "), "{}", format_own());
+    }
+
+    #[test]
+    fn pipelines_dxil_is_set_beside_the_write_combined_memory() {
+        let l = format_pipelines(100 * MB, 50, [(10, 20 * MB), (0, 0), (0, 0), (10, 5 * MB), (0, 0)]);
+        assert!(l.starts_with("memory map: XCL's pipelines' DXIL handed to the driver: 20 pipelines (25.0 MB) – compute 10 (20.0 MB), split pieces 0 (0.0 MB)"), "{l}");
+        assert!(l.contains("driver write-combined 100 MB = 2.00 MB per live pipeline (50), 5.00 MB per XCL pipeline, 4.0 MB per MB of DXIL"), "{l}");
+        let none = format_pipelines(0, 0, [(0, 0); 5]);
+        assert!(none.contains("= - MB per live pipeline (0), - MB per XCL pipeline, - MB per MB of DXIL"), "{none}");
     }
 
     #[test]

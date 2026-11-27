@@ -1857,6 +1857,7 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 
 fn forget_pso(pso: usize) {
     super::dred::forget_pso(pso);
+    pso_dxil::forget(pso);
     dispatch_chain::forget(pso);
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
@@ -4426,6 +4427,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    pso_dxil::note(*ppv as usize, pso_dxil::Kind::Compute, dxil.len());
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -5387,6 +5389,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    pso_dxil::note(*ppv as usize, pso_dxil::Kind::Graphics, bytes);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
@@ -6070,6 +6073,7 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 
 #[allow(dead_code)] // Consumed by the stacked driver-cache integration.
 mod two_pass_identity;
+pub(crate) mod pso_dxil;
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
@@ -6245,6 +6249,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mesh_pso = mesh_pso.into_raw();
     *ppv = mesh_pso;
     note_pso_rs(mesh_pso, mesh_rs);
+    pso_dxil::note(mesh_pso as usize, pso_dxil::Kind::TwoPass, tp.cs.len() + tp.ms.len());
     TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
