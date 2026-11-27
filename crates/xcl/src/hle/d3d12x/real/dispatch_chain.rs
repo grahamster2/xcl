@@ -99,6 +99,14 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     Some(rs)
 }
 
+/// For the memory map: split programs alive, their pieces, and how many of them have their
+/// whole form built too.
+pub(crate) fn forms() -> (usize, usize, usize) {
+    let chains = CHAINS.lock().unwrap();
+    let pieces = chains.values().map(|c| 1 + c.tail.len()).sum();
+    (chains.len(), pieces, chains.values().filter(|c| c.whole.get().is_some()).count())
+}
+
 pub(super) fn forget(pso: usize) {
     let gone = CHAINS.lock().unwrap().remove(&pso);
     drop(gone); // releasing a tail PSO also goes through forget_pso
