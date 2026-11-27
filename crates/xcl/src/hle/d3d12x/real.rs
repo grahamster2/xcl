@@ -4859,6 +4859,12 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
 static GRAPHICS_BLOBS: Mutex<Option<(HashMap<(u64, usize), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
 const GRAPHICS_BLOBS_MAX: usize = 256 << 20;
 
+/// Bytes of driver blobs kept in memory: (compute, graphics) – `XCL_MEMORY_MAP`.
+pub(crate) fn blob_cache_bytes() -> (usize, usize) {
+    let compute = COMPUTE_BLOBS.lock().unwrap().as_ref().map_or(0, |c| c.1);
+    (compute, GRAPHICS_BLOBS.lock().unwrap().as_ref().map_or(0, |c| c.1))
+}
+
 fn graphics_blob(key: (u64, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
     GRAPHICS_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
 }

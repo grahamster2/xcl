@@ -360,6 +360,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    if !q.is_null() && t & mem::MEM_RESERVE != 0 {
+        crate::memory_map::note_title(q as usize, size);
+    }
     q
 }
 
@@ -472,6 +475,9 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
         mirrors::released(addr as usize);
+    }
+    if ok != 0 && t & 0x8000 != 0 {
+        crate::memory_map::forget_title(addr as usize);
     }
     ok
 }
