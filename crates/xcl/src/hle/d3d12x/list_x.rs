@@ -629,6 +629,13 @@ pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const
     let handles = if read_count == 0 { Vec::new() } else { std::slice::from_raw_parts(rtvs, read_count).to_vec() };
     let d = dsv.as_ref().copied();
     with_bindings(this, |b| b.render_targets = Some(RenderTargets { num_targets, handles, single, dsv: d }));
+    if super::hot_residency::on() {
+        for h in bound_render_targets(this).into_iter().chain(d) {
+            if let Some(r) = super::present::rtv_resource(h) {
+                super::hot_residency::touch_res(this as usize, r);
+            }
+        }
+    }
 }
 
 /// The render target views bound on `list` (each one of a single descriptor range too).
@@ -1159,6 +1166,7 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 }
 
 fn note_write(list: usize, va: u64, size: u64) {
+    super::hot_residency::touch_va(list, va, size);
     recording(list).lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
@@ -2583,6 +2591,7 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
     note_write(this as usize, dst, size);
+    super::hot_residency::touch_va(this as usize, src, size);
     if d == s {
         // one window: one buffer cannot be in COPY_SOURCE and COPY_DEST at once (#958), so the
         // bytes go through a scratch buffer of the list
@@ -2908,6 +2917,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // that runs late does not take the CPU's view of it back (`sparse::IMM_KEEP_MAX`)
         let counter = words.len() == 2 && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&cpu_at(va))).is_some_and(|c| !c.non_monotonic && c.recorded_max != 0);
         let bytes = n as u8 | if counter { super::sparse::IMM_KEEP_MAX } else { 0 };
+        super::hot_residency::touch_va(list as usize, va, n);
         recording(list as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, bytes);
     } else {
         note_write(list as usize, va, n);
@@ -3664,6 +3674,7 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
 /// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
 /// `D3D12_RESOURCE_STATE_PREDICATION`.
 pub(super) unsafe fn before_close(list: *mut c_void) {
+    super::hot_residency::closed(list as usize);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -3687,6 +3698,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
+    super::hot_residency::reset(list as usize);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -3876,6 +3888,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 note_submitted(q_raw);
             });
             super::title_textures::submitted(prior);
+            super::hot_residency::submitted(prior);
             for &p in prior {
                 super::title_textures::list_reset(p as usize);
             }
@@ -3894,6 +3907,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
+    super::hot_residency::submitted(&one);
     super::title_textures::list_reset(this as usize);
     if !sparse_writes.0.is_empty() || !sparse_writes.1.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
@@ -4213,6 +4227,7 @@ fn bytes_in_window(u: &crate::gpu::uma::Uma, va: u64, bytes: u32) -> Option<u32>
 /// whole buffer at every bind filled unified memory within two minutes of a retail title's
 /// menus, and missed what the title wrote after the bind.)
 unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: bool) -> u64 {
+    super::hot_residency::touch_va(list as usize, va, bytes as u64);
     // in a GPU view: its window's PC address, over tiles asked for here
     super::bind::want_view(super::view_want::Path::VertexIndex, va, bytes as u64);
     let t = pc_va(va);
@@ -4675,6 +4690,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
 
     reset_copy_scratch(this);
     reset_own_alloc(this);
+    super::hot_residency::reset(this as usize);
     let is_bundle = {
         let mut g = recording(this as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -4922,6 +4938,8 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
         }
     }
     note_copy_into(this as usize, dst, dst_off, n);
+    super::hot_residency::touch_buffer(this as usize, dst, dst_off, n);
+    super::hot_residency::touch_buffer(this as usize, src, src_off, n);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
@@ -5049,9 +5067,28 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         let n = f.Footprint.RowPitch as u64 * f.Footprint.Height.max(1) as u64 * f.Footprint.Depth.max(1) as u64;
         note_copy_into(this as usize, transmute_copy::<_, usize>(&l.pResource), f.Offset, n);
     }
+    for l in [dst.as_ref(), src.as_ref()].into_iter().flatten() {
+        hot_copy_location(this as usize, l);
+    }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
+}
+
+/// `XCL_HOT_RESIDENCY`: a copy location `list` reads or writes – a footprint's rows of a buffer, a
+/// texture's resource.
+unsafe fn hot_copy_location(list: usize, l: &D3D12_TEXTURE_COPY_LOCATION) {
+    if !super::hot_residency::on() {
+        return;
+    }
+    let res = transmute_copy::<_, usize>(&l.pResource);
+    if l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+        let f = &l.Anonymous.PlacedFootprint;
+        let n = f.Footprint.RowPitch as u64 * f.Footprint.Height.max(1) as u64 * f.Footprint.Depth.max(1) as u64;
+        super::hot_residency::touch_buffer(list, res, f.Offset, n);
+    } else {
+        super::hot_residency::touch_res(list, res);
+    }
 }
 
 /// command list #83 CopyTextureRegionX(dst, x, y, z, src, box, flags): CopyTextureRegion with
@@ -5224,6 +5261,8 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     if super::present::trace_frame() {
         trace_watched_copy("CopyResource", dst, src);
     }
+    super::hot_residency::touch_buffer(this as usize, dst, 0, u64::MAX);
+    super::hot_residency::touch_buffer(this as usize, src, 0, u64::MAX);
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         note_copy_into(this as usize, dst, 0, u64::MAX);

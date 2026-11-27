@@ -9255,6 +9255,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::submit_cost::exec(t_end - t_exec);
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
+    super::hot_residency::submitted(&mapped);
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
     super::submit_cost::end(t_end.elapsed());

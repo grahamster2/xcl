@@ -118,6 +118,7 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     super::targets::frame_end();
+    super::hot_residency::frame();
     super::gpu_times::present(frames);
     super::bvh_want::frame();
     if frames % 300 == 0 {
@@ -371,6 +372,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
         return;
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+    super::hot_residency::frame();
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
     let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     unsafe { present_now(Duration::from_millis(4), None) };

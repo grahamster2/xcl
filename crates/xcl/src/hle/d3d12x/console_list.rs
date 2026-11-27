@@ -817,6 +817,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
     }
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void)).ok_or("no PC list")?.clone();
+    let hot_list = st.pc;
     // created with the first translated pipeline (without one every dispatch is skipped)
     let rs = super::real::abi_rs_cached().and_then(|p| ID3D12RootSignature::from_raw_borrowed(&p).cloned());
     let uma_va = super::real::uma_gpu_va();
@@ -987,6 +988,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // (the list is submitted after this: its root views in a GPU view get their tiles there)
                         super::bind::want_root_views(layout.as_deref(), &table, super::view_want::Path::RootView);
                         super::bind::shader_store_writes(layout.as_deref(), &table, real);
+                        super::bind::note_hot(hot_list, layout.as_deref(), &table, real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
@@ -1091,6 +1093,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     if let Some((w, at)) = out.unknown {
         crate::xlog_warn!("console list: unknown record {w:#010x} (word {at}) – rest skipped");
     }
+    super::hot_residency::closed(hot_list);
     list.Close().map_err(|e| format!("Close: {e}"))?;
     Ok(out)
 }

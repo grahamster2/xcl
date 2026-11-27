@@ -83,6 +83,11 @@ impl<V> Sharded<V> {
         f(self.shard(key).get_or_insert_with(Default::default).entry(key).or_default())
     }
 
+    /// `f` with the value of `key`, if there is one, with its part's lock held.
+    pub fn peek<R>(&self, key: usize, f: impl FnOnce(&V) -> R) -> Option<R> {
+        self.shard(key).as_ref()?.get(&key).map(f)
+    }
+
     /// Every value, one part after another.
     pub fn for_each(&self, mut f: impl FnMut(usize, &V)) {
         for s in &self.0 {

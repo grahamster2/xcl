@@ -164,6 +164,7 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
     }
     if let Some(h) = &heap {
         super::residency::target(h, size as u64, "video-memory arena of GPU-owned targets");
+        super::hot_residency::made(h.as_raw() as usize);
     }
     let made = MADE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -625,7 +626,7 @@ impl TilePool {
 /// MB a new pool heap leaves under the OS's local video memory budget for the process
 /// (`XCL_VRAM_HEADROOM_MB`, default 1024): what the title's own sparse pools, arenas and the
 /// driver still take in video memory after the pages stop growing there.
-fn vram_headroom() -> u64 {
+pub(super) fn vram_headroom() -> u64 {
     std::env::var("XCL_VRAM_HEADROOM_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024) << 20
 }
 
@@ -699,6 +700,9 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device, adapter: Option<&windows::Win32::G
         return None;
     }
     let video = properties.Type == D3D12_HEAP_TYPE_DEFAULT;
+    if let Some(h) = &heap {
+        super::hot_residency::made(h.as_raw() as usize);
+    }
     if let (Some(h), Ask::Reserve) = (&heap, ask) {
         let _ = h.SetName(windows::core::w!("xcl reserve pool heap of GPU-owned target pages"));
         // (the sparse pools that filled video memory page out before it: `residency::target`)
@@ -1509,8 +1513,88 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     if do_reclaim {
         newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
     }
+    // (they go once the GPU is past them: until then the first to page out)
+    super::hot_residency::retiring(&newly_reclaimed);
     if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
+    }
+}
+
+/// `XCL_HOT_RESIDENCY`: each pool heap of target pages in video memory and each arena to `see`, and
+/// the heaps whose class it changes, with it, to `out`. A pool heap is touched when a page of an
+/// address of `tiles` (64 KiB aligned, sorted; pages keyed by address) or of a texture of `res`
+/// is on it, pinned while it holds a page of a GPU-owned target, empty when every page of it is
+/// free (a spare pool, `keep_spare_pools`). An arena is touched by an address in it or a texture
+/// of `res` placed in it, pinned while a resource is, empty when none is (it goes `IDLE` later).
+/// Pool heaps in system memory have no place in video memory to keep: left out.
+pub(super) fn hot_scan(
+    tiles: &[usize],
+    res: &[usize],
+    see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
+    out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
+) {
+    use super::hot_residency::HeapView;
+    {
+        let g = PAGES.lock().unwrap();
+        for p in g.values().flatten() {
+            p.hot_scan(tiles, res, see, out);
+        }
+    }
+    let placed: HashSet<u64> = {
+        let g = ARENA_OF.lock().unwrap();
+        g.as_ref().map_or_else(HashSet::new, |m| res.iter().filter_map(|r| m.get(r).copied()).collect())
+    };
+    let g = ARENAS.lock().unwrap();
+    for a in &g.list {
+        let touched = placed.contains(&a.id) || super::hot_residency::any_in(tiles, a.base, a.size);
+        let v = HeapView { ptr: a.heap.as_raw() as usize, bytes: a.size as u64, touched, pinned: a.users > 0, empty: a.users == 0 };
+        if let Some(c) = see(&v) {
+            out.push((a.heap.clone(), c));
+        }
+    }
+}
+
+impl Pages {
+    /// `hot_scan` of this device's pool heaps
+    fn hot_scan(
+        &self,
+        tiles: &[usize],
+        res: &[usize],
+        see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
+        out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
+    ) {
+        let p = self;
+        let n = p.pools.slots.len();
+        let (mut touched, mut pinned) = (vec![false; n], vec![false; n]);
+        let mark = |flags: &mut Vec<bool>, page: Option<&Page>| {
+            if let Some(f) = page.and_then(|pg| flags.get_mut(pg.tile.0 as usize)) {
+                *f = true;
+            }
+        };
+        for a in tiles {
+            mark(&mut touched, p.pages.get(a));
+        }
+        for r in res {
+            if let Some(t) = p.targets.get(r) {
+                t.used.iter().take(super::hot_residency::RES_TILES_MAX).for_each(|k| mark(&mut touched, p.pages.get(k)));
+                t.used_extra.iter().take(super::hot_residency::RES_TILES_MAX).for_each(|k| mark(&mut touched, p.extra_pages.get(k)));
+            }
+        }
+        for t in p.targets.values().filter(|t| t.gpu_owned) {
+            t.used.iter().for_each(|k| mark(&mut pinned, p.pages.get(k)));
+            t.used_extra.iter().for_each(|k| mark(&mut pinned, p.extra_pages.get(k)));
+        }
+        for h in 0..n {
+            let Some(heap) = p.pools.get(h) else { continue };
+            if !p.pool.is_video(h) {
+                continue;
+            }
+            let empty = p.pool.free_by_heap.get(h).is_some_and(|f| f.len() >= POOL_PAGES as usize);
+            let v = super::hot_residency::HeapView { ptr: heap.as_raw() as usize, bytes: POOL_PAGES as u64 * PAGE as u64, touched: touched[h], pinned: pinned[h], empty };
+            if let Some(c) = see(&v) {
+                out.push((heap.clone(), c));
+            }
+        }
     }
 }
 
@@ -2617,6 +2701,54 @@ mod tests {
                 let made = dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_ok() && r.is_some();
                 assert_eq!(reservable(&dev, &desc), made, "format {} x{samples}: reservable vs CreateReservedResource", format.0);
             }
+        }
+    }
+
+    /// `XCL_HOT_RESIDENCY`: a pool heap is touched by a page of an address or by a texture on it,
+    /// and pinned while a GPU-owned target holds a page of it.
+    #[test]
+    fn hot_scan_finds_the_pool_heap_under_a_texture() {
+        use super::super::hot_residency::HeapView;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // (tiled resources tier 2, or no pages)
+            let Some(mut pages) = Pages::new(&dev) else { return crate::gpu::recomp::runner::skip_test("no tiled resources tier 2") };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 256, Height: 256, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default()
+            };
+            let (va_target, va_texture) = (0x10_0000_0000usize, 0x20_0000_0000usize);
+            let mut placed = Vec::new();
+            for (va, gpu_owned) in [(va_target, true), (va_texture, false)] {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).expect("reserved texture");
+                let r = r.unwrap();
+                let (used, used_extra) = pages.bind(&dev, &r, va, None, 4, &[], gpu_owned).expect("pages");
+                assert_eq!(used.len(), 4);
+                pages.targets.insert(r.as_raw() as usize, Target { va, console_bytes: None, total: 4, mapped: true, used, used_extra, levels: None, gpu_owned });
+                placed.push(r);
+            }
+            let scan = |p: &Pages, at: &[usize], res: &[usize]| -> Vec<HeapView> {
+                let mut views = Vec::new();
+                let mut out = Vec::new();
+                p.hot_scan(at, res, &mut |v: &HeapView| {
+                    views.push(*v);
+                    None
+                }, &mut out);
+                views
+            };
+            let v = scan(&pages, &[], &[]);
+            assert_eq!(v.len(), 1, "one 64 MiB pool heap");
+            assert!(v[0].pinned && !v[0].touched && !v[0].empty, "{:?}", v[0]);
+            assert!(scan(&pages, &[va_texture + PAGE], &[])[0].touched, "a page of the texture's addresses");
+            assert!(!scan(&pages, &[va_texture + 4 * PAGE], &[])[0].touched, "past its pages");
+            assert!(scan(&pages, &[], &[placed[1].as_raw() as usize])[0].touched, "the texture");
+            assert!(!scan(&pages, &[], &[0x5EE0])[0].touched);
+            pages.targets.remove(&(placed[0].as_raw() as usize));
+            assert!(!scan(&pages, &[], &[])[0].pinned, "no GPU-owned target on it any more");
         }
     }
 

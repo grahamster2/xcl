@@ -1076,6 +1076,76 @@ pub fn pool_bytes() -> (usize, usize) {
     let quarantined: usize = s.quarantined.iter().flat_map(|b| b.tiles.iter()).chain(s.reuse.released.iter()).filter(|&&t| !demote::is_sys(t)).count();
     (pools, pools.saturating_sub((s.free.len() + s.cooling.len() + quarantined) * TILE))
 }
+/// `XCL_HOT_RESIDENCY`: each pool heap of the windows (and each retired one) to `see` – touched
+/// when a tile at an address of `tiles` (64 KiB aligned) or under a placed buffer of `res` is
+/// on it, empty when every tile of it is free (none mapped into a window) – and the heaps whose
+/// class `see` changes, with it, to `out` (held: the call that sets them is made without the lock).
+pub(super) fn hot_scan(
+    tiles: &[usize],
+    res: &[usize],
+    see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
+    out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
+) {
+    let g = lock_state();
+    let _held = holding(Holder::Other);
+    if let Some(s) = g.as_ref() {
+        s.hot_scan(tiles, res, see, out);
+    }
+}
+
+impl State {
+    /// `hot_scan` of this state
+    fn hot_scan(
+        &self,
+        tiles: &[usize],
+        res: &[usize],
+        see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
+        out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
+    ) {
+        let s = self;
+        let n = s.pools.len();
+        let mut touched = vec![false; n];
+        // (a tile of a system-memory heap, `SHADOW_POOL` or `LAZY` has no pool index)
+        let mut mark = |pool: (u32, u32)| {
+            if let Some(t) = touched.get_mut(pool.0 as usize) {
+                *t = true;
+            }
+        };
+        for a in tiles {
+            if let Some(e) = s.mapped.get(a) {
+                mark(e.pool);
+            }
+        }
+        for r in res {
+            if let Some(ts) = s.buffers.get(r) {
+                ts.iter().take(super::hot_residency::RES_TILES_MAX).for_each(|&(_, p)| mark(p));
+            }
+        }
+        // (as `pool_bytes` counts them: free, cooling, quarantined and released tiles are unmapped)
+        let mut unmapped = vec![0u32; n];
+        let quarantined = s.quarantined.iter().flat_map(|b| b.tiles.iter()).chain(s.reuse.released.iter());
+        for &(h, _) in s.free.iter().chain(s.cooling.iter().map(|c| &c.0)).chain(quarantined) {
+            if let Some(u) = unmapped.get_mut(h as usize) {
+                *u += 1;
+            }
+        }
+        let bytes = POOL_TILES as u64 * TILE as u64;
+        for (h, heap) in s.pools.iter().enumerate() {
+            let Some(heap) = heap else { continue };
+            let v = super::hot_residency::HeapView { ptr: heap.as_raw() as usize, bytes, touched: touched[h], pinned: false, empty: unmapped[h] >= POOL_TILES };
+            if let Some(c) = see(&v) {
+                out.push((heap.clone(), c));
+            }
+        }
+        for (heap, ..) in &s.retired {
+            let v = super::hot_residency::HeapView { ptr: heap.as_raw() as usize, bytes, touched: false, pinned: false, empty: true };
+            if let Some(c) = see(&v) {
+                out.push((heap.clone(), c));
+            }
+        }
+    }
+}
+
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
@@ -1401,6 +1471,7 @@ impl State {
         let heap = heap?;
         let _ = heap.SetName(windows::core::w!("xcl sparse tile pool"));
         super::residency::sparse_pool(&heap, desc.SizeInBytes, "sparse tile pool");
+        super::hot_residency::made(heap.as_raw() as usize);
         let h = self.add_pool(heap);
         Some(((h, 0), false))
     }
@@ -6487,6 +6558,52 @@ mod tests {
             let left = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize;
             assert_eq!(s.free.len() + s.retired.len() * POOL_TILES as usize, freed, "every freed tile is free or its pool retired");
             assert!(left <= kept * 2, "{left} tiles of video memory stay in pools for {kept} tiles in use ({} MiB for {} MiB)", left * TILE >> 20, kept * TILE >> 20);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `XCL_HOT_RESIDENCY`: a window tile touched marks its pool heap, one placed buffer's tiles
+    /// too, and a pool heap whose every tile is free again is empty; the class `see` gives goes
+    /// out with the heap.
+    #[test]
+    fn hot_scan_finds_the_pool_heap_under_a_window_tile() {
+        use super::super::hot_residency::{Class, HeapView};
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            assert!(!VirtualAlloc(base as *const c_void, 2 * TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            s.commit_range(base, 2 * TILE);
+            let tiles: Vec<(u32, u32)> = (0..2).map(|k| s.mapped[&(base + k * TILE)].pool).collect();
+            assert_eq!(tiles[0].0, tiles[1].0, "one pool heap");
+            let heap = s.pools[tiles[0].0 as usize].as_ref().expect("a live pool").as_raw() as usize;
+            let scan = |s: &State, at: &[usize], res: &[usize]| -> HeapView {
+                let mut views = Vec::new();
+                let mut out = Vec::new();
+                s.hot_scan(at, res, &mut |v: &HeapView| {
+                    views.push(*v);
+                    None
+                }, &mut out);
+                assert!(out.is_empty());
+                *views.iter().find(|v| v.ptr == heap).expect("the pool heap is seen")
+            };
+            let v = scan(&s, &[base + TILE], &[]);
+            assert!(v.touched && !v.empty && !v.pinned && v.bytes == (POOL_TILES as usize * TILE) as u64);
+            assert!(!scan(&s, &[base + 7 * TILE], &[]).touched, "an address with no tile there");
+            // a placed buffer over the tiles
+            s.buffers.insert(0xB0F0, vec![(base, tiles[0])]);
+            assert!(scan(&s, &[], &[0xB0F0]).touched);
+            assert!(!scan(&s, &[], &[0xB0F1]).touched);
+            s.buffers.remove(&0xB0F0);
+            // both tiles free again: nothing of it is mapped
+            s.free.extend(tiles.iter().copied());
+            let v = scan(&s, &[], &[]);
+            assert!(v.empty && !v.touched);
+            let mut out = Vec::new();
+            s.hot_scan(&[], &[], &mut |v: &HeapView| (v.ptr == heap).then_some(Class::Minimum), &mut out);
+            assert!(out.len() == 1 && out[0].0.as_raw() as usize == heap && out[0].1 == Class::Minimum);
+            s.free.retain(|t| !tiles.contains(t));
+            drop(out);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }

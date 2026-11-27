@@ -174,6 +174,16 @@ pub unsafe fn spare_raw(heap: usize, bytes: u64, what: &str) {
     }
 }
 
+/// `objects` (pageables of one device, `first`'s) at `priorities`, in one SetResidencyPriority
+/// call (`hot_residency`).
+pub(super) unsafe fn set_batch(first: &ID3D12Pageable, objects: &[Option<ID3D12Pageable>], priorities: &[D3D12_RESIDENCY_PRIORITY]) -> windows::core::Result<()> {
+    let mut dev: Option<ID3D12Device1> = None;
+    first.GetDevice(&mut dev)?;
+    let Some(dev) = dev else { return Err(windows::Win32::Foundation::E_NOINTERFACE.into()) };
+    let n = objects.len().min(priorities.len());
+    dev.SetResidencyPriority(n as u32, objects.as_ptr(), priorities.as_ptr())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +219,11 @@ mod tests {
             set(&heap, 1 << 16, D3D12_RESIDENCY_PRIORITY_MAXIMUM, "test heap", &tally);
             assert_eq!(tally.heaps.load(Ordering::Relaxed), 1);
             assert_eq!(tally.bytes.load(Ordering::Relaxed), 1 << 16);
+            // (`hot_residency`: several in one call)
+            let mut other: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&desc, &mut other).unwrap();
+            let objects = [Some(heap.cast::<ID3D12Pageable>().unwrap()), Some(other.unwrap().cast::<ID3D12Pageable>().unwrap())];
+            set_batch(objects[0].as_ref().unwrap(), &objects, &[D3D12_RESIDENCY_PRIORITY_LOW, D3D12_RESIDENCY_PRIORITY_MINIMUM]).unwrap();
         }
     }
 }

@@ -316,6 +316,11 @@ fn reserve(alive: &AtomicU64, bytes: u64, cap: u64) -> bool {
     }
 }
 
+/// Bytes of two-pass buffers alive (`hot_residency`'s line: HIGH from their creation).
+pub(super) fn two_pass_alive_bytes() -> u64 {
+    TWO_PASS[TP_ALIVE].load(Ordering::Relaxed)
+}
+
 impl Drop for TwoPassBuf {
     fn drop(&mut self) {
         TWO_PASS[TP_ALIVE].fetch_sub(self.bytes, Ordering::Relaxed);
@@ -1259,6 +1264,37 @@ fn store_addresses<'a>(l: &'a Layout, args: &'a [u8]) -> impl Iterator<Item = u6
     console_list::root_views(l, args).chain(constants).filter(|&va| va != 0 && va % 4 == 0)
 }
 
+/// `XCL_HOT_RESIDENCY`: a draw or dispatch of `pso` on `list` with the root arguments `args`
+/// (packed by `layout`) touches its root views (`ROOT_VIEW_BYTES` each, `ROOT_VIEW_WRITE_BYTES` when
+/// the pipeline may store), the 64-bit addresses in unified memory among its root constants and
+/// the first slots of its descriptor tables.
+pub(super) fn note_hot(list: usize, layout: Option<&Layout>, args: &[u8], pso: usize) {
+    if !super::hot_residency::on() {
+        return;
+    }
+    let (Some(l), Some(u)) = (layout, crate::gpu::uma::get()) else { return };
+    let view = if super::real::pso_may_store(pso) { super::hot_residency::ROOT_VIEW_WRITE_BYTES } else { super::hot_residency::ROOT_VIEW_BYTES };
+    for va in console_list::root_views(l, args).filter(|&va| va != 0) {
+        super::hot_residency::touch_va(list, va, view);
+    }
+    let word = |at: usize| args.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    for p in l.params.iter() {
+        match *p {
+            Param::Constants { at, count } => {
+                for k in 0..(count as usize).saturating_sub(1) {
+                    let va = word(at as usize + 4 * k) as u64 | (word(at as usize + 4 * k + 4) as u64) << 32;
+                    if va != 0 && va % 4 == 0 && u.window_of(va as usize).is_some() {
+                        super::hot_residency::touch_va(list, va, super::hot_residency::ROOT_VIEW_BYTES);
+                    }
+                }
+            }
+            Param::Table { at } if word(at as usize) != 0 => super::hot_residency::touch_table(list, u.base() + word(at as usize) as usize),
+            Param::Table { .. } => {}
+            Param::Descriptor { .. } => {}
+        }
+    }
+}
+
 /// command signatures that change root arguments (they need the title's root signature)
 static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
@@ -1394,6 +1430,9 @@ unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Resu
         &mut res,
     )
     .map_err(|e| format!("{what} ({bytes:#x} B): {e}"))?;
+    if let Some(r) = &res {
+        super::hot_residency::keep_high(r);
+    }
     // (a name for what a device removal reports about an address, `real::log_device_removed`;
     // and where the first ones lie: an address just past one's end has no allocation to name)
     if let Some(r) = &res {
@@ -2674,6 +2713,7 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     want_root_views(layout.as_deref(), &args, super::view_want::Path::MeshStage);
     shader_store_writes(layout.as_deref(), &args, 0);
+    note_hot(this as usize, layout.as_deref(), &args, real_mesh_pso);
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -3105,6 +3145,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let dispatches = super::capture::on() && signature_dispatches(sig);
     let _c = capture_work(this, || super::capture::indirect(sig, dispatches, max, args, args_off, count_buf, count_off), !dispatches);
+    // (the arguments: `max` commands of the signature's stride, not known here – taken as 64 bytes)
+    super::hot_residency::touch_buffer(this as usize, args, args_off, max.max(1) as u64 * 64);
+    super::hot_residency::touch_buffer(this as usize, count_buf, count_off, 4);
     let raw_pso = with(this, |s| s.pso);
     // (a dispatching one whose pipeline would be waited for here: at the submit, `list_x::defer`;
     // recorded there through this call, with everything below)
@@ -4061,6 +4104,7 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
         OnPipeline::Bind => {}
     }
     let _c = super::capture::op(this, || Some(super::capture::Op::Pipeline(pso as usize)));
+    super::hot_residency::touch_pso(this as usize, pso as usize);
     with(this, |s| s.pso = pso as usize);
     super::real::bind_pipeline(this, pso);
 }
@@ -4461,6 +4505,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     });
     want_root_views(layout.as_deref(), &args, super::view_want::Path::RootView);
     shader_store_writes(layout.as_deref(), &args, pso);
+    note_hot(this as usize, layout.as_deref(), &args, pso);
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or_else(|| {
