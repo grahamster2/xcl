@@ -626,7 +626,6 @@ impl Lw {
             live_exec: None,
             xslot: 1,
             lds: None,
-            lds_words: 8192,
             lds_top: 8191,
             dpp_enable: None,
             partner: Partner::Present,
@@ -701,12 +700,7 @@ impl Lw {
                 _ => Partner::Spin,
             };
         }
-        // a compute program's LDS allocation (COMPUTE_PGM_RSRC2.LDS_SIZE) sizes the block
-        let lds_bytes = match entry {
-            Entry::Compute(cs) => cs.lds_bytes,
-            _ => 0,
-        };
-        lw.setup_storage(uses_lds, if split { slot } else { 1 }, lds_bytes);
+        lw.setup_storage(uses_lds, if split { slot } else { 1 });
         lw
     }
 
@@ -852,7 +846,7 @@ fn a_split_wave64_compute_program_stays_whole() {
 fn a_dispatch_chain_leaves_the_lanes_past_a_thread_limit_out() {
     use crate::gpu::recomp::{runner, IO_THREAD_LIMIT};
     let threads = [32, 1, 1];
-    let cs = CsInterface { threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1, lds_bytes: 0 };
+    let cs = CsInterface { threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
     let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
     let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs.clone()));
     let (tid, gtid) = lw.setup_lanes_compute(threads, false);
