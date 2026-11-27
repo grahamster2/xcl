@@ -49,6 +49,8 @@ struct State {
     fences: HashMap<usize, (ID3D12Fence, u64)>,
     made: u64,
     swaps: u64,
+    /// spares released by `trim_spares` so far
+    released: u64,
     /// PC list → its last submit (queue, fence, value after it, recording number then)
     last_submit: HashMap<usize, LastSubmit>,
     /// PC list → recordings so far (a Reset or creation starts the next one)
@@ -265,9 +267,77 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let (hr, extra) = {
+        let mut g = STATE.lock().unwrap();
+        let s = g.get_or_insert_with(State::default);
+        let hr = title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw));
+        let extra = trim_spares(s, alloc as usize, spares_kept());
+        if !extra.is_empty() {
+            let (before, now) = (s.released - extra.len() as u64, s.released);
+            // (logged when the count passes a power of two)
+            if (before + 1..=now).any(u64::is_power_of_two) {
+                let aside: usize = s.aside.values().map(|v| v.len()).sum();
+                crate::xlog_info!(
+                    "D3D12.X: {now} spare PC command allocators released so far (the free ones past {} per title allocator; {aside} put aside now)",
+                    spares_kept()
+                );
+            }
+        }
+        (hr, extra)
+    };
+    // (outside the lock: their Release comes back here)
+    for b in extra {
+        drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
+    }
+    hr
+}
+
+/// Free spares kept aside per title allocator for its next resets (`XCL_ALLOC_SPARES`,
+/// default 2). A PC allocator keeps the memory of its biggest recording (NVIDIA), and a spare
+/// is made whenever the GPU is still on the one in use, so without a bound a title that resets
+/// every frame collects hundreds of them (546 by 590 s in a retail title).
+fn spares_kept() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_ALLOC_SPARES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
+}
+
+/// Takes out of what the title's allocator `a` has put aside the free PC allocators past the
+/// first `keep`: made here (not `a` itself, not the one in use), no list recording on them and
+/// the GPU done with every submit of them. The caller releases them, outside the lock.
+fn trim_spares(s: &mut State, a: usize, keep: usize) -> Vec<usize> {
+    let cur = s.cur.get(&a).copied().unwrap_or(a);
+    let backings = &s.backings;
+    let Some(v) = s.aside.get_mut(&a) else { return Vec::new() };
+    let (mut free, mut out) = (0usize, Vec::new());
+    v.retain(|&b| {
+        // SAFETY: the fences in `marks` are held by the map.
+        if b == a || b == cur || !backings.get(&b).is_none_or(|x| unsafe { x.free() }) {
+            return true;
+        }
+        free += 1;
+        if free <= keep {
+            return true;
+        }
+        out.push(b);
+        false
+    });
+    for b in &out {
+        // (no list records on it: its `users` is empty, so `of_list` names none)
+        s.backings.remove(b);
+    }
+    s.released += out.len() as u64;
+    out
+}
+
+/// For the memory map: PC allocators put aside (of all title allocators), how many of them are
+/// free now, and spares released so far.
+pub fn spare_counts() -> (usize, usize, u64) {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return (0, 0, 0) };
+    let all = s.aside.values().flatten();
+    // SAFETY: the fences in `marks` are held by the map.
+    let free = all.clone().filter(|b| s.backings.get(b).is_none_or(|x| unsafe { x.free() })).count();
+    (all.count(), free, s.released)
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -330,6 +400,53 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past `keep` free spares the rest are taken out to be released; the title's own
+    /// allocator, the one in use and a spare a list still records on stay.
+    #[test]
+    fn free_spares_past_the_kept_ones_are_taken_out() {
+        let (a, cur, busy, list) = (0x10usize, 0x20usize, 0x30usize, 0x99usize);
+        let free = [0x40usize, 0x50, 0x60, 0x70];
+        let mut s = State::default();
+        s.cur.insert(a, cur);
+        // the title's allocator itself is aside (and free): never released here
+        let mut v = vec![a, busy];
+        v.extend(free);
+        s.aside.insert(a, v);
+        move_list(&mut s, list, busy);
+        for f in free {
+            s.backings.insert(f, Backing::default());
+        }
+        let out = trim_spares(&mut s, a, 2);
+        assert_eq!(out, vec![0x60, 0x70], "the free spares past the first two");
+        assert_eq!(s.aside[&a], vec![a, busy, 0x40, 0x50]);
+        assert!(!s.backings.contains_key(&0x60) && !s.backings.contains_key(&0x70));
+        assert!(s.backings[&busy].users.contains(&list), "a spare a list records on stays");
+        assert_eq!(s.released, 2);
+        assert!(trim_spares(&mut s, a, 2).is_empty(), "nothing more to take");
+        assert_eq!(trim_spares(&mut s, a, 0), vec![0x40, 0x50]);
+        assert!(trim_spares(&mut s, 0x1234, 0).is_empty(), "an allocator with nothing aside");
+        assert_eq!(s.released, 4);
+    }
+
+    /// A spare whose last submit the GPU has not finished is kept until it has.
+    #[test]
+    fn a_spare_the_gpu_still_runs_is_not_released() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (a, cur, spare) = (0x10usize, 0x20usize, 0x40usize);
+            let mut s = State::default();
+            s.cur.insert(a, cur);
+            s.aside.insert(a, vec![spare]);
+            s.backings.entry(spare).or_default().marks.insert(1, (fence.clone(), 1));
+            assert!(trim_spares(&mut s, a, 0).is_empty(), "its submit is still on the GPU");
+            fence.Signal(1).unwrap();
+            assert_eq!(trim_spares(&mut s, a, 0), vec![spare], "done now");
+        }
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
