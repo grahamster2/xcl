@@ -68,6 +68,7 @@ impl<H: Clone> Arenas<H> {
         let mut kept = Vec::with_capacity(self.list.len());
         for a in self.list.drain(..) {
             if is_expired(&a) {
+                super::vram_attr::freed(super::vram_attr::Cat::Arenas, a.size as u64);
                 dropped.push(a.heap);
             } else {
                 kept.push(a);
@@ -157,7 +158,7 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
         Flags: D3D12_HEAP_FLAG_NONE,
     };
     let mut heap: Option<ID3D12Heap> = None;
-    if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
+    if let Err(e) = super::vram_attr::measure(super::vram_attr::Cat::Arenas, || dev.CreateHeap(&desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: video-memory arena for {va:#x}: CreateHeap: {e}");
         return None;
     }
@@ -358,6 +359,9 @@ struct TilePool {
     /// Whether heap index h has a heap (false: reclaimed by `reclaim_empty_heaps`, its slot free
     /// for the next `add_heap_at`).
     live: Vec<bool>,
+    /// Whether heap index h is in local video memory (a DEFAULT heap; false: system memory, the
+    /// L0 heaps `pool_heap_properties` makes past the budget, read by the GPU over the bus).
+    video: Vec<bool>,
 }
 
 impl TilePool {
@@ -368,21 +372,35 @@ impl TilePool {
             free_total: 0,
             cooling: std::collections::VecDeque::new(),
             live: Vec::new(),
+            video: Vec::new(),
         }
     }
 
-    fn add_heap_at(&mut self, slot: u32, pool_pages: u32) {
+    /// A new pool heap in `slot`, all its tiles free; `video`: in local video memory.
+    fn add_heap_at(&mut self, slot: u32, pool_pages: u32, video: bool) {
         let idx = slot as usize;
         if idx >= self.free_by_heap.len() {
             self.free_by_heap.resize_with(idx + 1, Vec::new);
             self.dirty_sort.resize(idx + 1, false);
             self.live.resize(idx + 1, false);
+            self.video.resize(idx + 1, false);
         }
         debug_assert!(self.free_by_heap[idx].is_empty());
         self.free_by_heap[idx] = (0..pool_pages).rev().collect();
         self.dirty_sort[idx] = false;
         self.live[idx] = true;
+        self.video[idx] = video;
         self.free_total += pool_pages as usize;
+    }
+
+    /// Whether heap `h` is in local video memory.
+    fn is_video(&self, h: usize) -> bool {
+        self.video.get(h).copied().unwrap_or(false)
+    }
+
+    /// Live heaps: (in video memory, in system memory).
+    fn heaps_by_memory(&self) -> (usize, usize) {
+        (0..self.live.len()).filter(|&h| self.live[h]).fold((0, 0), |(v, s), h| if self.is_video(h) { (v + 1, s) } else { (v, s + 1) })
     }
 
     /// Reclaim completely empty cooled heaps (`free_by_heap[h].len() == pool_pages`), keeping up
@@ -390,6 +408,8 @@ impl TilePool {
     /// Returns the reclaimed heap indices so the caller can drop their `ID3D12Heap`s.
     /// No tile of a reclaimed heap is handed out after this (`live`): a page still mapped onto
     /// one would be a page of whatever heap takes its slot next.
+    /// Empty heaps in system memory go first: the spares kept are heaps in video memory where
+    /// there are any.
     fn reclaim_empty_heaps(&mut self, keep_spare: usize, pool_pages: u32) -> Vec<u32> {
         let full = pool_pages as usize;
         let mut empty: Vec<usize> = self
@@ -401,6 +421,8 @@ impl TilePool {
         if empty.len() <= keep_spare {
             return Vec::new();
         }
+        // (stable: video memory heaps first, each kind in slot order; the first ones are kept)
+        empty.sort_by_key(|&h| !self.is_video(h));
         let mut reclaimed = Vec::with_capacity(empty.len() - keep_spare);
         for h in empty.drain(keep_spare..) {
             self.free_by_heap[h].clear();
@@ -442,16 +464,18 @@ impl TilePool {
         }
     }
 
-    /// Pick the pool heap to take up to `rem` tiles from:
+    /// Pick the pool heap to take up to `rem` tiles from, of the heaps in video memory only
+    /// (`video_only`) or of all:
     /// 1. `preferred` if it fits all `rem` tiles (keeps partial-overlap placements on 1 heap),
     /// 2. otherwise best-fit heap with `len >= rem` (fits the whole texture in 1 heap without
     ///    splitting fuller pools),
     /// 3. otherwise the heap with the most free tiles (minimizing distinct heaps touched).
-    fn pick_heap(&self, rem: usize, preferred: Option<u32>) -> Option<usize> {
+    fn pick_heap(&self, rem: usize, preferred: Option<u32>, video_only: bool) -> Option<usize> {
         if self.free_total == 0 {
             return None;
         }
-        if let Some(p) = preferred.map(|h| h as usize).filter(|&h| h < self.free_by_heap.len()) {
+        let eligible = |h: usize| !video_only || self.is_video(h);
+        if let Some(p) = preferred.map(|h| h as usize).filter(|&h| h < self.free_by_heap.len() && eligible(h)) {
             if self.free_by_heap[p].len() >= rem {
                 return Some(p);
             }
@@ -460,7 +484,7 @@ impl TilePool {
         let mut largest: Option<(usize, usize)> = None;
         for (h, tiles) in self.free_by_heap.iter().enumerate() {
             let len = tiles.len();
-            if len == 0 {
+            if len == 0 || !eligible(h) {
                 continue;
             }
             if len >= rem {
@@ -474,16 +498,33 @@ impl TilePool {
         best_fit.or(largest).map(|(h, _)| h)
     }
 
-    /// Allocate `count` tiles, preferring a single heap and ascending contiguous offsets.
-    /// `make_heap` allocates a new backing pool heap of `pool_pages` tiles when `free_total == 0`.
+    /// `take_batch_for` a sampled texture, every heap made in video memory (the tests of the
+    /// allocator apart from where its heaps are).
+    #[cfg(test)]
+    fn take_batch(&mut self, count: usize, preferred: Option<u32>, now: std::time::Instant, pool_pages: u32, mut make_heap: impl FnMut() -> Option<u32>) -> Option<Vec<Tile>> {
+        self.take_batch_for(count, preferred, now, pool_pages, false, |_| make_heap().map(|h| (h, true)))
+    }
+
+    /// Allocate `count` tiles, preferring a single heap and ascending contiguous offsets, and
+    /// heaps in video memory (a tile of a heap in system memory is read over the bus).
+    /// `make_heap(video_only)` makes a new pool heap of `pool_pages` tiles and says where it
+    /// went, `(slot, in video memory)`; with `video_only` it makes none (None) where the budget
+    /// would put it in system memory.
+    /// * Heaps in video memory with free tiles go first, for every texture.
+    /// * Then a GPU-owned texture (`gpu_owned`: render target, depth, UAV – the GPU writes it
+    ///   every frame) gets a new heap in video memory while the budget allows, before the free
+    ///   tiles of heaps in system memory; a sampled one takes those free tiles.
+    /// * No heap with free tiles: a new heap, where the budget puts it.
+    ///
     /// On failure, any tiles already taken are returned untouched.
-    fn take_batch(
+    fn take_batch_for(
         &mut self,
         count: usize,
         preferred: Option<u32>,
         now: std::time::Instant,
         pool_pages: u32,
-        mut make_heap: impl FnMut() -> Option<u32>,
+        gpu_owned: bool,
+        mut make_heap: impl FnMut(bool) -> Option<(u32, bool)>,
     ) -> Option<Vec<Tile>> {
         if count == 0 {
             return Some(Vec::new());
@@ -492,15 +533,27 @@ impl TilePool {
         let mut out = Vec::with_capacity(count);
         while out.len() < count {
             let rem = count - out.len();
-            let h = match self.pick_heap(rem, preferred) {
+            let h = match self.pick_heap(rem, preferred, true) {
                 Some(h) => h,
                 None => {
-                    let Some(new_h) = make_heap() else {
-                        self.return_tiles(&out);
-                        return None;
+                    // (no heap in video memory has a free tile: any free tile is system memory)
+                    let system = self.pick_heap(rem, preferred, false);
+                    let made = match system {
+                        Some(_) if !gpu_owned => None,
+                        Some(_) => make_heap(true),
+                        None => make_heap(false),
                     };
-                    self.add_heap_at(new_h, pool_pages);
-                    new_h as usize
+                    match (made, system) {
+                        (Some((new_h, video)), _) => {
+                            self.add_heap_at(new_h, pool_pages, video);
+                            new_h as usize
+                        }
+                        (None, Some(h)) => h,
+                        (None, None) => {
+                            self.return_tiles(&out);
+                            return None;
+                        }
+                    }
                 }
             };
             if self.dirty_sort[h] {
@@ -547,12 +600,17 @@ unsafe fn local_video_memory(adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdap
     Some((i.CurrentUsage, i.Budget))
 }
 
-/// Allocate one 64 MiB heap for `Pages`: video memory while the budget allows (`pool_heap_properties`).
+/// Allocate one 64 MiB heap for `Pages`: video memory while the budget allows
+/// (`pool_heap_properties`), and whether it is there. `video_only`: none (None) where the budget
+/// would put it in system memory.
 // ponytail: a heap placed in system memory stays there; textures on it do not move back when video memory frees up
-unsafe fn alloc_pool_heap(dev: &ID3D12Device, adapter: Option<&windows::Win32::Graphics::Dxgi::IDXGIAdapter3>, headroom: u64) -> Option<ID3D12Heap> {
+unsafe fn alloc_pool_heap(dev: &ID3D12Device, adapter: Option<&windows::Win32::Graphics::Dxgi::IDXGIAdapter3>, headroom: u64, video_only: bool) -> Option<(ID3D12Heap, bool)> {
     let bytes = POOL_PAGES as u64 * PAGE as u64;
     let (usage, budget) = adapter.and_then(|a| local_video_memory(a)).unwrap_or((0, 0));
     let properties = pool_heap_properties(usage, budget, bytes, headroom);
+    if video_only && properties.Type != D3D12_HEAP_TYPE_DEFAULT {
+        return None;
+    }
     if properties.Type == D3D12_HEAP_TYPE_CUSTOM {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -568,15 +626,17 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device, adapter: Option<&windows::Win32::G
         Flags: D3D12_HEAP_FLAG_NONE,
     };
     let mut heap: Option<ID3D12Heap> = None;
-    if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+    let made = super::vram_attr::measure(super::vram_attr::Cat::TargetPools, || super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)));
+    if let Err(e) = made {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
     }
+    let video = properties.Type == D3D12_HEAP_TYPE_DEFAULT;
     // (a pool already in system memory has nowhere lower to go)
-    if let (Some(h), true) = (&heap, properties.Type == D3D12_HEAP_TYPE_DEFAULT) {
+    if let (Some(h), true) = (&heap, video) {
         super::residency::spare(h, bytes, "pool heap of title texture pages");
     }
-    heap
+    heap.map(|h| (h, video))
 }
 
 /// Backing 64 MiB default heaps for `Pages`, supporting slot reuse when completely empty heaps
@@ -730,15 +790,22 @@ impl Pages {
         self.pool.drain_cooling(now);
         let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
+        let mut system = 0usize;
         for idx in reclaimed_ids {
             if let Some(h) = self.pools.take_heap(idx) {
+                if self.pool.is_video(idx as usize) {
+                    super::vram_attr::freed(super::vram_attr::Cat::TargetPools, POOL_PAGES as u64 * PAGE as u64);
+                } else {
+                    system += 1;
+                }
                 dropped.push(h);
             }
         }
         if !dropped.is_empty() {
             let mb = (dropped.len() * POOL_PAGES as usize * PAGE) >> 20;
+            let (video_heaps, system_heaps) = self.pool.heaps_by_memory();
             crate::xlog_info!(
-                "D3D12.X: reclaimed {} empty 64 MiB VRAM pool heap(s) ({mb} MiB returned to GPU; {} pools active)",
+                "D3D12.X: reclaimed {} empty 64 MiB pool heap(s) of title texture pages, {system} of them in system memory ({mb} MiB; {} pools active: {video_heaps} in video memory, {system_heaps} in system memory)",
                 dropped.len(),
                 self.pools.len()
             );
@@ -852,14 +919,17 @@ impl Pages {
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue
-    /// (`phys[i]`: the title's physical page at owned page i, if any – see `page_key`).
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, phys: &[Option<usize>]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize, phys)
+    /// (`phys[i]`: the title's physical page at owned page i, if any – see `page_key`;
+    /// `gpu_owned`: a target the GPU writes, whose new pages go in video memory first –
+    /// `TilePool::take_batch_for`).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, phys: &[Option<usize>], gpu_owned: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize, phys, gpu_owned)
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, phys: &[Option<usize>]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, phys: &[Option<usize>], gpu_owned: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -882,9 +952,9 @@ impl Pages {
         let pools = &mut self.pools;
         let pool = &mut self.pool;
         let (adapter, headroom) = (self.adapter.as_ref(), self.headroom);
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
-            let heap = alloc_pool_heap(dev, adapter, headroom)?;
-            Some(pools.push_heap(heap))
+        let fresh = pool.take_batch_for(missing, preferred, now, POOL_PAGES, gpu_owned, |video_only| {
+            let (heap, video) = alloc_pool_heap(dev, adapter, headroom, video_only)?;
+            Some((pools.push_heap(heap), video))
         })?;
         let mut fresh_iter = fresh.into_iter();
 
@@ -1110,7 +1180,7 @@ unsafe fn place_on_pages(
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, gpu_owned: require_aligned });
                 true
-            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, &phys) {
+            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, &phys, require_aligned) {
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, gpu_owned: require_aligned });
                 true
             } else {
@@ -1190,7 +1260,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     }
     let phys = physical_pages_under(va, console_bytes, gpu_owned);
     let mut g = PAGES.lock().unwrap();
-    let Some((va, console_bytes, total, mapped, _)) = target(&mut g) else { return false };
+    let Some((va, console_bytes, total, mapped, gpu_owned)) = target(&mut g) else { return false };
     if mapped {
         return true;
     }
@@ -1200,7 +1270,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.mapped = true;
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, &phys) else {
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, &phys, gpu_owned) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -1411,24 +1481,56 @@ pub(super) fn tiles_unaccounted_for(device: usize) -> usize {
 /// they stand for (shared pages count once for each texture on them) and the pages no texture
 /// uses any more that wait to go back to the pools (`sweep_idle`).
 pub fn page_owners() -> String {
+    // (the split by memory looks every page up: on every 5th line, ~10 s with `XCL_ACTIVITY`)
+    static LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let split = LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5 == 0;
     let g = PAGES.lock().unwrap();
     // (with every page, with pages by level): textures, pages held
     let mut kinds = [(0usize, 0usize); 2];
     let (mut pages, mut idle) = (0usize, 0usize);
+    // pages in heaps in [video, system] memory: held by GPU-owned targets, by sampled textures
+    // (a shared page counts for each), and all pages once
+    let (mut gpu, mut sampled, mut all) = ([0usize; 2], [0usize; 2], [0usize; 2]);
+    let (mut video_heaps, mut system_heaps) = (0usize, 0usize);
     for p in g.values().flatten() {
         pages += p.pages.len() + p.extra_pages.len();
         idle += p.idle.len();
+        let (v, s) = p.pool.heaps_by_memory();
+        video_heaps += v;
+        system_heaps += s;
+        let class = |tile: Tile| if p.pool.is_video(tile.0 as usize) { 0 } else { 1 };
+        if split {
+            for page in p.pages.values().chain(p.extra_pages.values()) {
+                all[class(page.tile)] += 1;
+            }
+        }
         for t in p.targets.values() {
             let k = if t.levels.is_none() { 0 } else { 1 };
             kinds[k].0 += 1;
             kinds[k].1 += t.used.len() + t.used_extra.len();
+            if !split {
+                continue;
+            }
+            let held = if t.gpu_owned { &mut gpu } else { &mut sampled };
+            let tiles = t.used.iter().filter_map(|a| p.pages.get(a)).chain(t.used_extra.iter().filter_map(|k| p.extra_pages.get(k)));
+            for page in tiles {
+                held[class(page.tile)] += 1;
+            }
         }
     }
+    drop(g);
     let mb = |n: usize| n * PAGE >> 20;
-    format!(
-        "target pages by owner: {} textures with all their pages hold {} MB, {} sampled textures with pages by level hold {} MB (a shared page counts for each); {} MB of pages in all, {} MB of them idle",
+    let mut line = format!(
+        "target pages by owner: {} textures with all their pages hold {} MB, {} sampled textures with pages by level hold {} MB (a shared page counts for each); {} MB of pages in all, {} MB of them idle; pool heaps {video_heaps} in video memory, {system_heaps} in system memory",
         kinds[0].0, mb(kinds[0].1), kinds[1].0, mb(kinds[1].1), mb(pages), mb(idle)
-    )
+    );
+    if split {
+        line += &format!(
+            "; in video / system memory: GPU-owned targets {} / {} MB, sampled textures {} / {} MB, all pages {} / {} MB",
+            mb(gpu[0]), mb(gpu[1]), mb(sampled[0]), mb(sampled[1]), mb(all[0]), mb(all[1])
+        );
+    }
+    line
 }
 
 pub fn page_bytes() -> (usize, usize) {
@@ -1503,7 +1605,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, &[]) else { continue };
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, &[], false) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
@@ -1916,6 +2018,87 @@ mod tests {
         assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 3).count(), 1);
         assert_eq!(next_slot.get(), 4);
         assert_eq!(free_slots.borrow().len(), 1);
+    }
+
+    /// Heaps in video memory with free tiles go first for every texture, the heap the texture's
+    /// other pages are on (`preferred`) too. With none: a GPU-owned target gets a new heap in
+    /// video memory while the budget allows, else the free tiles in system memory; a sampled
+    /// texture takes those free tiles without a new heap. No free tile: a heap where the budget
+    /// puts it.
+    #[test]
+    fn tile_pool_prefers_video_memory_heaps_and_gpu_owned_targets_get_new_ones() {
+        let t0 = Instant::now();
+        const P: u32 = 4;
+        let mut pool = TilePool::new();
+        pool.add_heap_at(0, P, false);
+        pool.add_heap_at(1, P, true);
+        assert_eq!(pool.heaps_by_memory(), (1, 1));
+        assert_eq!(pool.pick_heap(2, Some(0), true), Some(1), "a system memory heap is not preferred over free video memory");
+        assert_eq!(pool.pick_heap(2, Some(0), false), Some(0), "of all heaps the preferred one");
+
+        let asked = std::cell::RefCell::new(Vec::new());
+        let sampled = pool.take_batch_for(2, Some(0), t0, P, false, |v| { asked.borrow_mut().push(v); None }).unwrap();
+        assert!(sampled.iter().all(|t| t.0 == 1), "{sampled:?}");
+        let gpu = pool.take_batch_for(2, None, t0, P, true, |v| { asked.borrow_mut().push(v); None }).unwrap();
+        assert!(gpu.iter().all(|t| t.0 == 1), "{gpu:?}");
+        assert!(asked.borrow().is_empty(), "no heap made while video memory had free tiles");
+
+        // video memory full: a sampled texture takes system memory's free tiles, no heap made
+        let s = pool.take_batch_for(1, None, t0, P, false, |v| { asked.borrow_mut().push(v); None }).unwrap();
+        assert_eq!(s, [(0, 0)]);
+        assert!(asked.borrow().is_empty());
+        // a GPU-owned target asks for a new heap in video memory first, and takes it
+        let g = pool.take_batch_for(2, None, t0, P, true, |v| { asked.borrow_mut().push(v); v.then_some((2, true)) }).unwrap();
+        assert!(g.iter().all(|t| t.0 == 2), "{g:?}");
+        assert_eq!(*asked.borrow(), [true]);
+        assert_eq!(pool.heaps_by_memory(), (2, 1));
+        // past the budget (no heap in video memory made): the free tiles in system memory
+        pool.take_batch_for(2, None, t0, P, false, |_| None).unwrap();
+        asked.borrow_mut().clear();
+        let over = pool.take_batch_for(3, None, t0, P, true, |v| { asked.borrow_mut().push(v); None }).unwrap();
+        assert!(over.iter().all(|t| t.0 == 0), "{over:?}");
+        assert_eq!(*asked.borrow(), [true]);
+        // no free tile anywhere: a heap where the budget puts it, for either kind
+        asked.borrow_mut().clear();
+        let sys = pool.take_batch_for(1, None, t0, P, false, |v| { asked.borrow_mut().push(v); Some((3, false)) }).unwrap();
+        assert_eq!(sys, [(3, 0)]);
+        assert_eq!(*asked.borrow(), [false]);
+        assert_eq!(pool.heaps_by_memory(), (2, 2));
+        assert!(pool.take_batch_for(P as usize, None, t0, P, true, |_| None).is_none(), "nothing made: refused");
+        assert_eq!(pool.free_total, 3, "and the tiles taken given back");
+    }
+
+    /// Empty heaps in system memory are given back before those in video memory: the spares
+    /// kept are video memory where there is.
+    #[test]
+    fn tile_pool_reclaims_empty_system_memory_heaps_first() {
+        const P: u32 = 4;
+        let empty_pool = || {
+            let mut pool = TilePool::new();
+            for (h, video) in [(0, true), (1, false), (2, true), (3, false)] {
+                pool.add_heap_at(h, P, video);
+            }
+            pool
+        };
+        let mut pool = empty_pool();
+        let mut r = pool.reclaim_empty_heaps(2, P);
+        r.sort_unstable();
+        assert_eq!(r, [1, 3], "both video memory heaps kept as spares");
+        assert_eq!(pool.heaps_by_memory(), (2, 0));
+
+        let mut pool = empty_pool();
+        let r = pool.reclaim_empty_heaps(1, P);
+        assert_eq!(r.len(), 3);
+        assert!(pool.live[0] && pool.is_video(0), "the spare is in video memory: {r:?}");
+
+        // only system memory heaps empty: one stays as the spare
+        let mut pool = TilePool::new();
+        pool.add_heap_at(0, P, true);
+        pool.add_heap_at(1, P, false);
+        pool.add_heap_at(2, P, false);
+        pool.take_batch_for(1, None, Instant::now(), P, true, |_| None).unwrap();
+        assert_eq!(pool.reclaim_empty_heaps(1, P), [2]);
+        assert!(pool.live[0] && pool.live[1]);
     }
 
     #[test]

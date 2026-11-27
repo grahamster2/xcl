@@ -55,6 +55,7 @@ mod texture_upload;
 pub mod title_textures;
 pub mod view_want;
 pub mod vram;
+pub(crate) mod vram_attr;
 mod worker_pool;
 
 use std::ffi::c_void;

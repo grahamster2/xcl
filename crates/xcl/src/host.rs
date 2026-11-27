@@ -104,6 +104,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut own_cost = crate::hle::api_cost::submitter_totals();
             let mut views = crate::hle::d3d12x::view_want::totals();
             let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
+            let mut memory_lines = 0u64;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -183,6 +184,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 );
                 if pages != 0 {
                     crate::xlog_info!("{}", crate::hle::d3d12x::vram::page_owners());
+                }
+                // every ~10 s: what made the local video memory in use
+                memory_lines += 1;
+                if memory_lines % 5 == 1 {
+                    if let Some(line) = crate::hle::d3d12x::vram_attr::line() {
+                        crate::xlog_info!("{line}");
+                    }
                 }
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also

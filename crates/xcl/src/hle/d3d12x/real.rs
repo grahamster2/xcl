@@ -3705,6 +3705,10 @@ thread_local! {
 /// Device creation methods ending in (REFIID riid, void** ppv).
 macro_rules! creator {
     ($name:ident, $method:literal, $kind:expr, [$($a:ident),*]) => {
+        creator!($name, $method, $kind, [$($a),*], None);
+    };
+    // `$cat`: the kind of creation whose video memory `vram_attr` measures, if any
+    ($name:ident, $method:literal, $kind:expr, [$($a:ident),*], $cat:expr) => {
         pub(super) unsafe extern "system" fn $name(this: *mut c_void, $($a: usize,)* riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
             type F = unsafe extern "system" fn(*mut c_void, $(as_usize!($a),)* *const GUID, *mut *mut c_void) -> HRESULT;
             let f: F = std::mem::transmute(orig_fn(this, slot_of(this, $method)));
@@ -3714,7 +3718,12 @@ macro_rules! creator {
             if IN_CREATOR.with(|c| c.replace(true)) {
                 return f(this, $($a,)* riid, ppv);
             }
+            let cat: Option<super::vram_attr::Cat> = $cat;
+            let before = cat.and_then(super::vram_attr::begin);
             let mut hr = f(this, $($a,)* riid, ppv);
+            if let Some(cat) = cat {
+                super::vram_attr::end(cat, before);
+            }
             IN_CREATOR.with(|c| c.set(false));
             if hr == E_NOINTERFACE {
                 let iid = pc_iid($kind);
@@ -3775,9 +3784,9 @@ pub(super) unsafe fn create_raw_pc_command_list(
     (hr >= 0 && !out.is_null()).then_some(out)
 }
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
-creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
+creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5], Some(super::vram_attr::Cat::Committed));
+creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6], Some(super::vram_attr::Cat::Committed));
+creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6], Some(super::vram_attr::Cat::Committed));
 creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 
 /// D3D12_RESOURCE_STATES the PC knows (as `list_x::PC_STATES`)
@@ -4422,7 +4431,7 @@ pub fn switch_form_retries() -> u64 {
 unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
-    let hr = if injected { E_OUTOFMEMORY } else { f(this, desc, riid, ppv) };
+    let hr = if injected { E_OUTOFMEMORY } else { super::vram_attr::measure(super::vram_attr::Cat::Pipelines, || f(this, desc, riid, ppv)) };
     if hr == E_OUTOFMEMORY && heap {
         HEAP_WINDOW_OOM.with(|o| o.set(true));
     }

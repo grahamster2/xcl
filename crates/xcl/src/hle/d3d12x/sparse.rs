@@ -1254,7 +1254,7 @@ impl State {
         // CPU signal that asks meanwhile gives up after 2 ms)
         self.flush_pending();
         let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
+        if let Err(e) = super::vram_attr::measure(super::vram_attr::Cat::Sparse, || super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap))) {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
             return None;
         }
