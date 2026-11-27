@@ -3343,6 +3343,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
     match bind_abi(this, list, pso, gfx, None, 0) {
         Ok(b) => {
+            if compute && super::loop_stats::on() {
+                super::loop_stats::note_indirect(pso, checked.as_ref().map(|c| c.slot));
+            }
             let whole = if compute {
                 match super::real::dispatch_chain::whole_ready(pso) {
                     Ok(super::real::dispatch_chain::Whole::Plain) => None,
@@ -4498,6 +4501,13 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let mut views = [first; 6];
     views[0] = va(io_at);
     views[1] = va(res_at);
+    // `XCL_LOOP_STATS`: the dispatch, and a program with loop counters adds to its own block at res
+    if !gfx && super::loop_stats::on() {
+        if let Some(counters) = super::loop_stats::res_for(real) {
+            views[1] = counters;
+        }
+        super::loop_stats::note_dispatch(real, groups, layout.as_deref(), &args);
+    }
     // (every window slot gets a buffer: direct DXIL compute reads all four, `with_mem_raw_loads`)
     for k in 0..4 {
         views[2 + k] = super::real::uma_window_va(k).filter(|&v| v != 0).unwrap_or(first);

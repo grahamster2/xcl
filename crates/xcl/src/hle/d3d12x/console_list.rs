@@ -1012,7 +1012,14 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         }
                         ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
-                        list.SetComputeRootUnorderedAccessView(1, va(res_at));
+                        // `XCL_LOOP_STATS`: the dispatch, and a program's loop counters at res
+                        let res_va = if super::loop_stats::on() {
+                            super::loop_stats::note_dispatch(real, Some([x, y, z]), layout.as_deref(), &table);
+                            super::loop_stats::res_for(real).unwrap_or(va(res_at))
+                        } else {
+                            va(res_at)
+                        };
+                        list.SetComputeRootUnorderedAccessView(1, res_va);
                         // (every window slot gets a buffer: direct DXIL compute reads all four, as in `bind`)
                         for k in 0..4 {
                             list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().filter(|&v| v != 0).unwrap_or(uma_va));

@@ -5130,6 +5130,76 @@ fn forget_in(s: &mut State, res: usize) {
     }
 }
 
+/// What the tile under an address of the sparse windows holds (`XCL_LOOP_STATS`: whether a
+/// program's root ranges lie where nothing was ever filled in, `loop_stats`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum Held {
+    /// not in a sparse window (committed unified memory, or no title memory)
+    NotSparse,
+    /// a tile the windows have no entry for: never committed there, or decommitted (reads zeros)
+    NotMapped,
+    /// the address's 4 KiB page is a hole of its tile (not committed)
+    Hole,
+    /// listed with no video memory yet (`XCL_SPARSE_LAZY`, `LAZY`): reads zeros
+    NoVideoMemory,
+    /// video memory to which no CPU byte other than zero was ever sent (`never_sent`): zeros,
+    /// unless the GPU wrote it
+    NoCpuBytes,
+    /// the CPU's bytes went up to it
+    CpuBytes,
+}
+
+/// `Held` of `va`, a sparse window address, by the windows' tiles `mapped`.
+fn held_in(mapped: &FxHashMap<usize, TileEntry>, va: usize) -> Held {
+    let Some(e) = mapped.get(&(va & !(TILE - 1))) else { return Held::NotMapped };
+    if e.holes & (1 << ((va % TILE) / PAGE)) != 0 {
+        Held::Hole
+    } else if e.pool == LAZY {
+        Held::NoVideoMemory
+    } else if e.sent.iter().all(|p| p.is_none()) {
+        Held::NoCpuBytes
+    } else {
+        Held::CpuBytes
+    }
+}
+
+/// `Held` of each address of `vas` (title addresses), as the windows hold them now.
+pub(super) fn held(vas: &[usize]) -> Vec<Held> {
+    let g = lock_state();
+    let _held = holding(Holder::Other);
+    vas.iter()
+        .map(|&va| match (sparse_window_of(va), g.as_ref()) {
+            (Some(_), Some(s)) => held_in(&s.mapped, va),
+            (Some(_), None) => Held::NotMapped,
+            _ => Held::NotSparse,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    /// A tile with no entry, a hole, one listed with no video memory, one never sent a byte and
+    /// one the CPU's bytes went to are told apart, by the address's tile and page.
+    #[test]
+    fn what_a_tile_holds_is_told_by_its_entry() {
+        let mut m: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let w = 0x40_0000usize;
+        m.insert(w, TileEntry::with_holes((0, 1), 0b10));
+        m.insert(w + TILE, TileEntry::with_holes(LAZY, 0));
+        let mut sent = TileEntry::with_holes((0, 2), 0);
+        sent.sent[3] = Some(Box::new([1; CHUNKS]));
+        m.insert(w + 2 * TILE, sent);
+        assert_eq!(held_in(&m, w + 8), Held::NoCpuBytes);
+        assert_eq!(held_in(&m, w + PAGE + 8), Held::Hole);
+        assert_eq!(held_in(&m, w + TILE + 0x100), Held::NoVideoMemory);
+        // (any page's bytes count for the whole tile, as `never_sent` counts)
+        assert_eq!(held_in(&m, w + 2 * TILE), Held::CpuBytes);
+        assert_eq!(held_in(&m, w + 3 * TILE), Held::NotMapped);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -188,6 +188,11 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         split_wave64,
         cache_dir: dxc::cache_dir(),
     };
+    // `XCL_LOOP_STATS` names this compute program: its counted HLSL is kept in memory, never on
+    // disk (the disk entries of its bytes hold it without the counters, and stay as they are)
+    if loop_counted(blob, stage) {
+        return cached_shader(shader_cache(), key, blob, || compile_one().map(|(c, _)| c)).map(|shader| shader.as_ref().clone());
+    }
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
@@ -620,9 +625,11 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
     // `XCL_DEBUG_CS_SUB` names this compute shader: the HLSL path, whatever its size
     let cs_subs = cs_subs(blob, stage);
+    // `XCL_LOOP_STATS` names it: the HLSL path too (the counters go into its HLSL)
+    let counted = loop_counted(blob, stage);
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
-    if stage == Stage::Compute && cs_subs.is_none() && crate::gpu::dxil::kernel::enabled() {
+    if stage == Stage::Compute && cs_subs.is_none() && !counted && crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -651,7 +658,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
-    if cs_subs.is_none() && enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
+    if cs_subs.is_none() && !counted && enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -687,6 +694,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     if let Some(subs) = &cs_subs {
         apply_debug_subs(&mut t.hlsl, subs, "XCL_DEBUG_CS_SUB");
     }
+    let counted = counted && count_loops(blob, &mut t.hlsl);
     // `XCL_DEBUG_PS_EXPR=hash:expression` (one pixel shader): its target 0 gets that HLSL
     // expression, e.g. `float4(xi.a1.rgb, 1)` – an input or a register made visible
     if let Some(expr) = (stage == Stage::Pixel).then(|| std::env::var("XCL_DEBUG_PS_EXPR").ok()).flatten().and_then(|v| {
@@ -697,9 +705,45 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
     if stage == Stage::Compute {
-        note_compute_path(blob, if cs_subs.is_some() { "HLSL, with XCL_DEBUG_CS_SUB" } else { "HLSL" });
+        note_compute_path(blob, if cs_subs.is_some() { "HLSL, with XCL_DEBUG_CS_SUB" } else if counted { "HLSL, with XCL_LOOP_STATS counters" } else { "HLSL" });
+        if counted {
+            crate::gpu::loop_probe::note_counted(crate::gpu::shader::fnv64(blob));
+        }
     }
     Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+}
+
+/// Whether `XCL_LOOP_STATS` names this compute program (`gpu::loop_probe`).
+fn loop_counted(blob: &[u8], stage: Stage) -> bool {
+    stage == Stage::Compute && crate::gpu::loop_probe::switch().on() && crate::gpu::loop_probe::wanted(crate::gpu::shader::fnv64(blob))
+}
+
+/// The counters of `gpu::loop_probe` into the HLSL of the compute program `blob` (in `res`, which
+/// D3D12.X then binds to the program's counter block); false, and the HLSL as it was, when the
+/// program cannot have them.
+fn count_loops(blob: &[u8], hlsl: &mut String) -> bool {
+    let hash = crate::gpu::shader::fnv64(blob);
+    match crate::gpu::loop_probe::instrument(hlsl, "res", 0) {
+        Ok((counted, sites)) => {
+            crate::xlog_info!(
+                "[SHADER] XCL_LOOP_STATS: cs {:016x} (dump hash {hash:016x}): counters at {} loop budget check(s), {} loop entry count(s), {} split-wave exchange poll(s), {} barrier poll(s); HLSL path, not cached on disk",
+                crate::gpu::loop_probe::cs_hash(hash),
+                sites.budget,
+                sites.caps,
+                sites.exchange,
+                sites.barrier
+            );
+            if enormous(Stage::Compute, counted.len()) {
+                crate::xlog_warn!("[SHADER] XCL_LOOP_STATS: cs {hash:016x}: {} KB of HLSL, compiled unoptimised", counted.len() >> 10);
+            }
+            *hlsl = counted;
+            true
+        }
+        Err(e) => {
+            crate::xlog_warn!("[SHADER] XCL_LOOP_STATS: cs {hash:016x} gets no counters: {e}");
+            false
+        }
+    }
 }
 
 /// `XCL_DEBUG_PS_SUB` / `XCL_DEBUG_CS_SUB` = `hash:from=>to||from=>to…` (a dump hash, hex): the

@@ -35,6 +35,7 @@ mod late_release;
 pub mod layout;
 pub mod list_x;
 mod look_stats;
+mod loop_stats;
 mod lut3d;
 pub mod null;
 mod placements;

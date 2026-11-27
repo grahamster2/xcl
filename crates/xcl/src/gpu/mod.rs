@@ -9,6 +9,7 @@ pub mod dxbc;
 pub mod dxil;
 pub mod effects;
 pub(crate) mod fence;
+pub mod loop_probe;
 pub mod pack;
 pub mod rdna2;
 pub mod recomp;
