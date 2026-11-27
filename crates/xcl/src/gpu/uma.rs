@@ -487,6 +487,17 @@ impl Uma {
         g.1.range(..=p).next_back().map(|(&a, &l)| (a, l)).filter(|&(a, l)| p < a + l)
     }
 
+    /// The title's reservations in the sparse windows: (start, bytes) – `XCL_MEMORY_MAP`.
+    pub fn sparse_reservations(&self) -> Vec<(usize, usize)> {
+        self.sparse_free.lock().unwrap().1.iter().map(|(&a, &l)| (a, l)).collect()
+    }
+
+    /// XCL's arena pool: (start, end) – `XCL_MEMORY_MAP`.
+    pub fn pool_range(&self) -> (usize, usize) {
+        let g = self.pool.lock().unwrap();
+        (g.0, g.1)
+    }
+
     /// Bytes currently reserved/allocated in sparse windows.
     pub fn sparse_used(&self) -> usize {
         self.sparse_free.lock().unwrap().1.values().sum()
@@ -857,6 +868,11 @@ impl Uma {
     pub fn committed_window(&self) -> Option<usize> {
         (0..self.kinds.len()).find(|&k| self.is_committed_window(k))
     }
+}
+
+/// The title's graphics memory if it has been made (`get` makes it).
+pub fn made() -> Option<&'static Uma> {
+    GLOBAL.get().and_then(|u| u.as_ref())
 }
 
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048;

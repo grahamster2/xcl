@@ -150,6 +150,11 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
     CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)))
 }
 
+/// Bytes of translated shaders kept in memory – `XCL_MEMORY_MAP`.
+pub(crate) fn shader_cache_bytes() -> usize {
+    shader_cache().lock().unwrap().bytes
+}
+
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {

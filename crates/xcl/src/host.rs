@@ -93,6 +93,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
+    // `XCL_MEMORY_MAP=1`: every 10 s (`XCL_MEMORY_MAP_EVERY`) what fills the process's memory
+    crate::memory_map::start();
     // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
     if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
         let at: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
