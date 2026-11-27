@@ -223,13 +223,14 @@ fn format_pipelines(combined: u64, live: u64, kinds: [(usize, u64); 5]) -> Strin
     let parts: Vec<String> = KINDS.iter().zip(kinds).map(|(k, (c, b))| format!("{} {c} ({:.1} MB)", k.name(), b as f64 / MB as f64)).collect();
     let per = |d: u64| if d == 0 { "-".to_string() } else { format!("{:.2}", combined as f64 / MB as f64 / d as f64) };
     format!(
-        "memory map: XCL's pipelines' DXIL handed to the driver: {n} pipelines ({:.1} MB) – {}; driver write-combined {} MB = {} MB per live pipeline ({live}), {} MB per XCL pipeline, {} MB per MB of DXIL",
+        "memory map: XCL's pipelines' DXIL handed to the driver: {n} pipelines ({:.1} MB) – {}; driver write-combined {} MB = {} MB per live pipeline ({live}), {} MB per XCL pipeline, {} MB per MB of DXIL{}",
         bytes as f64 / MB as f64,
         parts.join(", "),
         combined / MB,
         per(live),
         per(n as u64),
-        if bytes == 0 { "-".to_string() } else { format!("{:.1}", combined as f64 / bytes as f64) }
+        if bytes == 0 { "-".to_string() } else { format!("{:.1}", combined as f64 / bytes as f64) },
+        crate::hle::d3d12x::pso_idle::summary()
     )
 }
 

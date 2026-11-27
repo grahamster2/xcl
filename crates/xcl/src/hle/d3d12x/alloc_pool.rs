@@ -105,6 +105,9 @@ pub(super) fn forget_list(list: usize) {
 pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
     let backing = current(alloc);
     let hr = reset(backing);
+    if hr >= 0 {
+        super::pso_idle::list_began(list);
+    }
     if hr < 0 || !enabled() || alloc == 0 {
         return hr;
     }

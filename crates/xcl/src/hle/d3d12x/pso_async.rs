@@ -34,6 +34,21 @@ struct Pending {
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
     spared: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
+    /// builds the real pipeline again after it was taken out of use (`pso_idle`); None: it is
+    /// never taken out of use
+    rebuild: Mutex<Option<Rebuild>>,
+    /// the last bind's time (`pso_idle::now_ms`; 0: none yet), kept while `pso_idle` is on
+    last_use: std::sync::atomic::AtomicU64,
+    /// the real pipeline was taken out of use (`evict_idle`): the next bind makes it again
+    evicted: std::sync::atomic::AtomicBool,
+    /// a bind holds it shared from its use's time to its read of the real pipeline
+    /// (`Pending::gate`), `evict_idle` alone while it takes the real pipeline out: a bind reads
+    /// either the pipeline before it went or that it went
+    gate: std::sync::RwLock<()>,
+    /// held while the real pipeline is made again
+    revive: Mutex<()>,
+    /// a worker is making it again for a bind that does not wait (`resolve`)
+    revive_sent: std::sync::atomic::AtomicBool,
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -113,7 +128,83 @@ impl Pending {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
         }
+        if super::pso_idle::active() {
+            self.last_use.store(super::pso_idle::now_ms(), Ordering::SeqCst);
+        }
     }
+
+    /// Held by a bind from its `note_use` to its last read of the real pipeline (None when
+    /// `pso_idle` is off: nothing is taken out of use).
+    fn gate(&self) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
+        super::pso_idle::active().then(|| self.gate.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// A real pipeline taken out of use is made again here, for the bind asking for it (None:
+    /// it was not taken out of use). One that cannot be made binds as the stand-in, and the next
+    /// bind tries again. (Called with the gate held, or on a worker for `resolve`.)
+    fn revive(&self, pso: usize) -> Option<usize> {
+        if !self.evicted.load(Ordering::SeqCst) {
+            return None;
+        }
+        let _g = self.revive.lock().unwrap();
+        match self.real.load(Ordering::SeqCst) {
+            0 => {}
+            r => return Some(r),
+        }
+        let rebuild = self.rebuild.lock().unwrap().clone();
+        let built = rebuild.map_or(0, |r| r());
+        super::pso_idle::note_made_again(built != 0);
+        if built == 0 {
+            return Some(self.stand(pso));
+        }
+        self.real.store(built, Ordering::SeqCst);
+        self.evicted.store(false, Ordering::SeqCst);
+        Some(built)
+    }
+}
+
+/// Builds a real pipeline again (raw pointer, 0 = failed): what `Job` did, as often as asked.
+pub type Rebuild = Arc<dyn Fn() -> usize + Send + Sync>;
+
+/// The real pipeline of stand-in `standin` may be taken out of use when idle (`pso_idle`) and
+/// made again with `rebuild`. Told before the title has the stand-in.
+pub fn rebuild_with(standin: usize, rebuild: Rebuild) {
+    if let Some(p) = entry(standin) {
+        *p.rebuild.lock().unwrap() = Some(rebuild);
+    }
+}
+
+/// Take out of use the real pipelines no bind has asked for in `after` (at `now`,
+/// `pso_idle::now_ms`): their references, for `pso_idle::retire`, and whether each is compute.
+/// Only built ones that can be made again; a stand-in being built or released is left alone.
+pub fn evict_idle(now: u64, after: std::time::Duration) -> Vec<(usize, bool)> {
+    let all: Vec<Arc<Pending>> = PENDING.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.values().cloned().collect());
+    let mut out = Vec::new();
+    for p in all {
+        if p.real.load(Ordering::SeqCst) == 0 || p.rebuild.lock().unwrap().is_none() || !*p.done.lock().unwrap() {
+            continue;
+        }
+        if !super::pso_idle::idle(p.last_use.load(Ordering::SeqCst), now, after) {
+            continue;
+        }
+        // no bind between its use and its read of the real pipeline meanwhile (one waiting for a
+        // build holds the gate: that pipeline is not idle)
+        let Ok(_alone) = p.gate.try_write() else { continue };
+        if !super::pso_idle::idle(p.last_use.load(Ordering::SeqCst), now, after) {
+            continue;
+        }
+        let _g = p.revive.lock().unwrap();
+        // (a bind after this finds it taken out: `revive`)
+        p.evicted.store(true, Ordering::SeqCst);
+        let real = p.real.swap(0, Ordering::SeqCst);
+        if real == 0 {
+            // released meanwhile (`released` took it)
+            p.evicted.store(false, Ordering::SeqCst);
+            continue;
+        }
+        out.push((real, p.compute));
+    }
+    out
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -400,8 +491,15 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         late: Default::default(),
         spared: Default::default(),
         demand: Default::default(),
+        rebuild: Mutex::new(None),
+        last_use: Default::default(),
+        evicted: Default::default(),
+        gate: std::sync::RwLock::new(()),
+        revive: Mutex::new(()),
+        revive_sent: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    super::pso_idle::start();
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -640,6 +738,66 @@ mod used_tests {
         assert_eq!(resolve_for_bind(builds), 0x1234);
         // (0x1234 is no pipeline: taken, not released)
         assert_eq!((released(fails), released(builds)), (0, 0x1234));
+    }
+
+    /// An idle real pipeline is taken out of use only when it was built and can be made again;
+    /// the next bind of its stand-in makes it again, one that cannot be made binds as the
+    /// stand-in and is tried again at the next bind.
+    #[test]
+    fn an_idle_pipeline_is_taken_out_and_made_again_at_its_next_bind() {
+        let (gfx, cs, plain, building) = (0x7E57_1D01usize, 0x7E57_1D02usize, 0x7E57_1D03usize, 0x7E57_1D04usize);
+        // (only this test's stand-ins can be made again: no other test's is taken out)
+        let mine = |v: Vec<(usize, bool)>| v;
+        static NEXT: AtomicUsize = AtomicUsize::new(0x5000_0000);
+        static FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        submit_lazy(gfx, false, Box::new(|| 0x7E57_1D11), 0);
+        submit_lazy(cs, true, Box::new(|| 0x7E57_1D12), 0);
+        submit_lazy(plain, false, Box::new(|| 0x7E57_1D13), 0);
+        submit_lazy(building, false, Box::new(|| 0x7E57_1D14), 0);
+        let again: Rebuild = Arc::new(|| if FAIL.load(Ordering::SeqCst) { 0 } else { NEXT.fetch_add(0x10, Ordering::SeqCst) });
+        for s in [gfx, cs, building] {
+            rebuild_with(s, again.clone());
+        }
+        assert_eq!(resolve_wait_for(gfx, None), 0x7E57_1D11);
+        assert_eq!(resolve_wait_for(cs, None), 0x7E57_1D12);
+        assert_eq!(resolve_wait_for(plain, None), 0x7E57_1D13);
+        let after = std::time::Duration::from_secs(10);
+        // not unused for long enough yet (never bound since the clock's start: last use 0)
+        assert_eq!(mine(evict_idle(9_999, after)), vec![]);
+        // `plain` cannot be made again; `building` was never built; a bind between its use and
+        // its read of the real pipeline (the gate held) keeps `gfx` for now
+        let bound = entry(gfx).unwrap();
+        let gate = bound.gate.read().unwrap();
+        assert_eq!(mine(evict_idle(10_000, after)), vec![(0x7E57_1D12, true)]);
+        drop(gate);
+        assert_eq!(mine(evict_idle(10_000, after)), vec![(0x7E57_1D11, false)]);
+        assert_eq!(mine(evict_idle(10_000, after)), vec![], "taken out once");
+        // the next binds make them again: one that does not wait gets the stand-in while a
+        // worker makes it, one that waits makes it here
+        let first = resolve(gfx);
+        assert!(first == gfx || first == 0x5000_0000, "{first:#x}");
+        let t0 = std::time::Instant::now();
+        let mut again = first;
+        while again == gfx && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            again = resolve(gfx);
+        }
+        assert_eq!(again, 0x5000_0000);
+        assert_eq!(resolve_wait_for(cs, None), 0x5000_0010);
+        assert_eq!((resolve(gfx), resolve_for_bind(cs)), (0x5000_0000, 0x5000_0010), "made once");
+        // one that cannot be made binds as its stand-in until it can
+        let mut out = mine(evict_idle(10_000, after));
+        out.sort();
+        assert_eq!(out, vec![(0x5000_0000, false), (0x5000_0010, true)]);
+        FAIL.store(true, Ordering::SeqCst);
+        assert_eq!(resolve_wait_for(gfx, None), gfx);
+        assert_eq!(resolve_for_bind(cs), cs);
+        FAIL.store(false, Ordering::SeqCst);
+        assert_eq!(resolve_wait_for(gfx, None), 0x5000_0020);
+        // a stand-in released while its pipeline is out of use has nothing to release
+        assert_eq!(released(cs), 0);
+        assert_eq!((released(gfx), released(plain)), (0x5000_0020, 0x7E57_1D13));
+        let _ = released(building);
     }
 
     /// A bind does not wait for a compute pipeline that writes only images: it gets the stand-in
@@ -1050,13 +1208,30 @@ pub fn shared(standin: usize, driver: usize) {
 /// pipeline (`pso` itself when it is one).
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    let _gate = p.gate();
     p.note_use();
+    if p.evicted.load(Ordering::SeqCst) {
+        // taken out of use: made again on a worker, as a lazy one is built at its first bind
+        // (callers of this one do not wait, and some hold locks of their own)
+        if !p.revive_sent.swap(true, Ordering::AcqRel) {
+            let w = p.clone();
+            let _ = queue().lock().unwrap().send(Box::new(move || {
+                let _gate = w.gate();
+                let _ = w.revive(pso);
+                w.revive_sent.store(false, Ordering::Release);
+            }));
+        }
+        return match p.real.load(Ordering::SeqCst) {
+            0 => p.stand(pso),
+            r => r,
+        };
+    }
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
             let stand = p.stand(pso);
             if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p);
+                enqueue(p.clone());
             }
             stand
         }
@@ -1073,7 +1248,11 @@ pub fn resolve_wait(pso: usize) -> usize {
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    let _gate = p.gate();
     p.note_use();
+    if let Some(r) = p.revive(pso) {
+        return r;
+    }
     if p.spared.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }

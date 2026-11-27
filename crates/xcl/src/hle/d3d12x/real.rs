@@ -739,6 +739,9 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if kind == Kind::PipelineState {
         LIVE_PIPELINES.fetch_add(1, Ordering::Relaxed);
     }
+    if matches!(kind, Kind::CommandList | Kind::DmaList) {
+        super::pso_idle::list_adopted(obj as usize);
+    }
 }
 
 /// adopted pipeline states not yet released for good (`XCL_MEMORY_MAP`)
@@ -3019,6 +3022,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
     if hr >= 0 {
+        super::pso_idle::list_began(this as usize);
         super::list_x::on_pc_reset(this);
         super::dred::reset(this);
         if !initial_state.is_null() {
@@ -5724,18 +5728,25 @@ unsafe fn go_background(
     let key = owned.shaders_key();
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
-    let job: super::pso_async::Job = Box::new(move || {
+    let owned = std::sync::Arc::new(Mutex::new(owned));
+    let make = move || {
         let mut out: *mut c_void = std::ptr::null_mut();
-        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+        if unsafe { build(dev, &owned.lock().unwrap(), &mut out) } && !out.is_null() {
             out as usize
         } else {
             0
         }
-    });
+    };
+    // (kept to make the pipeline again after it was taken out of use: `pso_idle`)
+    let rebuild: Option<super::pso_async::Rebuild> = super::pso_idle::idle_after().map(|_| std::sync::Arc::new(make.clone()) as super::pso_async::Rebuild);
+    let job: super::pso_async::Job = Box::new(make);
     if super::pso_async::lazy() {
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
+    }
+    if let Some(r) = rebuild {
+        super::pso_async::rebuild_with(*ppv as usize, r);
     }
     if driver != 0 {
         super::pso_async::shared(*ppv as usize, driver);
@@ -7203,6 +7214,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::pso_idle::list_gone(this as usize);
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
         super::dred::forget_list(this);
@@ -7472,6 +7484,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::pso_idle::lists_submitted(&mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());

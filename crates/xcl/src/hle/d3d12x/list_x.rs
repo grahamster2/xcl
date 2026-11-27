@@ -2711,6 +2711,8 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         };
         if hr >= 0 {
             hr = super::alloc_pool::reset_list(seg as usize, own as usize, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(seg, PC_RESET)(seg, pc_alloc, 0));
+            // (the put-off dispatch's state is from the title's recording: `pso_idle`)
+            super::pso_idle::list_carries(seg as usize, super::pso_idle::list_recording(first as usize));
         }
         real::preserve_vtable(seg, ext);
         if hr < 0 {
@@ -2820,6 +2822,8 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     } else {
         super::pso_async::resolve(bound_pso)
     };
+    // (the next segment goes on with this one's state: `pso_idle`)
+    let carried = super::pso_idle::list_recording(list as usize);
     let dev = device_of(list)?;
     let dev_raw = dev.as_raw() as usize;
 
@@ -2848,6 +2852,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
+    super::pso_idle::list_carries(next_pc as usize, carried);
     super::dred::reset(next_pc);
     if init_pso != 0 {
         super::dred::mark_pipeline(next_pc, bound_pso, init_pso);
@@ -3423,9 +3428,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
+    // (the title's recording goes on after the kickoff, with its state: `pso_idle`)
+    let carried = super::pso_idle::list_recording(this as usize);
     let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
+    if reset_hr >= 0 {
+        super::pso_idle::list_carries(target as usize, carried);
+    }
     real::preserve_vtable(target, ext_closed);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
