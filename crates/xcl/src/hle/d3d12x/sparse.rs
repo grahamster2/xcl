@@ -1260,7 +1260,7 @@ impl State {
         }
         let heap = heap?;
         let _ = heap.SetName(windows::core::w!("xcl sparse tile pool"));
-        super::residency::keep(&heap, desc.SizeInBytes, "sparse tile pool");
+        super::residency::sparse_pool(&heap, desc.SizeInBytes, "sparse tile pool");
         let h = self.add_pool(heap);
         Some(((h, 0), false))
     }

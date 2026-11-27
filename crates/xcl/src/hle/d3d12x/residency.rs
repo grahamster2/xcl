@@ -12,6 +12,11 @@
 //!   the pool heaps of title texture pages in video memory (`vram::alloc_pool_heap`), and a
 //!   title's buffers-only heap once its buffers live in unified memory (its PC heap is then
 //!   never used).
+//! * By default (`XCL_TARGET_RESIDENCY=0` turns it off): GPU-owned targets, the reserve pool
+//!   heaps of their pages (`XCL_TARGET_VRAM_MB`) and the video-memory arenas, get HIGH priority,
+//!   and the sparse tile pools LOW (unless `XCL_RESIDENCY` asks for more): over the budget the
+//!   OS pages sparse tiles out before the render targets, depth and UAVs the GPU writes every
+//!   frame. Not everything at MAXIMUM: `XCL_RESIDENCY=max` made frames slower.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -46,6 +51,15 @@ fn hot_priority() -> Option<D3D12_RESIDENCY_PRIORITY> {
     })
 }
 
+fn parse_targeted(v: Option<&str>) -> bool {
+    !matches!(v.map(str::trim), Some("0" | "off" | "false" | "no"))
+}
+
+fn targeted_on() -> bool {
+    static P: OnceLock<bool> = OnceLock::new();
+    *P.get_or_init(|| parse_targeted(std::env::var("XCL_TARGET_RESIDENCY").ok().as_deref()))
+}
+
 fn cold_on() -> bool {
     static P: OnceLock<bool> = OnceLock::new();
     *P.get_or_init(|| parse_cold(std::env::var("XCL_RESIDENCY_LOW").ok().as_deref()))
@@ -61,12 +75,16 @@ struct Tally {
 }
 
 static HOT: Tally = Tally { name: "XCL_RESIDENCY", broken: AtomicBool::new(false), heaps: AtomicU32::new(0), bytes: AtomicU64::new(0) };
+static TARGET: Tally = Tally { name: "XCL_TARGET_RESIDENCY (GPU-owned targets)", broken: AtomicBool::new(false), heaps: AtomicU32::new(0), bytes: AtomicU64::new(0) };
+static SPARSE: Tally = Tally { name: "XCL_TARGET_RESIDENCY (sparse tile pools)", broken: AtomicBool::new(false), heaps: AtomicU32::new(0), bytes: AtomicU64::new(0) };
 static COLD: Tally = Tally { name: "XCL_RESIDENCY_LOW", broken: AtomicBool::new(false), heaps: AtomicU32::new(0), bytes: AtomicU64::new(0) };
 
 fn priority_name(p: D3D12_RESIDENCY_PRIORITY) -> &'static str {
     match p {
         D3D12_RESIDENCY_PRIORITY_MAXIMUM => "MAXIMUM",
         D3D12_RESIDENCY_PRIORITY_HIGH => "HIGH",
+        D3D12_RESIDENCY_PRIORITY_NORMAL => "NORMAL",
+        D3D12_RESIDENCY_PRIORITY_LOW => "LOW",
         D3D12_RESIDENCY_PRIORITY_MINIMUM => "MINIMUM",
         _ => "?",
     }
@@ -116,6 +134,25 @@ pub unsafe fn keep(heap: &ID3D12Heap, bytes: u64, what: &str) {
     }
 }
 
+/// A heap of GPU-owned targets (a reserve pool heap of their pages, an arena) gets HIGH
+/// priority right after it is made. Nothing with `XCL_TARGET_RESIDENCY=0`.
+pub unsafe fn target(heap: &ID3D12Heap, bytes: u64, what: &str) {
+    if targeted_on() {
+        set(heap, bytes, D3D12_RESIDENCY_PRIORITY_HIGH, what, &TARGET);
+    }
+}
+
+/// A sparse tile pool right after it is made: `XCL_RESIDENCY`'s priority when set (`keep`),
+/// else LOW, so it pages out before GPU-owned targets (`target`). Nothing with
+/// `XCL_TARGET_RESIDENCY=0` and no `XCL_RESIDENCY`.
+pub unsafe fn sparse_pool(heap: &ID3D12Heap, bytes: u64, what: &str) {
+    if hot_priority().is_some() {
+        keep(heap, bytes, what);
+    } else if targeted_on() {
+        set(heap, bytes, D3D12_RESIDENCY_PRIORITY_LOW, what, &SPARSE);
+    }
+}
+
 /// `XCL_RESIDENCY_LOW`: a heap that is fine to page (texture pages, a title heap whose buffers
 /// live elsewhere) goes out first. Nothing when off.
 pub unsafe fn spare(heap: &ID3D12Heap, bytes: u64, what: &str) {
@@ -151,6 +188,10 @@ mod tests {
         assert!(parse_cold(Some("1")));
         assert!(!parse_cold(Some("0")));
         assert!(!parse_cold(None));
+        assert!(parse_targeted(None), "on by default");
+        assert!(parse_targeted(Some("1")));
+        assert!(!parse_targeted(Some(" 0 ")));
+        assert!(!parse_targeted(Some("off")));
     }
 
     #[test]
