@@ -11,6 +11,9 @@
 //!   pieces) that no bind has asked for in that long is released. The title holds the stand-in,
 //!   never the driver pipeline, and every bind asks `pso_async` for the driver pipeline of the
 //!   stand-in it has: the next one makes it again.
+//! * `XCL_SPLIT_DROP_WHOLE=1`: the whole form of a split compute program (`dispatch_chain`),
+//!   built for an `ExecuteIndirect` or a dispatch without scratch, is released when it has not
+//!   been used for `XCL_PSO_IDLE_S` (30 s when that is unset). Its driver blob is kept on disk.
 //!
 //! What may still use a pipeline when it is taken out of use (`bury`):
 //! * a list recording, or recorded and not yet submitted, or submitted again without a new
@@ -30,6 +33,8 @@ use std::time::{Duration, Instant};
 
 /// how often the sweep looks for pipelines not used for long enough
 const SWEEP: Duration = Duration::from_secs(5);
+/// `XCL_SPLIT_DROP_WHOLE` without `XCL_PSO_IDLE_S`
+const WHOLE_IDLE: Duration = Duration::from_secs(30);
 
 fn parse_idle(v: Option<&str>) -> Option<Duration> {
     v.and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s > 0.0).map(Duration::from_secs_f64)
@@ -41,10 +46,21 @@ pub fn idle_after() -> Option<Duration> {
     *D.get_or_init(|| parse_idle(std::env::var("XCL_PSO_IDLE_S").ok().as_deref()))
 }
 
-/// The switch is on: uses are timed and lists followed.
+/// `XCL_SPLIT_DROP_WHOLE=1`
+pub fn drop_whole() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("XCL_SPLIT_DROP_WHOLE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// How long a split program's whole form goes unused before it is released.
+pub fn whole_after() -> Option<Duration> {
+    drop_whole().then(|| idle_after().unwrap_or(WHOLE_IDLE))
+}
+
+/// Either switch is on: uses are timed and lists followed.
 pub fn active() -> bool {
     static A: OnceLock<bool> = OnceLock::new();
-    *A.get_or_init(|| idle_after().is_some())
+    *A.get_or_init(|| idle_after().is_some() || drop_whole())
 }
 
 /// Milliseconds since the first call: the time of a use.
@@ -246,8 +262,9 @@ pub fn start() {
     ONCE.call_once(|| {
         let after = |d: Option<Duration>| d.map_or("off".to_string(), |d| format!("after {:.1} s unused", d.as_secs_f64()));
         crate::xlog_info!(
-            "D3D12.X: pipelines XCL made are released when unused and made again at their next bind: background-built pipelines (XCL_PSO_IDLE_S) {}",
-            after(idle_after())
+            "D3D12.X: pipelines XCL made are released when unused and made again at their next bind: background-built pipelines (XCL_PSO_IDLE_S) {}, split programs' whole forms (XCL_SPLIT_DROP_WHOLE) {}",
+            after(idle_after()),
+            after(whole_after())
         );
         let _ = std::thread::Builder::new().name("xcl-pso-idle".into()).spawn(|| loop {
             std::thread::sleep(SWEEP);
@@ -264,6 +281,11 @@ fn sweep() {
     if let Some(after) = idle_after() {
         for (pso, compute) in super::pso_async::evict_idle(now, after) {
             retire(pso, if compute { What::Compute } else { What::Graphics });
+        }
+    }
+    if let Some(after) = whole_after() {
+        for pso in super::real::dispatch_chain_drop_wholes(now, after) {
+            retire(pso, What::Whole);
         }
     }
     let (free, waiting, holding) = with(|l| l.take_free());

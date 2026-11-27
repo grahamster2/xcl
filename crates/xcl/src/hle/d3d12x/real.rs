@@ -4444,6 +4444,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
 pub(crate) use dispatch_chain::forms as dispatch_chain_forms;
+pub(crate) use dispatch_chain::drop_wholes as dispatch_chain_drop_wholes;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ComputeBuild {

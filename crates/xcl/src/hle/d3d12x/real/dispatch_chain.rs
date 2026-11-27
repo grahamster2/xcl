@@ -13,12 +13,28 @@ static SLABS: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static WANTED: AtomicU64 = AtomicU64::new(0);
+/// uses of the whole form: by an ExecuteIndirect; by a dispatch on a bundle, on a list whose
+/// allocator is not known, or without scratch (none could be made)
+static WHOLE_USES: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// whole forms built, and released unused (`XCL_SPLIT_DROP_WHOLE`)
+static WHOLES_BUILT: AtomicU64 = AtomicU64::new(0);
+static WHOLES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+enum WholeUse {
+    Indirect = 0,
+    Bundle = 1,
+    NoAllocator = 2,
+    NoScratch = 3,
+}
 
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
-    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
+    let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); whole forms built {}, released unused {}, used by ExecuteIndirect {}, by dispatches in bundles {}, with no known allocator {}, without scratch {}",
         PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
-        mib(&LIVE), mib(&PEAK), mib(&WANTED));
+        mib(&LIVE), mib(&PEAK), mib(&WANTED), n(&WHOLES_BUILT), n(&WHOLES_DROPPED),
+        n(&WHOLE_USES[0]), n(&WHOLE_USES[1]), n(&WHOLE_USES[2]), n(&WHOLE_USES[3]));
 }
 
 /// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
@@ -53,20 +69,52 @@ struct Chain {
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
-    build_whole: Mutex<()>,
+    /// built at its first use (held while it is built)
+    whole: Mutex<Option<ID3D12PipelineState>>,
+    /// its last use (`pso_idle::now_ms`), kept with `XCL_SPLIT_DROP_WHOLE`
+    whole_used: AtomicU64,
 }
 
 impl Chain {
-    unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+    unsafe fn whole(&self, why: WholeUse) -> Result<ID3D12PipelineState, String> {
+        WHOLE_USES[why as usize].fetch_add(1, Ordering::Relaxed);
+        // (before the whole form is looked at: `drop_wholes` reads the time after it took it out)
+        if super::super::pso_idle::drop_whole() {
+            self.whole_used.store(super::super::pso_idle::now_ms(), Ordering::SeqCst);
+        }
+        let mut whole = self.whole.lock().unwrap();
+        if let Some(p) = whole.as_ref() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
         super::pso_dxil::note(p.as_raw() as usize, super::pso_dxil::Kind::Whole, self.whole_code.len());
-        let _ = self.whole.set(p.clone());
+        WHOLES_BUILT.fetch_add(1, Ordering::Relaxed);
+        *whole = Some(p.clone());
         Ok(p)
     }
+
+    /// The whole form when it was built and is unused for `after` at `now` (a reference, for
+    /// `pso_idle::retire`), with its driver blob kept on disk first so that it is made again
+    /// from that at its next use.
+    unsafe fn drop_whole(&self, now: u64, after: std::time::Duration) -> Option<ID3D12PipelineState> {
+        if !super::super::pso_idle::idle(self.whole_used.load(Ordering::SeqCst), now, after) {
+            return None;
+        }
+        // (one being built is in use)
+        let p = self.whole.try_lock().ok()?.take()?;
+        if let Some(path) = driver_cache::path_for(&self.whole_code, self.builder.flags.0, true).filter(|p| !p.exists()) {
+            if let Some(blob) = read_pso_cached_blob(p.as_raw()) {
+                driver_cache::write(&path, &blob);
+            }
+        }
+        WHOLES_DROPPED.fetch_add(1, Ordering::Relaxed);
+        Some(p)
+    }
+}
+
+/// `XCL_SPLIT_DROP_WHOLE`: the whole forms of split programs unused for `after` at `now`,
+/// taken out (their references, for `pso_idle::retire`).
+pub(crate) fn drop_wholes(now: u64, after: std::time::Duration) -> Vec<usize> {
+    let chains: Vec<Arc<Chain>> = CHAINS.lock().unwrap().values().cloned().collect();
+    chains.iter().filter_map(|c| unsafe { c.drop_whole(now, after) }).map(|p| p.into_raw() as usize).collect()
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
@@ -96,7 +144,8 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: Mutex::new(None), whole_used: AtomicU64::new(0) });
+    super::super::pso_idle::start();
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -109,7 +158,8 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
 pub(crate) fn forms() -> (usize, usize, usize) {
     let chains = CHAINS.lock().unwrap();
     let pieces = chains.values().map(|c| 1 + c.tail.len()).sum();
-    (chains.len(), pieces, chains.values().filter(|c| c.whole.get().is_some()).count())
+    // (one being built is not counted yet)
+    (chains.len(), pieces, chains.values().filter(|c| c.whole.try_lock().is_ok_and(|w| w.is_some())).count())
 }
 
 pub(super) fn forget(pso: usize) {
@@ -119,7 +169,7 @@ pub(super) fn forget(pso: usize) {
 
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+    chain.map(|c| c.whole(WholeUse::Indirect)).transpose()
 }
 
 struct Scratch {
@@ -233,7 +283,8 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        let why = if allocator == 0 { WholeUse::NoAllocator } else if list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE { WholeUse::Bundle } else { WholeUse::NoScratch };
+        list.SetPipelineState(&chain.whole(why)?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
