@@ -63,6 +63,7 @@ impl Chain {
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
+        super::pso_dxil::note(p.as_raw() as usize, super::pso_dxil::Kind::Whole, self.whole_code.len());
         let _ = self.whole.set(p.clone());
         Ok(p)
     }
@@ -88,7 +89,11 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     // Take ownership of every success, including when a different piece failed.
     let built: Vec<_> = super::super::pso_async::build_pieces(jobs).into_iter()
         .map(|p| (p != 0).then(|| ID3D12PipelineState::from_raw(p as *mut c_void))).collect();
-    let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
+    let built = built.into_iter().collect::<Option<Vec<_>>>()?;
+    for (p, code) in built.iter().zip(&plan.pieces) {
+        super::pso_dxil::note(p.as_raw() as usize, super::pso_dxil::Kind::Piece, code.len());
+    }
+    let mut pieces = built.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
