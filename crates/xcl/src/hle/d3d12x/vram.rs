@@ -1522,13 +1522,13 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 
 /// `XCL_HOT_RESIDENCY`: each pool heap of target pages in video memory and each arena to `see`, and
 /// the heaps whose class it changes, with it, to `out`. A pool heap is touched when a page of an
-/// address of `tiles` (64 KiB aligned, sorted; pages keyed by address) or of a texture of `res`
+/// address of `tiles` (pages keyed by address) or of a texture of `res`
 /// is on it, pinned while it holds a page of a GPU-owned target, empty when every page of it is
 /// free (a spare pool, `keep_spare_pools`). An arena is touched by an address in it or a texture
 /// of `res` placed in it, pinned while a resource is, empty when none is (it goes `IDLE` later).
 /// Pool heaps in system memory have no place in video memory to keep: left out.
 pub(super) fn hot_scan(
-    tiles: &[usize],
+    tiles: &super::hot_residency::TileSet,
     res: &[usize],
     see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
     out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
@@ -1558,7 +1558,7 @@ impl Pages {
     /// `hot_scan` of this device's pool heaps
     fn hot_scan(
         &self,
-        tiles: &[usize],
+        tiles: &super::hot_residency::TileSet,
         res: &[usize],
         see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
         out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
@@ -1571,9 +1571,7 @@ impl Pages {
                 *f = true;
             }
         };
-        for a in tiles {
-            mark(&mut touched, p.pages.get(a));
-        }
+        super::hot_residency::for_each_touched(tiles, &p.pages, |pg| mark(&mut touched, Some(pg)));
         for r in res {
             if let Some(t) = p.targets.get(r) {
                 t.used.iter().take(super::hot_residency::RES_TILES_MAX).for_each(|k| mark(&mut touched, p.pages.get(k)));
@@ -2708,7 +2706,7 @@ mod tests {
     /// and pinned while a GPU-owned target holds a page of it.
     #[test]
     fn hot_scan_finds_the_pool_heap_under_a_texture() {
-        use super::super::hot_residency::HeapView;
+        use super::super::hot_residency::{HeapView, TileSet};
         use windows::Win32::Graphics::Dxgi::Common::*;
         unsafe {
             let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
@@ -2734,7 +2732,7 @@ mod tests {
             let scan = |p: &Pages, at: &[usize], res: &[usize]| -> Vec<HeapView> {
                 let mut views = Vec::new();
                 let mut out = Vec::new();
-                p.hot_scan(at, res, &mut |v: &HeapView| {
+                p.hot_scan(&TileSet::of(at), res, &mut |v: &HeapView| {
                     views.push(*v);
                     None
                 }, &mut out);

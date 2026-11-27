@@ -1077,11 +1077,11 @@ pub fn pool_bytes() -> (usize, usize) {
     (pools, pools.saturating_sub((s.free.len() + s.cooling.len() + quarantined) * TILE))
 }
 /// `XCL_HOT_RESIDENCY`: each pool heap of the windows (and each retired one) to `see` – touched
-/// when a tile at an address of `tiles` (64 KiB aligned) or under a placed buffer of `res` is
+/// when a tile at an address of `tiles` or under a placed buffer of `res` is
 /// on it, empty when every tile of it is free (none mapped into a window) – and the heaps whose
 /// class `see` changes, with it, to `out` (held: the call that sets them is made without the lock).
 pub(super) fn hot_scan(
-    tiles: &[usize],
+    tiles: &super::hot_residency::TileSet,
     res: &[usize],
     see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
     out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
@@ -1097,7 +1097,7 @@ impl State {
     /// `hot_scan` of this state
     fn hot_scan(
         &self,
-        tiles: &[usize],
+        tiles: &super::hot_residency::TileSet,
         res: &[usize],
         see: &mut dyn FnMut(&super::hot_residency::HeapView) -> Option<super::hot_residency::Class>,
         out: &mut Vec<(ID3D12Heap, super::hot_residency::Class)>,
@@ -1111,11 +1111,7 @@ impl State {
                 *t = true;
             }
         };
-        for a in tiles {
-            if let Some(e) = s.mapped.get(a) {
-                mark(e.pool);
-            }
-        }
+        super::hot_residency::for_each_touched(tiles, &s.mapped, |e| mark(e.pool));
         for r in res {
             if let Some(ts) = s.buffers.get(r) {
                 ts.iter().take(super::hot_residency::RES_TILES_MAX).for_each(|&(_, p)| mark(p));
@@ -6568,7 +6564,7 @@ mod tests {
     /// out with the heap.
     #[test]
     fn hot_scan_finds_the_pool_heap_under_a_window_tile() {
-        use super::super::hot_residency::{Class, HeapView};
+        use super::super::hot_residency::{Class, HeapView, TileSet};
         use windows_sys::Win32::System::Memory::MEM_RELEASE;
         unsafe {
             let (base, mut s) = test_state_with_reserved(2);
@@ -6580,7 +6576,7 @@ mod tests {
             let scan = |s: &State, at: &[usize], res: &[usize]| -> HeapView {
                 let mut views = Vec::new();
                 let mut out = Vec::new();
-                s.hot_scan(at, res, &mut |v: &HeapView| {
+                s.hot_scan(&TileSet::of(at), res, &mut |v: &HeapView| {
                     views.push(*v);
                     None
                 }, &mut out);
@@ -6600,7 +6596,7 @@ mod tests {
             let v = scan(&s, &[], &[]);
             assert!(v.empty && !v.touched);
             let mut out = Vec::new();
-            s.hot_scan(&[], &[], &mut |v: &HeapView| (v.ptr == heap).then_some(Class::Minimum), &mut out);
+            s.hot_scan(&TileSet::default(), &[], &mut |v: &HeapView| (v.ptr == heap).then_some(Class::Minimum), &mut out);
             assert!(out.len() == 1 && out[0].0.as_raw() as usize == heap && out[0].1 == Class::Minimum);
             s.free.retain(|t| !tiles.contains(t));
             drop(out);

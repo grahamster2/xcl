@@ -11,10 +11,13 @@
 //!   the first slots of descriptor tables;
 //! * at ExecuteCommandLists (and KickoffX) the logs of the lists submitted go into the frame's
 //!   set (a list submitted again counts again; its log goes at its Reset);
-//! * at a present, at most every `UPDATE_EVERY`, the set is mapped onto heaps – a sparse window
-//!   tile onto its pool heap, a target page or a texture onto its pool heap, an address or
-//!   texture onto its arena – and the heaps whose class changed get it in one batched
-//!   `SetResidencyPriority`:
+//! * at a present, at most every `UPDATE_EVERY`, a worker thread is woken (the present only counts
+//!   the frame and signals): it takes the set and maps it onto heaps – a sparse window tile onto
+//!   its pool heap, a target page or a texture onto its pool heap, an address or texture onto its
+//!   arena – and the heaps whose class changed get it in one batched `SetResidencyPriority`. The
+//!   tiles are a bitmap (`TileSet`), and a heap owner's map is looked up tile by tile or walked
+//!   whole, whichever is shorter (`for_each_touched`): its lock is held for a walk of it at most.
+//!   The classes:
 //!   HIGH: touched in the last `HOT`, and target pool heaps holding pages of GPU-owned targets,
 //!   arenas in use, two-pass buffers (at their creation);
 //!   NORMAL: untouched for `HOT` to `COLD`; LOW: untouched for `COLD` or more;
@@ -30,8 +33,8 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -66,10 +69,9 @@ pub(super) const RES_TILES_MAX: usize = 4096;
 const TABLE_SLOTS: usize = 8;
 /// keys a thread holds before they go to their list's log
 const LOCAL_MAX: usize = 512;
-/// keys a list's log and the frame's set hold at most, and keys mapped at an update
+/// keys a list's log and the frame's set hold at most
 const LIST_KEYS_MAX: usize = 1 << 16;
 const FRAME_KEYS_MAX: usize = 1 << 18;
-const RESOLVE_MAX: usize = 1 << 18;
 
 #[derive(Default)]
 pub(super) struct Fx(u64);
@@ -87,7 +89,9 @@ impl Hasher for Fx {
         self.write_u64(i as u64);
     }
     fn finish(&self) -> u64 {
-        self.0
+        // (the product's low bits, where the table's index is taken, are poor: without the
+        // rotation 64 KiB aligned addresses all fell in a few buckets)
+        self.0.rotate_left(26)
     }
 }
 
@@ -317,12 +321,184 @@ pub(super) fn reset(list: usize) {
     RESETS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// what the lists submitted since the last update touched
-struct FrameKeys {
-    keys: Option<FxSet<u64>>,
+/// 64 KiB tiles of title addresses, as a bitmap of each GiB with one in it.
+#[derive(Default)]
+pub(super) struct TileSet {
+    chunks: FxMap<u64, Box<[u64; CHUNK_WORDS]>>,
+    len: usize,
 }
 
-static FRAME: Mutex<FrameKeys> = Mutex::new(FrameKeys { keys: None });
+/// tiles of a chunk (1 GiB) as a power of two, and its words
+const CHUNK_SHIFT: u32 = 14;
+const CHUNK_MASK: u64 = (1 << CHUNK_SHIFT) - 1;
+const CHUNK_WORDS: usize = (1 << CHUNK_SHIFT) / 64;
+
+/// the bits `from..=to` of a word
+fn bits(from: usize, to: usize) -> u64 {
+    (u64::MAX >> (63 - to)) & (u64::MAX << from)
+}
+
+impl TileSet {
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    fn chunk(&mut self, c: u64) -> &mut [u64; CHUNK_WORDS] {
+        self.chunks.entry(c).or_insert_with(|| Box::new([0; CHUNK_WORDS]))
+    }
+
+    /// The tile `i` (`va / TILE`); whether it is new.
+    pub(super) fn insert(&mut self, i: u64) -> bool {
+        let w = &mut self.chunk(i >> CHUNK_SHIFT)[(i & CHUNK_MASK) as usize / 64];
+        let bit = 1u64 << (i % 64);
+        let new = *w & bit == 0;
+        *w |= bit;
+        self.len += new as usize;
+        new
+    }
+
+    /// The tiles `first..=last`.
+    pub(super) fn insert_range(&mut self, first: u64, last: u64) {
+        let mut i = first;
+        while i <= last {
+            let c = i >> CHUNK_SHIFT;
+            let end = last.min(i | CHUNK_MASK);
+            let (lo, hi) = ((i & CHUNK_MASK) as usize, (end & CHUNK_MASK) as usize);
+            let mut added = 0;
+            let words = self.chunk(c);
+            for w in lo / 64..=hi / 64 {
+                let mask = bits(if w == lo / 64 { lo % 64 } else { 0 }, if w == hi / 64 { hi % 64 } else { 63 });
+                added += (mask & !words[w]).count_ones() as usize;
+                words[w] |= mask;
+            }
+            self.len += added;
+            if end == u64::MAX {
+                break;
+            }
+            i = end + 1;
+        }
+    }
+
+    pub(super) fn contains_index(&self, i: u64) -> bool {
+        self.chunks.get(&(i >> CHUNK_SHIFT)).is_some_and(|w| w[(i & CHUNK_MASK) as usize / 64] >> (i % 64) & 1 != 0)
+    }
+
+    /// whether the tile at `a` is in (a 64 KiB aligned address; any other is no tile's)
+    pub(super) fn contains(&self, a: usize) -> bool {
+        a % TILE as usize == 0 && self.contains_index((a / TILE as usize) as u64)
+    }
+
+    /// the tiles' addresses
+    pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.chunks.iter().flat_map(|(&c, words)| {
+            words.iter().enumerate().flat_map(move |(w, &b)| {
+                let base = (c << CHUNK_SHIFT) + w as u64 * 64;
+                BitIter(b).map(move |k| ((base + k as u64) * TILE) as usize)
+            })
+        })
+    }
+
+    /// whether a tile lies in `[base, base + size)` (from the middle of a tile on: that tile too)
+    pub(super) fn any_in(&self, base: usize, size: usize) -> bool {
+        // the tiles from the one `base` is in to the last that starts before the end
+        let first = (base / TILE as usize) as u64;
+        let end = (base.saturating_add(size) as u64).div_ceil(TILE);
+        if first >= end {
+            return false;
+        }
+        // the part of chunk `c` in the range
+        let hit = |c: u64, words: &[u64; CHUNK_WORDS]| {
+            let (from, to) = (first.max(c << CHUNK_SHIFT), (end - 1).min(c << CHUNK_SHIFT | CHUNK_MASK));
+            let (lo, hi) = ((from & CHUNK_MASK) as usize, (to & CHUNK_MASK) as usize);
+            (lo / 64..=hi / 64).any(|w| words[w] & bits(if w == lo / 64 { lo % 64 } else { 0 }, if w == hi / 64 { hi % 64 } else { 63 }) != 0)
+        };
+        let (c0, c1) = (first >> CHUNK_SHIFT, (end - 1) >> CHUNK_SHIFT);
+        // (the chunks of the range looked up, or the chunks there are walked: never the
+        // address space's 2^34 empty ones)
+        if c1 - c0 < self.chunks.len() as u64 {
+            (c0..=c1).any(|c| self.chunks.get(&c).is_some_and(|w| hit(c, w)))
+        } else {
+            self.chunks.iter().any(|(&c, w)| (c0..=c1).contains(&c) && hit(c, w))
+        }
+    }
+
+    /// (tests) the tiles at `addrs`
+    #[cfg(test)]
+    pub(super) fn of(addrs: &[usize]) -> TileSet {
+        let mut t = TileSet::default();
+        for &a in addrs {
+            t.insert((a / TILE as usize) as u64);
+        }
+        t
+    }
+}
+
+struct BitIter(u64);
+
+impl Iterator for BitIter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        (self.0 != 0).then(|| {
+            let b = self.0.trailing_zeros();
+            self.0 &= self.0 - 1;
+            b
+        })
+    }
+}
+
+/// `f` with the value of each tile of `tiles` in `map` (keyed by 64 KiB aligned addresses): the
+/// tiles looked up, or the map walked when it is the shorter – the same values either way.
+pub(super) fn for_each_touched<V, S: std::hash::BuildHasher>(tiles: &TileSet, map: &HashMap<usize, V, S>, mut f: impl FnMut(&V)) {
+    if tiles.len() <= map.len() {
+        for a in tiles.iter() {
+            if let Some(v) = map.get(&a) {
+                f(v);
+            }
+        }
+    } else {
+        for (&a, v) in map {
+            if tiles.contains(a) {
+                f(v);
+            }
+        }
+    }
+}
+
+/// what the lists submitted since the last update touched: tiles, and tagged keys
+#[derive(Default)]
+pub(super) struct FrameKeys {
+    pub(super) tiles: TileSet,
+    pub(super) tagged: FxSet<u64>,
+}
+
+impl FrameKeys {
+    pub(super) fn len(&self) -> usize {
+        self.tiles.len() + self.tagged.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `k` in, unless `FRAME_KEYS_MAX` keys are in already (false: cut).
+    pub(super) fn insert(&mut self, k: u64) -> bool {
+        let full = self.len() >= FRAME_KEYS_MAX;
+        if k & TAGS != 0 {
+            if full && !self.tagged.contains(&k) {
+                return false;
+            }
+            self.tagged.insert(k);
+        } else {
+            if full && !self.tiles.contains_index(k) {
+                return false;
+            }
+            self.tiles.insert(k);
+        }
+        true
+    }
+}
+
+static FRAME: Mutex<Option<FrameKeys>> = Mutex::new(None);
 
 /// The PC lists `lists` were submitted: their logs go in the frame's set (they stay with the
 /// lists: one submitted again counts again).
@@ -332,31 +508,27 @@ pub(super) fn submitted(lists: &[*mut std::ffi::c_void]) {
     }
     let t = Instant::now();
     flush_local();
-    let mut keys = Vec::new();
-    for &l in lists {
-        LOGS.peek(l as usize, |log| keys.extend(log.keys.iter().copied()));
-    }
-    if !keys.is_empty() {
-        let mut cut = 0;
+    let mut cut = 0;
+    {
+        // (`FRAME`, then a part of `LOGS`: nothing takes them the other way round)
         let mut f = FRAME.lock().unwrap_or_else(|e| e.into_inner());
-        let set = f.keys.get_or_insert_with(FxSet::default);
-        for k in keys {
-            if set.len() < FRAME_KEYS_MAX || set.contains(&k) {
-                set.insert(k);
-            } else {
-                cut += 1;
-            }
+        let set = f.get_or_insert_with(FrameKeys::default);
+        for &l in lists {
+            LOGS.peek(l as usize, |log| {
+                for &k in &log.keys {
+                    cut += !set.insert(k) as u64;
+                }
+            });
         }
-        drop(f);
-        if cut != 0 {
-            CUT.fetch_add(cut, Ordering::Relaxed);
-        }
+    }
+    if cut != 0 {
+        CUT.fetch_add(cut, Ordering::Relaxed);
     }
     MERGE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
-fn take_frame() -> FxSet<u64> {
-    FRAME.lock().unwrap_or_else(|e| e.into_inner()).keys.take().unwrap_or_default()
+fn take_frame() -> FrameKeys {
+    FRAME.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -480,54 +652,53 @@ impl Tracker {
 // updates
 // ---------------------------------------------------------------------------------------
 
-/// what the frames since the last update touched, by kind (tiles 64 KiB aligned, sorted)
+/// what the frames since the last update touched, by kind (resources sorted)
 #[derive(Default)]
 pub(super) struct Touched {
-    pub tiles: Vec<usize>,
+    pub tiles: TileSet,
     pub res: Vec<usize>,
     pub psos: usize,
 }
 
-/// `keys` sorted out (`RESOLVE_MAX` at most); a table's slots name resources by `resource_at`,
-/// and a resource of a console buffer is its first `RES_TILES_MAX` tiles (`console_buffer`).
-pub(super) fn sort_keys(keys: impl IntoIterator<Item = u64>, resource_at: impl Fn(usize) -> Option<usize>, console_buffer: impl Fn(usize) -> Option<(usize, usize)>) -> (Touched, u64) {
-    let mut t = Touched::default();
-    let mut tiles = FxSet::default();
+/// `keys` sorted out; a table's slots name resources by `resources_at` (`f` with each one found
+/// at the addresses given), and a resource of a console buffer is its first `RES_TILES_MAX` tiles
+/// (`console_buffers`: `f` with the address and bytes of each of the resources given that is one).
+pub(super) fn sort_keys(
+    keys: FrameKeys,
+    resources_at: impl FnOnce(&[usize], &mut dyn FnMut(usize)),
+    console_buffers: impl FnOnce(&[usize], &mut dyn FnMut(usize, usize)),
+) -> Touched {
+    let mut t = Touched { tiles: keys.tiles, ..Touched::default() };
     let mut res = FxSet::default();
-    let mut cut = 0u64;
-    for (n, k) in keys.into_iter().enumerate() {
-        if n >= RESOLVE_MAX {
-            cut += 1;
-            continue;
-        }
+    let mut slots = Vec::new();
+    for k in keys.tagged {
         match decode(k) {
-            Key::Tile(a) => {
-                tiles.insert(a);
-            }
+            Key::Tile(_) => {}
             Key::Res(r) => {
                 res.insert(r);
             }
             Key::Pso(_) => t.psos += 1,
-            Key::Table(at) => res.extend((0..TABLE_SLOTS).filter_map(|s| resource_at(at + 32 * s))),
+            Key::Table(at) => slots.extend((0..TABLE_SLOTS).map(|s| at + 32 * s)),
         }
     }
-    for &r in &res {
-        if let Some((p, n)) = console_buffer(r) {
-            let (keys, _) = va_keys(p as u64, n.min(RES_TILES_MAX * TILE as usize) as u64);
-            tiles.extend(keys.map(|k| k as usize * TILE as usize));
-        }
-    }
-    t.tiles = tiles.into_iter().collect();
-    t.tiles.sort_unstable();
+    slots.sort_unstable();
+    slots.dedup();
+    resources_at(&slots, &mut |r| {
+        res.insert(r);
+    });
     t.res = res.into_iter().collect();
     t.res.sort_unstable();
-    (t, cut)
+    let tiles = &mut t.tiles;
+    console_buffers(&t.res, &mut |p, n| {
+        let (keys, _) = va_keys(p as u64, n.min(RES_TILES_MAX * TILE as usize) as u64);
+        tiles.insert_range(*keys.start(), *keys.end());
+    });
+    t
 }
 
-/// whether a tile of `tiles` (sorted) lies in `[base, base + size)`
-pub(super) fn any_in(tiles: &[usize], base: usize, size: usize) -> bool {
-    let i = tiles.partition_point(|&a| a < base & !(TILE as usize - 1));
-    tiles.get(i).is_some_and(|&a| a < base + size)
+/// whether a tile of `tiles` lies in `[base, base + size)`
+pub(super) fn any_in(tiles: &TileSet, base: usize, size: usize) -> bool {
+    tiles.any_in(base, size)
 }
 
 /// heaps made since the last update (`made`): what was known at their address goes
@@ -540,16 +711,18 @@ pub(super) fn made(ptr: usize) {
     }
 }
 
+/// The worker's: what is known of the heaps, and the counts since the last log line.
 struct Hot {
     tracker: Tracker,
-    last_update: Option<Instant>,
     last_log: Instant,
-    /// since the last log line: presents, updates, their time (ns, and the longest), keys mapped,
-    /// heaps given a class and `SetResidencyPriority` calls, pipelines touched
-    frames: u64,
+    /// since the last log line: updates, their time (ns, and the longest), the longest scans of
+    /// `sparse` and `vram` (their locks are held for them), keys mapped, heaps given a class and
+    /// `SetResidencyPriority` calls, pipelines touched
     updates: u64,
     update_ns: u64,
     update_max_ns: u64,
+    sparse_max_ns: u64,
+    vram_max_ns: u64,
     mapped: u64,
     changed: u64,
     calls: u64,
@@ -561,40 +734,127 @@ struct Hot {
 // (D3D12 objects are free-threaded; none is held here)
 static HOT_STATE: Mutex<Option<Hot>> = Mutex::new(None);
 
-/// A frame ends (a present): at most every `UPDATE_EVERY`, the touches are mapped onto heaps and
-/// their classes set; every `LOG_EVERY` a line.
+/// presents since the last log line, and their time in `frame` (ns, and the longest)
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+static PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+static PRESENT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Wakes the thread that updates: at a present at most every `UPDATE_EVERY`, with the present's
+/// time (the classes are of then). A present while it is at one does not wait: the next update
+/// is at the latest present's time.
+pub(super) struct Worker {
+    signal: Mutex<Signal>,
+    wake: Condvar,
+}
+
+struct Signal {
+    pending: Option<Instant>,
+    last: Option<Instant>,
+    stop: bool,
+}
+
+impl Worker {
+    pub(super) const fn new() -> Worker {
+        Worker { signal: Mutex::new(Signal { pending: None, last: None, stop: false }), wake: Condvar::new() }
+    }
+
+    /// A present at `now`: whether an update is due (the thread is woken for it).
+    pub(super) fn frame(&self, now: Instant) -> bool {
+        let mut s = self.signal.lock().unwrap_or_else(|e| e.into_inner());
+        if s.last.is_some_and(|t| now.saturating_duration_since(t) < UPDATE_EVERY) {
+            return false;
+        }
+        s.last = Some(now);
+        s.pending = Some(now);
+        drop(s);
+        self.wake.notify_one();
+        true
+    }
+
+    /// The thread's: the next update's time, when it is due (None: stop).
+    pub(super) fn next(&self) -> Option<Instant> {
+        let mut s = self.signal.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if s.stop {
+                return None;
+            }
+            if let Some(t) = s.pending.take() {
+                return Some(t);
+            }
+            s = self.wake.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// The thread ends (tests).
+    #[cfg(test)]
+    pub(super) fn stop(&self) {
+        self.signal.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+        self.wake.notify_all();
+    }
+
+    /// A thread that runs `work` at each update, until `stop`.
+    pub(super) fn spawn(&'static self, mut work: impl FnMut(Instant) + Send + 'static) -> std::io::Result<std::thread::JoinHandle<()>> {
+        std::thread::Builder::new().name("xcl hot residency".into()).spawn(move || {
+            while let Some(now) = self.next() {
+                work(now);
+            }
+        })
+    }
+}
+
+static WORKER: Worker = Worker::new();
+static SPAWN: Once = Once::new();
+/// no thread could be made: the present updates, as it did
+static INLINE: AtomicBool = AtomicBool::new(false);
+
+/// A frame ends (a present): what this thread recorded goes to the lists' logs, and at most every
+/// `UPDATE_EVERY` the worker thread is woken to map the touches onto heaps and set their classes
+/// (every `LOG_EVERY` a line).
 pub(super) fn frame() {
     if !on() {
         return;
     }
-    flush_local();
     let now = Instant::now();
-    // (one update at a time; a present meanwhile does not wait)
-    let Ok(mut g) = HOT_STATE.try_lock() else { return };
+    flush_local();
+    SPAWN.call_once(|| {
+        if let Err(e) = WORKER.spawn(|now| unsafe { update_and_log(now) }) {
+            INLINE.store(true, Ordering::Relaxed);
+            crate::xlog_warn!("hot residency: no worker thread ({e}): the presenting thread updates");
+        }
+    });
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+    if WORKER.frame(now) && INLINE.load(Ordering::Relaxed) {
+        unsafe { update_and_log(now) };
+    }
+    let ns = now.elapsed().as_nanos() as u64;
+    PRESENT_NS.fetch_add(ns, Ordering::Relaxed);
+    PRESENT_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// An update for the present at `now`, and a line when one is due.
+unsafe fn update_and_log(now: Instant) {
+    let start = Instant::now();
+    let mut g = HOT_STATE.lock().unwrap_or_else(|e| e.into_inner());
     let h = g.get_or_insert_with(|| Hot {
         tracker: Tracker::default(),
-        last_update: None,
         last_log: now,
-        frames: 0,
         updates: 0,
         update_ns: 0,
         update_max_ns: 0,
+        sparse_max_ns: 0,
+        vram_max_ns: 0,
         mapped: 0,
         changed: 0,
         calls: 0,
         psos: 0,
         broken: false,
     });
-    h.frames += 1;
-    if h.last_update.is_none_or(|t| now.duration_since(t) >= UPDATE_EVERY) {
-        h.last_update = Some(now);
-        unsafe { update(h, now) };
-        let ns = now.elapsed().as_nanos() as u64;
-        h.updates += 1;
-        h.update_ns += ns;
-        h.update_max_ns = h.update_max_ns.max(ns);
-    }
-    if now.duration_since(h.last_log) >= LOG_EVERY {
+    update(h, now);
+    let ns = start.elapsed().as_nanos() as u64;
+    h.updates += 1;
+    h.update_ns += ns;
+    h.update_max_ns = h.update_max_ns.max(ns);
+    if now.saturating_duration_since(h.last_log) >= LOG_EVERY {
         log(h, now);
     }
 }
@@ -605,17 +865,18 @@ unsafe fn update(h: &mut Hot, now: Instant) {
     for p in std::mem::take(&mut *MADE.lock().unwrap_or_else(|e| e.into_inner())) {
         h.tracker.forget(p);
     }
-    let (t, cut) = sort_keys(keys, super::console_heap::resource_at, super::real::console_buffer);
-    if cut != 0 {
-        CUT.fetch_add(cut, Ordering::Relaxed);
-    }
+    let t = sort_keys(keys, |at, f| super::console_heap::resources_at(at, f), |res, f| super::real::console_buffers_of(res, f));
     h.psos += t.psos as u64;
     h.tracker.begin();
     let mut out: Vec<(ID3D12Heap, Class)> = Vec::new();
     let tracker = &mut h.tracker;
     let mut see = |v: &HeapView| tracker.see(v, now);
+    let t0 = Instant::now();
     super::sparse::hot_scan(&t.tiles, &t.res, &mut see, &mut out);
+    let t1 = Instant::now();
     super::vram::hot_scan(&t.tiles, &t.res, &mut see, &mut out);
+    h.sparse_max_ns = h.sparse_max_ns.max((t1 - t0).as_nanos() as u64);
+    h.vram_max_ns = h.vram_max_ns.max(t1.elapsed().as_nanos() as u64);
     h.tracker.end();
     if out.is_empty() || h.broken {
         return;
@@ -679,29 +940,36 @@ fn log(h: &mut Hot, now: Instant) {
     let (local, _, budget) = super::real::video_memory().unwrap_or((0, 0, 0));
     let headroom = super::vram::vram_headroom();
     let text = line(&h.tracker.tally, super::bind::two_pass_alive_bytes(), budget, headroom, local);
-    let frames = h.frames.max(1);
+    let frames = FRAMES.swap(0, Ordering::Relaxed).max(1);
+    let present = PRESENT_NS.swap(0, Ordering::Relaxed);
+    let present_max = PRESENT_MAX_NS.swap(0, Ordering::Relaxed);
     let merge = MERGE_NS.swap(0, Ordering::Relaxed);
     let recorded = RECORDED.swap(0, Ordering::Relaxed);
     let cut = CUT.swap(0, Ordering::Relaxed);
     crate::xlog_info!(
-        "{text}; cost {:.1} µs a frame on the presenting thread ({} updates, longest {} µs) + {:.1} µs a frame at the submits; {} keys recorded and {} mapped a frame, {} cut, {} pipelines touched an update; {} heaps changed class in {} SetResidencyPriority calls over {} frames",
-        h.update_ns as f64 / 1e3 / frames as f64,
+        "{text}; cost {:.1} µs a frame on the presenting thread (longest {} µs) + {:.1} µs a frame at the submits; worker {:.1} µs per update ({} updates, longest {} µs; sparse scan longest {} µs, vram scan longest {} µs); {} keys recorded and {} mapped a frame, {} cut, {} pipelines touched an update; {} heaps changed class in {} SetResidencyPriority calls over {} frames",
+        present as f64 / 1e3 / frames as f64,
+        present_max / 1000,
+        merge as f64 / 1e3 / frames as f64,
+        h.update_ns as f64 / 1e3 / h.updates.max(1) as f64,
         h.updates,
         h.update_max_ns / 1000,
-        merge as f64 / 1e3 / frames as f64,
+        h.sparse_max_ns / 1000,
+        h.vram_max_ns / 1000,
         recorded / frames,
         h.mapped / frames,
         cut,
         h.psos / h.updates.max(1),
         h.changed,
         h.calls,
-        h.frames
+        frames
     );
     h.last_log = now;
-    h.frames = 0;
     h.updates = 0;
     h.update_ns = 0;
     h.update_max_ns = 0;
+    h.sparse_max_ns = 0;
+    h.vram_max_ns = 0;
     h.mapped = 0;
     h.changed = 0;
     h.calls = 0;

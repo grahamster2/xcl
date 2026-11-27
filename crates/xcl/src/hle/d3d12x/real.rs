@@ -196,6 +196,16 @@ pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
     UMA_BUFFERS.lock().unwrap().as_ref()?.get(&res).map(|&(p, n, _)| (p, n))
 }
 
+/// `f` with the address and bytes of each resource of `res` that is a console buffer
+/// (`XCL_HOT_RESIDENCY`): the lock taken once for each 1024.
+pub fn console_buffers_of(res: &[usize], f: &mut dyn FnMut(usize, usize)) {
+    for part in res.chunks(1024) {
+        let g = UMA_BUFFERS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        part.iter().filter_map(|r| m.get(r)).for_each(|&(p, n, _)| f(p, n));
+    }
+}
+
 /// (tests) `res` taken for a console buffer of `bytes` at `p` (None: forgotten again).
 #[cfg(test)]
 pub(super) fn console_buffer_for_test(res: usize, at: Option<(usize, usize)>) {

@@ -834,6 +834,16 @@ pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
 }
 
+/// `f` with the resource of each view slot of `ats` that has one (`XCL_HOT_RESIDENCY`): the
+/// lock taken once for each 1024.
+pub fn resources_at(ats: &[usize], f: &mut dyn FnMut(usize)) {
+    for part in ats.chunks(1024) {
+        let g = RES.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        part.iter().filter_map(|at| m.get(at)).for_each(|&r| f(r));
+    }
+}
+
 /// The PC resource the descriptor at index `i` of the shared heap names (0: none or not known;
 /// `GONE`: the null view of a destroyed resource) – what a T# with that index in word 0 samples,
 /// whichever slot the T# lies in (`XCL_TRACE_FRAME` diagnostics).
