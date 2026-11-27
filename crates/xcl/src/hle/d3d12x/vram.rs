@@ -629,7 +629,8 @@ fn vram_headroom() -> u64 {
     std::env::var("XCL_VRAM_HEADROOM_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024) << 20
 }
 
-/// MB of video memory kept for GPU-owned targets (`XCL_TARGET_VRAM_MB`, default 2048; 0: none):
+/// MB of video memory kept for GPU-owned targets (`XCL_TARGET_VRAM_MB`, default 0: none – opt-in
+/// until a run proves it, runs 66/67 with 2048 hung the device during world load):
 /// reserve pool heaps made in video memory past the budget, their pages for GPU-owned targets
 /// only (`TilePool::take_batch_for`).
 fn target_vram_reserve_mb() -> u64 {
@@ -637,7 +638,7 @@ fn target_vram_reserve_mb() -> u64 {
 }
 
 fn parse_target_vram_mb(v: Option<&str>) -> u64 {
-    v.and_then(|v| v.trim().parse().ok()).unwrap_or(2048)
+    v.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
 }
 
 /// Where a new pool heap of `bytes` goes with `usage` bytes of local video memory in use and
@@ -831,9 +832,13 @@ impl Pages {
             .and_then(|f| f.EnumAdapterByLuid(dev.GetAdapterLuid()))
             .ok();
         let reserve_mb = target_vram_reserve_mb();
-        crate::xlog_info!(
-            "D3D12.X: XCL_TARGET_VRAM_MB={reserve_mb}: {reserve_mb} MB of video memory reserved for GPU-owned targets (render targets, depth, UAVs): their pool heaps go in video memory past the budget up to it, at residency priority HIGH, and sampled textures do not take their pages"
-        );
+        if reserve_mb == 0 {
+            crate::xlog_info!("D3D12.X: XCL_TARGET_VRAM_MB=0: no video memory reserved for GPU-owned targets (opt-in)");
+        } else {
+            crate::xlog_info!(
+                "D3D12.X: XCL_TARGET_VRAM_MB={reserve_mb}: {reserve_mb} MB of video memory reserved for GPU-owned targets (render targets, depth, UAVs): their new pool heaps go in video memory past the budget up to it (residency priority HIGH with XCL_TARGET_RESIDENCY=1); a page already held at an address is shared whatever heap it is on"
+            );
+        }
         let mut pool = TilePool::new();
         pool.reserve_pages = ((reserve_mb << 20) / PAGE as u64) as usize;
         Some(Pages {
@@ -1015,72 +1020,70 @@ impl Pages {
         let now = std::time::Instant::now();
         self.sweep(now);
 
-        let mut missing = 0usize;
-        let mut preferred: Option<u32> = None;
-        for i in range.clone() {
-            let existing = if i < own {
-                self.pages.get(&page_key(first + i * PAGE, phys.get(i).copied().flatten())).map(|p| p.tile.0)
-            } else {
-                self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
-            };
-            match existing {
-                Some(h) if preferred.is_none() => preferred = Some(h),
-                Some(_) => {}
-                None => missing += 1,
-            }
-        }
-
+        let keys: Vec<PageKey> = range
+            .map(|i| if i < own { PageKey::Own(page_key(first + i * PAGE, phys.get(i).copied().flatten())) } else { PageKey::Extra(va, i) })
+            .collect();
         let pools = &mut self.pools;
-        let pool = &mut self.pool;
         let (adapter, headroom) = (self.adapter.as_ref(), self.headroom);
-        let fresh = pool.take_batch_for(missing, preferred, now, POOL_PAGES, gpu_owned, |ask| {
+        let tiles = share_or_take(&mut self.pool, &mut self.pages, &mut self.extra_pages, &keys, now, gpu_owned, |ask| {
             let (heap, video) = alloc_pool_heap(dev, adapter, headroom, ask)?;
             Some((pools.push_heap(heap), video))
         })?;
-        let mut fresh_iter = fresh.into_iter();
-
-        let mut tiles = Vec::with_capacity(range.len());
-        let mut used = Vec::with_capacity(own.min(range.len()));
+        let mut used = Vec::with_capacity(own.min(keys.len()));
         let mut used_extra = Vec::new();
-        for i in range {
-            let tile = if i < own {
-                let a = page_key(first + i * PAGE, phys.get(i).copied().flatten());
-                let t = match self.pages.get_mut(&a) {
-                    Some(p) => {
-                        p.users += 1;
-                        p.idle_since = None;
-                        p.tile
-                    }
-                    None => {
-                        let t = fresh_iter.next().unwrap();
-                        self.pages.insert(a, Page { tile: t, users: 1, idle_since: None });
-                        t
-                    }
-                };
-                used.push(a);
-                t
-            } else {
-                let k = (va, i);
-                let t = match self.extra_pages.get_mut(&k) {
-                    Some(p) => {
-                        p.users += 1;
-                        p.idle_since = None;
-                        p.tile
-                    }
-                    None => {
-                        let t = fresh_iter.next().unwrap();
-                        self.extra_pages.insert(k, Page { tile: t, users: 1, idle_since: None });
-                        t
-                    }
-                };
-                used_extra.push(k);
-                t
-            };
-            tiles.push(tile);
+        for k in &keys {
+            match *k {
+                PageKey::Own(a) => used.push(a),
+                PageKey::Extra(v, i) => used_extra.push((v, i)),
+            }
         }
         self.map(res, sub, &tiles);
         Some((used, used_extra))
     }
+}
+
+/// The tiles of the pages `keys` of one resource: a page some resource already holds (by its key –
+/// the title address or physical page, `page_key`) is shared whatever heap it is on, a reserve
+/// heap included, for a GPU-owned target and a sampled texture alike; only the pages no one holds
+/// yet get new tiles, and only for those does `TilePool::take_batch_for` choose a heap (the
+/// reserve, `XCL_TARGET_VRAM_MB`, for GPU-owned targets only). Aliasing resources so always see
+/// each other's writes. Each page's users go up by one. None: no tiles for the new pages.
+fn share_or_take(
+    pool: &mut TilePool,
+    pages: &mut std::collections::HashMap<usize, Page>,
+    extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+    keys: &[PageKey],
+    now: std::time::Instant,
+    gpu_owned: bool,
+    make_heap: impl FnMut(Ask) -> Option<(u32, bool)>,
+) -> Option<Vec<Tile>> {
+    let held = |k: &PageKey, pages: &std::collections::HashMap<usize, Page>, extra: &std::collections::HashMap<(usize, usize), Page>| match *k {
+        PageKey::Own(a) => pages.get(&a).map(|p| p.tile),
+        PageKey::Extra(v, i) => extra.get(&(v, i)).map(|p| p.tile),
+    };
+    let mut missing = 0usize;
+    let mut preferred: Option<u32> = None;
+    for k in keys {
+        match held(k, pages, extra_pages) {
+            Some(t) if preferred.is_none() => preferred = Some(t.0),
+            Some(_) => {}
+            None => missing += 1,
+        }
+    }
+    let fresh = pool.take_batch_for(missing, preferred, now, POOL_PAGES, gpu_owned, make_heap)?;
+    let mut fresh = fresh.into_iter();
+    let mut tiles = Vec::with_capacity(keys.len());
+    for k in keys {
+        let mut new_page = || Page { tile: fresh.next().unwrap(), users: 0, idle_since: None };
+        let p = match *k {
+            PageKey::Own(a) => pages.entry(a).or_insert_with(&mut new_page),
+            PageKey::Extra(v, i) => extra_pages.entry((v, i)).or_insert_with(&mut new_page),
+        };
+        p.users += 1;
+        p.idle_since = None;
+        tiles.push(p.tile);
+    }
+    Some(tiles)
 }
 
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall
@@ -2167,7 +2170,7 @@ mod tests {
     fn gpu_owned_targets_get_reserve_heaps_in_video_memory_past_the_budget() {
         let t0 = Instant::now();
         const P: u32 = 4;
-        assert_eq!(parse_target_vram_mb(None), 2048);
+        assert_eq!(parse_target_vram_mb(None), 0, "opt-in");
         assert_eq!(parse_target_vram_mb(Some(" 0 ")), 0);
         assert_eq!(parse_target_vram_mb(Some("512")), 512);
         let mut pool = TilePool::new();
@@ -2226,6 +2229,56 @@ mod tests {
         pool.take_batch_for(1, None, t0, P, true, &mut over_budget).unwrap();
         assert_eq!(*asked.borrow(), [Ask::Any]);
         assert!(!pool.is_reserve(0));
+    }
+
+    /// With the reserve on, resources at the same addresses share their pages whatever heap the
+    /// pages are on: a sampled texture aliasing a GPU-owned target on reserve pages gets those
+    /// very tiles (only its pages no one holds go elsewhere), and a target aliasing a sampled
+    /// texture in system memory gets its tiles, no new heap asked for.
+    #[test]
+    fn aliasing_target_and_sampled_texture_share_pages_with_the_reserve_on() {
+        let t0 = Instant::now();
+        let mut pool = TilePool::new();
+        pool.reserve_pages = 2 * POOL_PAGES as usize;
+        let (mut pages, mut extra) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+        let next = std::cell::Cell::new(0u32);
+        let asked = std::cell::RefCell::new(Vec::new());
+        // over the budget: only `Ask::Reserve` gives a heap in video memory
+        let mut over_budget = |ask: Ask| {
+            asked.borrow_mut().push(ask);
+            let h = next.get();
+            match ask {
+                Ask::Video => None,
+                _ => {
+                    next.set(h + 1);
+                    Some((h, ask == Ask::Reserve))
+                }
+            }
+        };
+        let a = 0x10_0000_0000usize;
+        let target = [PageKey::Own(a), PageKey::Own(a + PAGE), PageKey::Extra(a, 2)];
+        let g = share_or_take(&mut pool, &mut pages, &mut extra, &target, t0, true, &mut over_budget).unwrap();
+        assert!(g.iter().all(|t| pool.is_reserve(t.0 as usize)), "the target on a reserve heap: {g:?}");
+        assert_eq!(*asked.borrow(), [Ask::Reserve]);
+
+        // a sampled texture over the same pages and one more
+        asked.borrow_mut().clear();
+        let sampled = [PageKey::Own(a), PageKey::Own(a + PAGE), PageKey::Extra(a, 2), PageKey::Own(a + 2 * PAGE)];
+        let s = share_or_take(&mut pool, &mut pages, &mut extra, &sampled, t0, false, &mut over_budget).unwrap();
+        assert_eq!(s[..3], g[..], "the aliased pages are the target's, on the reserve heap");
+        assert!(!pool.is_reserve(s[3].0 as usize), "its own new page is not reserve memory: {s:?}");
+        assert_eq!(*asked.borrow(), [Ask::Any]);
+        assert_eq!((pages[&a].users, pages[&(a + PAGE)].users, extra[&(a, 2)].users, pages[&(a + 2 * PAGE)].users), (2, 2, 2, 1));
+
+        // the reverse: a sampled texture first (system memory), then a target over its pages
+        let b = 0x20_0000_0000usize;
+        let keys = [PageKey::Own(b), PageKey::Own(b + PAGE)];
+        let s = share_or_take(&mut pool, &mut pages, &mut extra, &keys, t0, false, &mut over_budget).unwrap();
+        asked.borrow_mut().clear();
+        let g = share_or_take(&mut pool, &mut pages, &mut extra, &keys, t0, true, &mut over_budget).unwrap();
+        assert_eq!(g, s, "the target shares the sampled texture's pages");
+        assert!(asked.borrow().is_empty(), "no heap asked for: {:?}", asked.borrow());
+        assert_eq!(pages[&b].users, 2);
     }
 
     /// Empty heaps in system memory are given back before those in video memory: the spares

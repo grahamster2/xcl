@@ -12,7 +12,7 @@
 //!   the pool heaps of title texture pages in video memory (`vram::alloc_pool_heap`), and a
 //!   title's buffers-only heap once its buffers live in unified memory (its PC heap is then
 //!   never used).
-//! * By default (`XCL_TARGET_RESIDENCY=0` turns it off): GPU-owned targets, the reserve pool
+//! * `XCL_TARGET_RESIDENCY=1` (off by default until proven in a run): GPU-owned targets, the reserve pool
 //!   heaps of their pages (`XCL_TARGET_VRAM_MB`) and the video-memory arenas, get HIGH priority,
 //!   and the sparse tile pools LOW (unless `XCL_RESIDENCY` asks for more): over the budget the
 //!   OS pages sparse tiles out before the render targets, depth and UAVs the GPU writes every
@@ -51,8 +51,9 @@ fn hot_priority() -> Option<D3D12_RESIDENCY_PRIORITY> {
     })
 }
 
+// (off by default until a run proves it: runs 66/67 with the target reserve hung the device)
 fn parse_targeted(v: Option<&str>) -> bool {
-    !matches!(v.map(str::trim), Some("0" | "off" | "false" | "no"))
+    matches!(v.map(str::trim), Some("1" | "on" | "true" | "yes"))
 }
 
 fn targeted_on() -> bool {
@@ -188,7 +189,7 @@ mod tests {
         assert!(parse_cold(Some("1")));
         assert!(!parse_cold(Some("0")));
         assert!(!parse_cold(None));
-        assert!(parse_targeted(None), "on by default");
+        assert!(!parse_targeted(None), "off by default");
         assert!(parse_targeted(Some("1")));
         assert!(!parse_targeted(Some(" 0 ")));
         assert!(!parse_targeted(Some("off")));
