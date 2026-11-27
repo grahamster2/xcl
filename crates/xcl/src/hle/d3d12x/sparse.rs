@@ -46,8 +46,127 @@ const PARKED_MAX: usize = 4096;
 const PENDING_MAX: usize = 4096;
 /// a pool tile freed is not reused before this (`State::cooling`): work the title submitted
 /// before its unmap may still read it on the title's queues, and the sparse queue that maps,
-/// clears and fills it for its next address does not wait for those
+/// clears and fills it for its next address does not wait for those. With
+/// `XCL_TILE_FENCE_REUSE=0` it is all that guards a tile a placed buffer let go of, and a pool
+/// heap retired (`ReusePolicy`).
 const COOL: std::time::Duration = std::time::Duration::from_secs(2);
+/// the time a freed pool tile still cools once every title queue is past its free
+/// (`ReusePolicy`, `XCL_TILE_FENCE_REUSE` on): the fences gate it, this is a floor
+const FENCED_COOL: std::time::Duration = std::time::Duration::from_millis(250);
+/// a freed tile or retired heap waiting this long for a title queue's fence is warned about once
+/// (a queue that never gets there: hung, or waiting for something that never comes)
+const FENCE_WAIT_WARN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// When a freed pool tile (`State::cooling`) or retired pool heap (`State::retired`) may be used
+/// again or released. `fences` (`XCL_TILE_FENCE_REUSE`, on unless `0`): only once every title
+/// queue is past the work submitted before the free – each is signalled on an XCL fence then
+/// (`State::stamp_title_queues`) – and `cool` after the free at the earliest (`XCL_TILE_COOL_MS`,
+/// `FENCED_COOL` by default). Off: as before, `COOL` of wall-clock time for a tile a placed buffer
+/// let go of and for a heap, with the title queues marked only for tiles unmapped from a window
+/// (`flush_parked`). The title's GPU frames took 0.7-1.8 s on an RTX 3080, and a world load
+/// queues more: work submitted before a free could still run 2 s later, on memory already
+/// mapped, cleared and filled for another address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReusePolicy {
+    fences: bool,
+    cool: std::time::Duration,
+}
+
+impl ReusePolicy {
+    /// The policy `XCL_TILE_FENCE_REUSE` (`fences`) and `XCL_TILE_COOL_MS` (`cool_ms`) ask for.
+    /// Without the fences the wall clock is all there is: no less than `COOL` then.
+    fn parse(fences: Option<&str>, cool_ms: Option<&str>) -> Self {
+        let fences = !fences.map(str::trim).is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"));
+        let asked = cool_ms.and_then(|v| v.trim().parse::<u64>().ok()).map(std::time::Duration::from_millis);
+        let cool = if fences { asked.unwrap_or(FENCED_COOL) } else { asked.unwrap_or(COOL).max(COOL) };
+        Self { fences, cool }
+    }
+
+    /// A new state's: the environment's (a test's state: fences, and `COOL` as before, its
+    /// timings made for that; a test of the policy sets its own)
+    fn for_state() -> Self {
+        if cfg!(test) {
+            Self { fences: true, cool: COOL }
+        } else {
+            Self::from_env()
+        }
+    }
+
+    fn from_env() -> Self {
+        static P: std::sync::OnceLock<ReusePolicy> = std::sync::OnceLock::new();
+        *P.get_or_init(|| Self::parse(std::env::var("XCL_TILE_FENCE_REUSE").ok().as_deref(), std::env::var("XCL_TILE_COOL_MS").ok().as_deref()))
+    }
+}
+
+/// `State::reuse`: the policy, and what it keeps
+struct TileReuse {
+    policy: ReusePolicy,
+    /// pool tiles a placed buffer let go of (`release_if_unused`, with `fences`), quarantined
+    /// behind the title queues at the next `drain_quarantined` (the release can come from the
+    /// buffer's last Release, inside D3D12: no queue is signalled there)
+    released: Vec<(u32, u32)>,
+    /// `FENCE_WAIT_WARN` was warned about
+    warned: bool,
+    /// when the cooling line was last logged (`cooling_line`, once a minute)
+    logged: std::time::Instant,
+}
+
+impl TileReuse {
+    fn new(policy: ReusePolicy) -> Self {
+        Self { policy, released: Vec::new(), warned: false, logged: std::time::Instant::now() }
+    }
+}
+
+/// Whether every fence mark (queue key, fence, value) is reached. A queue's fence reads
+/// `u64::MAX` once the device is removed: done then too. (A title queue destroyed meanwhile is
+/// not gone: XCL holds it in `State::queue_fences`, and the Signal queued on it still runs.)
+fn marks_done<F>(marks: &[(usize, F, u64)], mut completed: impl FnMut(&F) -> u64) -> bool {
+    marks.iter().all(|(_, f, v)| completed(f) >= *v)
+}
+
+/// The cooling line (`State::cooling_line`): `total` freed tiles not usable yet, `waiting` of them
+/// for a title queue's fence, the `longest` such wait, the retired heaps not released yet.
+fn cooling_text(total: usize, waiting: usize, longest: std::time::Duration, heaps: usize, policy: ReusePolicy) -> String {
+    let how = if policy.fences {
+        format!("used again once the title's queues are past their free and {} ms went by (XCL_TILE_FENCE_REUSE)", policy.cool.as_millis())
+    } else {
+        format!("used again {} ms after their free (XCL_TILE_FENCE_REUSE=0)", policy.cool.as_millis())
+    };
+    format!("sparse windows: {total} tiles cooling ({waiting} waiting on title fences, longest wait {} ms), {heaps} retired pool heaps not released yet; {how}", longest.as_millis())
+}
+
+/// The startup line of Windows' GPU timeout detection (`HKLM\SYSTEM\CurrentControlSet\Control\
+/// GraphicsDrivers`; None: not set, Windows' default), to tell a timeout from a fault in a
+/// DEVICE_HUNG later: GPU work running past `TdrDelay` is reset as hung too.
+fn tdr_line(level: Option<u32>, delay: Option<u32>, ddi_delay: Option<u32>) -> String {
+    let v = |x: Option<u32>, default: u32, unit: &str| match x {
+        Some(x) => format!("{x}{unit}"),
+        None => format!("{default}{unit} (not set: the default)"),
+    };
+    format!(
+        "D3D12.X: Windows GPU timeout detection: TdrLevel {}, TdrDelay {}, TdrDdiDelay {} - a GPU job running longer than TdrDelay is reset as hung (DXGI_ERROR_DEVICE_HUNG), not only a fault",
+        v(level, 3, ""),
+        v(delay, 2, " s"),
+        v(ddi_delay, 5, " s")
+    )
+}
+
+/// `tdr_line`, read from the registry (read only) and logged once.
+fn log_tdr_settings() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+        let key: Vec<u16> = "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers\0".encode_utf16().collect();
+        let read = |name: &str| -> Option<u32> {
+            let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let (mut data, mut size) = (0u32, std::mem::size_of::<u32>() as u32);
+            // SAFETY: NUL-terminated names, a DWORD to fill and its size
+            let r = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), &mut data as *mut u32 as *mut c_void, &mut size) };
+            (r == 0).then_some(data)
+        };
+        crate::xlog_info!("{}", tdr_line(read("TdrLevel"), read("TdrDelay"), read("TdrDdiDelay")));
+    });
+}
 /// bytes of the ring-buffered upload staging buffer
 const STAGING: usize = 64 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
@@ -376,15 +495,15 @@ fn zero_runs(pieces: BTreeSet<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
-/// Whether the oldest tile of `cooling` was freed `COOL` ago or more at `now`
-fn cooled(cooling: &VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> bool {
-    cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL)
+/// Whether the oldest tile of `cooling` was freed `cool` ago or more at `now`
+fn cooled(cooling: &VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant, cool: std::time::Duration) -> bool {
+    cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= cool)
 }
 
 /// The pool tile to use next (`State::take_tile`): the oldest of `cooling` if it cooled, else
-/// one of `free`. None: neither, though tiles freed less than `COOL` ago may be cooling.
-fn reuse_tile(free: &mut Vec<(u32, u32)>, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> Option<(u32, u32)> {
-    if cooled(cooling, now) {
+/// one of `free`. None: neither, though tiles freed less than `cool` ago may be cooling.
+fn reuse_tile(free: &mut Vec<(u32, u32)>, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant, cool: std::time::Duration) -> Option<(u32, u32)> {
+    if cooled(cooling, now, cool) {
         return cooling.pop_front().map(|(t, _)| t);
     }
     free.pop()
@@ -392,8 +511,8 @@ fn reuse_tile(free: &mut Vec<(u32, u32)>, cooling: &mut VecDeque<((u32, u32), st
 
 /// The pool heaps (`pools` of them) all of whose tiles are in `free` or cooled in `cooling` at
 /// `now` (`State::retire_free_pools`): a tile still cooling keeps its heap.
-fn free_heaps(free: &[(u32, u32)], cooling: &VecDeque<((u32, u32), std::time::Instant)>, pools: usize, now: std::time::Instant) -> Vec<usize> {
-    let ready = cooling.iter().take_while(|&&(_, at)| now.duration_since(at) >= COOL).map(|&(t, _)| t);
+fn free_heaps(free: &[(u32, u32)], cooling: &VecDeque<((u32, u32), std::time::Instant)>, pools: usize, now: std::time::Instant, cool: std::time::Duration) -> Vec<usize> {
+    let ready = cooling.iter().take_while(|&&(_, at)| now.duration_since(at) >= cool).map(|&(t, _)| t);
     if free.len() + ready.clone().count() < POOL_TILES as usize {
         return Vec::new();
     }
@@ -407,10 +526,10 @@ fn free_heaps(free: &[(u32, u32)], cooling: &VecDeque<((u32, u32), std::time::In
 }
 
 /// Whether a submit that freed no tile tries `State::retire_free_pools` at `now`: when a tile
-/// of `cooling` cooled or a heap waits in `retired` (`waiting`), and `COOL` after the last try
+/// of `cooling` cooled or a heap waits in `retired` (`waiting`), and `cool` after the last try
 /// (`tried`) at the earliest (a try counts the cooled tiles).
-fn retire_due(cooling: &VecDeque<((u32, u32), std::time::Instant)>, waiting: bool, tried: std::time::Instant, now: std::time::Instant) -> bool {
-    (waiting || cooled(cooling, now)) && now.duration_since(tried) >= COOL
+fn retire_due(cooling: &VecDeque<((u32, u32), std::time::Instant)>, waiting: bool, tried: std::time::Instant, now: std::time::Instant, cool: std::time::Duration) -> bool {
+    (waiting || cooled(cooling, now, cool)) && now.duration_since(tried) >= cool
 }
 
 struct UploadSlot {
@@ -472,8 +591,9 @@ enum Drain {
 
 struct RetiredTiles {
     tiles: Vec<(u32, u32)>,
-    /// Fence marks on `self.queue` and every known title queue (`None` = signal failed, keep held).
-    marks: Option<Vec<(ID3D12Fence, u64)>>,
+    /// Fence marks (queue key, fence, value) on `self.queue` (key 0) and every known title queue
+    /// (`None` = signal failed, keep held: `XCL_TILE_FENCE_REUSE=0` only).
+    marks: Option<Vec<(usize, ID3D12Fence, u64)>>,
     /// when they were unmapped: they cool (`State::cooling`) from then on once the marks are reached
     at: std::time::Instant,
 }
@@ -518,9 +638,12 @@ struct State {
     /// filled for another address on the sparse queue while title work submitted before the
     /// unmap could still read it.
     cooling: VecDeque<((u32, u32), std::time::Instant)>,
-    /// pools all of whose tiles came free: released once the GPU is past `value` and a moment
+    /// pools all of whose tiles came free: released once the GPU is past `value`, every title
+    /// queue past its mark then (`ReusePolicy::fences`; none without) and `ReusePolicy::cool`
     /// went by (titles' queues may still read what was mapped there)
-    retired: Vec<(ID3D12Heap, u64, std::time::Instant)>,
+    retired: Vec<(ID3D12Heap, u64, std::time::Instant, Vec<(usize, ID3D12Fence, u64)>)>,
+    /// when freed tiles and retired heaps may be used again or go, and what that keeps
+    reuse: TileReuse,
     /// when `retire_free_pools` last ran (`retire_due`)
     retire_tried: std::time::Instant,
     /// tile address → pool tile + uncommitted page hole mask + per-page sent chunk hashes
@@ -945,7 +1068,7 @@ pub fn pool_bytes() -> (usize, usize) {
     let _held = holding(Holder::Other);
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
-    let quarantined: usize = s.quarantined.iter().map(|b| b.tiles.len()).sum();
+    let quarantined: usize = s.quarantined.iter().map(|b| b.tiles.len()).sum::<usize>() + s.reuse.released.len();
     (pools, pools.saturating_sub((s.free.len() + s.cooling.len() + quarantined) * TILE))
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
@@ -1075,6 +1198,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         cooling: VecDeque::new(),
         retired: Vec::new(),
         retire_tried: std::time::Instant::now(),
+        reuse: TileReuse::new(ReusePolicy::for_state()),
         mapped: FxHashMap::default(),
         pinned: FxHashMap::default(),
         parked: FxHashMap::default(),
@@ -1156,6 +1280,7 @@ pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &
 /// sparse window in `gpu::uma` and each view window, made the same way (empty: no sparse
 /// windows). Nothing of a view window is mapped here: its tiles get video memory when asked for.
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
+    log_tdr_settings();
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
     let mut out = Vec::new();
     let mut windows = Vec::new();
@@ -1183,6 +1308,14 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         Ok(mut s) => {
             let views = out.iter().filter(|w| u.is_view_window(w.0)).count();
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory and {views} for GPU views of it (tiled buffers on video memory)", out.len() - views);
+            crate::xlog_info!(
+                "D3D12.X: sparse tiles freed are {}",
+                if s.reuse.policy.fences {
+                    format!("used again once every title queue is past the work submitted before the free, {} ms later at the earliest (XCL_TILE_FENCE_REUSE=0: as before)", s.reuse.policy.cool.as_millis())
+                } else {
+                    format!("used again {} ms after the free (XCL_TILE_FENCE_REUSE=0)", s.reuse.policy.cool.as_millis())
+                }
+            );
             let sw = view_switches();
             if let Some(pattern) = sw.poison {
                 s.poison_windows(pattern);
@@ -1233,14 +1366,15 @@ impl State {
             return None;
         }
         self.drain_quarantined();
-        if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now()) {
+        if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now(), self.reuse.policy.cool) {
             return Some((t, true));
         }
         // a pool retired a moment ago (its last tile came free) is taken back before a new
         // heap is made: freeing and allocating a tile in turn made a new pool each time,
         // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
-        // (zeroed), and they all cooled before it was retired.
-        if let Some((heap, _, _)) = self.retired.pop() {
+        // (zeroed), and they all cooled before it was retired (past their own title queue
+        // marks, with `ReusePolicy::fences`: the heap's marks are for its release).
+        if let Some((heap, _, _, _)) = self.retired.pop() {
             let h = self.add_pool(heap);
             return Some(((h, 0), true));
         }
@@ -1282,17 +1416,31 @@ impl State {
         h
     }
 
-    /// Pools whose every tile is free again (cooled, `COOL`) go (their video memory –
+    /// Pools whose every tile is free again (cooled, `ReusePolicy::cool`) go (their video memory –
     /// and as much of the system's commit: a retail game's homes of physical pages left 0.75 GB
     /// of pools for 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
+    /// A heap retired goes once the sparse queue and (`ReusePolicy::fences`) every title queue
+    /// are past their marks of its retirement, and `cool` later at the earliest.
     fn retire_free_pools(&mut self) {
         let now = std::time::Instant::now();
         self.retire_tried = now;
+        let cool = self.reuse.policy.cool;
         let done = unsafe { super::real::fence_completed(&self.fence) };
-        self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
+        let mut longest: Option<std::time::Duration> = None;
+        self.retired.retain(|(_, v, at, marks)| {
+            let waited = now.duration_since(*at);
+            let fenced = marks_done(marks, |f| unsafe { super::real::fence_completed(f) });
+            if !fenced {
+                longest = longest.max(Some(waited));
+            }
+            !(done >= *v && waited >= cool && fenced)
+        });
+        if let Some(w) = longest {
+            self.warn_fence_wait(w, "a retired pool heap");
+        }
         // (a flag a pool: a title's world load frees hundreds of pools' worth of tiles at once)
         let mut gone = vec![false; self.pools.len()];
-        for h in free_heaps(&self.free, &self.cooling, self.pools.len(), now) {
+        for h in free_heaps(&self.free, &self.cooling, self.pools.len(), now, cool) {
             gone[h] = self.pools[h].is_some();
         }
         if !gone.contains(&true) {
@@ -1300,11 +1448,53 @@ impl State {
         }
         self.free.retain(|&(h, _)| !gone[h as usize]);
         self.cooling.retain(|&((h, _), _)| !gone[h as usize]);
+        // (one mark of each title queue for all the heaps retired now)
+        let marks = if self.reuse.policy.fences { unsafe { self.stamp_title_queues() } } else { Vec::new() };
         for h in (0..gone.len()).filter(|&h| gone[h]) {
             if let Some(heap) = self.pools[h].take() {
-                self.retired.push((heap, self.value, now));
+                self.retired.push((heap, self.value, now, marks.clone()));
             }
         }
+    }
+
+    /// Warn once that a freed tile or retired heap (`what`) has waited `waited` for a title queue's
+    /// fence, when that is `FENCE_WAIT_WARN` or more: the queue never got past the work submitted
+    /// before the free (hung, or waiting for something that never comes). Its memory stays held.
+    fn warn_fence_wait(&mut self, waited: std::time::Duration, what: &str) {
+        if !self.reuse.policy.fences || self.reuse.warned || waited < FENCE_WAIT_WARN {
+            return;
+        }
+        self.reuse.warned = true;
+        let behind: Vec<String> = self
+            .queue_fences
+            .iter()
+            .map(|(&k, (_, f, v))| (k, unsafe { super::real::fence_completed(f) }, *v))
+            .filter(|&(_, at, v)| at < v)
+            .map(|(k, at, v)| format!("{k:#x} at {at} of {v}"))
+            .collect();
+        crate::xlog_warn!(
+            "sparse windows: {what} has waited {} ms for the title's queues to finish the work submitted before it was freed (XCL_TILE_FENCE_REUSE); queues behind: {} - its video memory stays held (warned once)",
+            waited.as_millis(),
+            if behind.is_empty() { "none now".to_string() } else { behind.join(", ") }
+        );
+    }
+
+    /// The cooling line (`before_execute_on`, once a minute): the freed tiles not usable yet, those
+    /// of them waiting for a title queue's fence (not yet stamped, or a mark not reached), and the
+    /// longest such wait now.
+    fn cooling_line(&self) -> String {
+        let now = std::time::Instant::now();
+        let quarantined: usize = self.quarantined.iter().map(|b| b.tiles.len()).sum();
+        let mut waiting = self.reuse.released.len();
+        let mut longest = std::time::Duration::ZERO;
+        for b in &self.quarantined {
+            if !b.marks.as_ref().is_some_and(|m| marks_done(m, |f| unsafe { super::real::fence_completed(f) })) {
+                waiting += b.tiles.len();
+                longest = longest.max(now.duration_since(b.at));
+            }
+        }
+        let cooling = self.cooling.iter().filter(|&&(_, at)| now.duration_since(at) < self.reuse.policy.cool).count();
+        cooling_text(cooling + quarantined + self.reuse.released.len(), waiting, longest, self.retired.len(), self.reuse.policy)
     }
 
     /// Map `tiles` (tile addresses) of `res` (starting at `res_base`) onto pool tiles,
@@ -1516,7 +1706,7 @@ impl State {
         let (mut got, mut left) = (0, 0);
         while t < end {
             if self.mapped.get(&t).is_some_and(|e| e.pool == LAZY) {
-                let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now()) || !self.retired.is_empty();
+                let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now(), self.reuse.policy.cool) || !self.retired.is_empty();
                 let wait = left > 0 || (!force && self.short_of_memory() && !at_hand);
                 match if wait { None } else { self.take_tile() } {
                     Some((tile, used)) => {
@@ -3009,9 +3199,10 @@ impl State {
         }
     }
 
-    /// A pool tile a buffer used at `t` is freed (`cooling`), unless its window maps it, it
-    /// is parked there, it waits in `quarantined`, or another buffer uses it. Kept mapped for
-    /// the buffer: parked from here on.
+    /// A pool tile a buffer used at `t` is freed (`cooling`; with `ReusePolicy::fences` behind the
+    /// title queues first: `TileReuse::released`), unless its window maps it, it is parked there,
+    /// it waits in `quarantined`, or another buffer uses it. Kept mapped for the buffer: parked
+    /// from here on.
     fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
         if self.pinned.contains_key(&tile) {
             return;
@@ -3024,8 +3215,14 @@ impl State {
         if self.mapped.get(&t).is_none_or(|e| e.pool != tile)
             && self.parked.get(&t) != Some(&tile)
             && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
+            && !self.reuse.released.contains(&tile)
         {
-            self.cooling.push_back((tile, std::time::Instant::now()));
+            if self.reuse.policy.fences {
+                // (the title's work on the buffer, submitted before its release, may still run)
+                self.reuse.released.push(tile);
+            } else {
+                self.cooling.push_back((tile, std::time::Instant::now()));
+            }
         }
     }
 
@@ -3058,22 +3255,60 @@ impl State {
                 }
             }
         }
+        // (XCL's texture uploads read the title's memory on queues of their own)
+        if self.reuse.policy.fences {
+            for q in super::title_textures::upload_queues() {
+                ok &= self.note_queue(&q);
+            }
+        }
         ok
+    }
+
+    /// A fence mark on every title queue (`sync_known_queues`, `note_queue`): its XCL fence
+    /// signalled now, behind all it was given so far. A queue whose Signal fails (a removed
+    /// device) gets none (warned once). Nothing waits on the CPU for these: `drain_quarantined`
+    /// and `retire_free_pools` look at them.
+    unsafe fn stamp_title_queues(&mut self) -> Vec<(usize, ID3D12Fence, u64)> {
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        self.sync_known_queues();
+        let mut marks = Vec::with_capacity(self.queue_fences.len());
+        for (&k, (q, fence, val)) in self.queue_fences.iter_mut() {
+            let next = *val + 1;
+            match q.Signal(&*fence, next) {
+                Ok(()) => {
+                    *val = next;
+                    marks.push((k, fence.clone(), next));
+                }
+                Err(e) if !FAILED.swap(true, Ordering::Relaxed) => {
+                    crate::xlog_warn!("sparse windows: no fence mark on title queue {k:#x} for a freed tile ({e}): it is not waited for (warned once)");
+                }
+                Err(_) => {}
+            }
+        }
+        marks
     }
 
     unsafe fn quarantine_tiles(&mut self, tiles: Vec<(u32, u32)>) {
         if tiles.is_empty() {
             return;
         }
+        let own = (0usize, self.fence.clone(), self.value);
+        if self.reuse.policy.fences {
+            let mut marks = vec![own];
+            marks.extend(self.stamp_title_queues());
+            self.quarantined.push_back(RetiredTiles { tiles, marks: Some(marks), at: std::time::Instant::now() });
+            return;
+        }
+        // (`XCL_TILE_FENCE_REUSE=0`: as before, and a Signal that fails keeps the tiles for good)
         let mut ok = self.sync_known_queues();
         let mut marks = Vec::with_capacity(1 + self.queue_fences.len());
-        marks.push((self.fence.clone(), self.value));
+        marks.push(own);
         if ok {
-            for (q, fence, val) in self.queue_fences.values_mut() {
+            for (&k, (q, fence, val)) in self.queue_fences.iter_mut() {
                 let next = *val + 1;
                 if q.Signal(&*fence, next).is_ok() {
                     *val = next;
-                    marks.push((fence.clone(), next));
+                    marks.push((k, fence.clone(), next));
                 } else {
                     ok = false;
                     break;
@@ -3086,11 +3321,20 @@ impl State {
     /// The `quarantined` tiles the GPU is past go to `cooling` (from when they were unmapped).
     /// (XCL's own query of the fences: the title's `GetCompletedValue` hook takes the state's
     /// lock, which the caller holds.)
+    /// Tiles a placed buffer let go of (`TileReuse::released`) are quarantined first.
     unsafe fn drain_quarantined(&mut self) -> bool {
+        if !self.reuse.released.is_empty() {
+            let tiles = std::mem::take(&mut self.reuse.released);
+            self.quarantine_tiles(tiles);
+        }
         let mut freed = false;
         while let Some(front) = self.quarantined.front() {
-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| super::real::fence_completed(f) >= *v));
+            let ready = front.marks.as_ref().is_some_and(|marks| marks_done(marks, |f| super::real::fence_completed(f)));
             if !ready {
+                if self.reuse.policy.fences && !self.reuse.warned {
+                    let waited = front.at.elapsed();
+                    self.warn_fence_wait(waited, "a freed sparse tile");
+                }
                 break;
             }
             let batch = self.quarantined.pop_front().unwrap();
@@ -3573,7 +3817,7 @@ impl State {
             // (a moment after a heap could not be made, only tiles at hand: parked ones and those
             // still quarantined or cooling are not)
             self.drain_quarantined();
-            let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now()) || !self.retired.is_empty();
+            let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now(), self.reuse.policy.cool) || !self.retired.is_empty();
             let wait = at_cap || (!force && self.short_of_memory() && !at_hand);
             let got = if wait { None } else { self.take_tile() };
             let Some((tile, reused)) = got else {
@@ -4527,8 +4771,14 @@ impl State {
         s.note_queue(queue);
         let flushed = s.flush_parked();
         s.drain_quarantined();
-        if flushed || retire_due(&s.cooling, !s.retired.is_empty(), s.retire_tried, std::time::Instant::now()) {
+        if flushed || retire_due(&s.cooling, !s.retired.is_empty(), s.retire_tried, std::time::Instant::now(), s.reuse.policy.cool) {
             s.retire_free_pools();
+        }
+        if s.reuse.logged.elapsed() >= std::time::Duration::from_secs(60) {
+            s.reuse.logged = std::time::Instant::now();
+            if s.pools.iter().any(|p| p.is_some()) {
+                crate::xlog_info!("{}", s.cooling_line());
+            }
         }
         let t_locked = std::time::Instant::now();
         PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
@@ -5168,6 +5418,7 @@ mod tests {
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
+                reuse: TileReuse::new(ReusePolicy { fences: true, cool: COOL }),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
@@ -5558,6 +5809,7 @@ mod tests {
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
+                reuse: TileReuse::new(ReusePolicy { fences: true, cool: COOL }),
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 pending: Vec::new(),
@@ -5795,6 +6047,7 @@ mod tests {
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
+                reuse: TileReuse::new(ReusePolicy { fences: true, cool: COOL }),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
@@ -5921,6 +6174,7 @@ mod tests {
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
                 retire_tried: std::time::Instant::now(),
+                reuse: TileReuse::new(ReusePolicy { fences: true, cool: COOL }),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
@@ -6533,6 +6787,180 @@ mod tests {
             s.wait_for(s.value);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `XCL_TILE_FENCE_REUSE` is on unless `0`; with it a freed tile cools `FENCED_COOL` (or
+    /// `XCL_TILE_COOL_MS`), without it `COOL` at the least.
+    #[test]
+    fn the_tile_reuse_policy_switch_and_floor() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(ReusePolicy::parse(None, None), ReusePolicy { fences: true, cool: FENCED_COOL });
+        assert_eq!(ReusePolicy::parse(Some("1"), Some("1000")), ReusePolicy { fences: true, cool: ms(1000) });
+        assert_eq!(ReusePolicy::parse(Some("0"), None), ReusePolicy { fences: false, cool: COOL }, "off: the wall clock as before");
+        assert_eq!(ReusePolicy::parse(Some(" off "), Some("100")), ReusePolicy { fences: false, cool: COOL }, "off: no less than COOL");
+        assert_eq!(ReusePolicy::parse(Some("0"), Some("5000")), ReusePolicy { fences: false, cool: ms(5000) });
+        assert_eq!(ReusePolicy::parse(None, Some("nope")), ReusePolicy { fences: true, cool: FENCED_COOL });
+        // the fence marks: every one reached, a removed device's fence (u64::MAX) too
+        let marks = [(0usize, 0usize, 5u64), (0x10, 1, 7)];
+        assert!(!marks_done(&marks, |&f| [5, 6][f]), "a title queue short of its mark");
+        assert!(marks_done(&marks, |&f| [5, 7][f]));
+        assert!(marks_done(&marks, |&f| [5, u64::MAX][f]), "a removed device");
+        assert!(marks_done::<usize>(&[], |_| 0));
+        assert_eq!(
+            cooling_text(70, 64, ms(1234), 1, ReusePolicy::parse(None, None)),
+            "sparse windows: 70 tiles cooling (64 waiting on title fences, longest wait 1234 ms), 1 retired pool heaps not released yet; used again once the title's queues are past their free and 250 ms went by (XCL_TILE_FENCE_REUSE)"
+        );
+        assert_eq!(
+            tdr_line(None, Some(8), None),
+            "D3D12.X: Windows GPU timeout detection: TdrLevel 3 (not set: the default), TdrDelay 8 s, TdrDdiDelay 5 s (not set: the default) - a GPU job running longer than TdrDelay is reset as hung (DXGI_ERROR_DEVICE_HUNG), not only a fault"
+        );
+    }
+
+    /// A state for the reuse tests: `policy`, one pool tile taken (`(pool tile, title queue,
+    /// its gate)`), nothing free, the title queue noted and held at its gate (work the title
+    /// submitted that has not run yet).
+    unsafe fn reuse_state(policy: ReusePolicy) -> (usize, State, (u32, u32), ID3D12CommandQueue, ID3D12Fence) {
+        let (base, mut s) = test_state_with_reserved(2);
+        s.reuse = TileReuse::new(policy);
+        let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+        assert!(s.note_queue(&title_q));
+        let (tile, _) = s.take_tile().expect("a pool tile");
+        s.free.clear();
+        let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+        title_q.Wait(&gate, 1).expect("gate title queue");
+        (base, s, tile, title_q, gate)
+    }
+
+    /// Until `s` drains `tile` to `cooling` (5 s at most).
+    unsafe fn drained(s: &mut State, tile: (u32, u32)) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            s.drain_quarantined();
+            if s.cooling.iter().any(|c| c.0 == tile) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
+    /// A pool tile a placed buffer let go of while a title queue still had work submitted before
+    /// it is not used again before that work is done, however long ago it was freed; then it is.
+    /// Before, it cooled 2 s of wall-clock time and was used again with the work still pending.
+    #[test]
+    fn a_tile_freed_while_a_title_fence_is_pending_waits_for_it() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s, tile, _title_q, gate) = reuse_state(ReusePolicy { fences: true, cool: std::time::Duration::ZERO });
+            let _unblock = SignalOnDrop(gate.clone(), 1);
+            s.release_if_unused(base, tile);
+            assert_eq!(s.reuse.released, vec![tile], "behind the title queues first");
+            assert!(!s.cooling.iter().any(|c| c.0 == tile));
+            s.drain_quarantined();
+            assert!(s.reuse.released.is_empty() && s.quarantined.iter().any(|b| b.tiles.contains(&tile)), "stamped");
+            s.wait_for(s.value);
+            // (as 10 s later: the wall clock is no reason)
+            for b in s.quarantined.iter_mut() {
+                b.at = b.at.checked_sub(std::time::Duration::from_secs(10)).expect("an earlier instant");
+            }
+            assert!(!s.drain_quarantined(), "the title queue has not got past its work");
+            assert!(s.cooling_line().contains("1 waiting on title fences"), "{}", s.cooling_line());
+            let (other, _) = s.take_tile().expect("a tile of a new pool");
+            assert_ne!(other, tile, "not the tile the title's work may still use");
+            gate.Signal(1).expect("the title's work runs");
+            assert!(drained(&mut s, tile), "used again once the title queue is past it");
+            assert_eq!(s.take_tile().map(|t| t.0), Some(tile));
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `XCL_TILE_FENCE_REUSE=0`: a tile a placed buffer let go of cools `COOL` of wall-clock time
+    /// and is used again then, the title queue's work pending or not (as before).
+    #[test]
+    fn with_tile_fence_reuse_off_a_freed_tile_cools_by_the_clock() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s, tile, _title_q, gate) = reuse_state(ReusePolicy::parse(Some("0"), None));
+            let _unblock = SignalOnDrop(gate.clone(), 1);
+            s.release_if_unused(base, tile);
+            assert!(s.reuse.released.is_empty() && s.cooling.iter().any(|c| c.0 == tile), "cooling at once");
+            let (other, _) = s.take_tile().expect("a tile of a new pool");
+            assert_ne!(other, tile, "less than COOL ago");
+            // (as 2 s later)
+            for t in s.cooling.iter_mut() {
+                t.1 = t.1.checked_sub(COOL).expect("an earlier instant");
+            }
+            assert_eq!(s.take_tile().map(|t| t.0), Some(tile), "COOL later, the title's work still pending");
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A title queue the title destroyed after a tile was freed does not hold the tile: XCL holds
+    /// the queue, its work runs, and the mark queued behind it is reached.
+    #[test]
+    fn a_destroyed_title_queue_does_not_block_reuse() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s, tile, title_q, gate) = reuse_state(ReusePolicy { fences: true, cool: std::time::Duration::ZERO });
+            let _unblock = SignalOnDrop(gate.clone(), 1);
+            s.release_if_unused(base, tile);
+            s.drain_quarantined();
+            assert!(s.quarantined.iter().any(|b| b.tiles.contains(&tile)));
+            // the title's last reference
+            drop(title_q);
+            gate.Signal(1).expect("the title's work runs");
+            assert!(drained(&mut s, tile), "the destroyed queue's mark is reached");
+            assert_eq!(s.take_tile().map(|t| t.0), Some(tile));
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A pool heap retired while a title queue's earlier work is pending is not released before
+    /// that work is done (`XCL_TILE_FENCE_REUSE`); off, it goes `COOL` after as before.
+    #[test]
+    fn a_retired_heap_waits_for_the_title_fences() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            for fences in [true, false] {
+                let policy = if fences { ReusePolicy { fences: true, cool: std::time::Duration::ZERO } } else { ReusePolicy::parse(Some("0"), None) };
+                let (base, mut s, _tile, _title_q, gate) = reuse_state(policy);
+                let _unblock = SignalOnDrop(gate.clone(), 1);
+                let desc = D3D12_HEAP_DESC {
+                    SizeInBytes: POOL_TILES as u64 * TILE as u64,
+                    Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    Alignment: 0,
+                    Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+                };
+                let mut heap: Option<ID3D12Heap> = None;
+                s.dev.CreateHeap(&desc, &mut heap).expect("heap");
+                let marks = if fences { s.stamp_title_queues() } else { Vec::new() };
+                assert_eq!(marks.is_empty(), !fences);
+                let long_ago = std::time::Instant::now().checked_sub(COOL).expect("an earlier instant");
+                s.retired.push((heap.expect("heap"), 0, long_ago, marks));
+                s.retire_free_pools();
+                assert_eq!(s.retired.len(), usize::from(fences), "fences {fences}: held while the title queue's work is pending");
+                gate.Signal(1).expect("the title's work runs");
+                let start = std::time::Instant::now();
+                while !s.retired.is_empty() && start.elapsed() < std::time::Duration::from_secs(5) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    s.retire_free_pools();
+                }
+                assert!(s.retired.is_empty(), "fences {fences}: released once the work is done");
+                drop(_unblock);
+                s.wait_for(s.value);
+                drop(s);
+                assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+            }
         }
     }
 
@@ -7786,18 +8214,18 @@ mod tests {
         let mut cooling: VecDeque<((u32, u32), std::time::Instant)> = VecDeque::new();
         cooling.push_back(((0, 5), ms(0)));
         cooling.push_back(((0, 6), ms(10)));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999)), None, "freed 1999 ms ago: still cooling");
-        assert!(!cooled(&cooling, ms(1999)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999), COOL), None, "freed 1999 ms ago: still cooling");
+        assert!(!cooled(&cooling, ms(1999), COOL));
         free.push((1, 9));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999)), Some((1, 9)), "a free tile meanwhile");
-        assert!(cooled(&cooling, ms(2000)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999), COOL), Some((1, 9)), "a free tile meanwhile");
+        assert!(cooled(&cooling, ms(2000), COOL));
         free.push((1, 8));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005)), Some((0, 5)), "cooled: before a free tile");
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005)), Some((1, 8)), "the next one freed 10 ms later is not");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005), COOL), Some((0, 5)), "cooled: before a free tile");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005), COOL), Some((1, 8)), "the next one freed 10 ms later is not");
         cooling.push_back(((2, 1), ms(20)));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((0, 6)), "the oldest first");
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((2, 1)));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), None);
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000), COOL), Some((0, 6)), "the oldest first");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000), COOL), Some((2, 1)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000), COOL), None);
     }
 
     /// The tile mapping line gives the calls and tiles since the counts before, by kind of window.
@@ -7906,10 +8334,10 @@ mod tests {
         let mut free: Vec<(u32, u32)> = (0..POOL_TILES - 1).map(|t| (1, t)).collect();
         free.extend((1..POOL_TILES).map(|t| (0, t)));
         let cooling = VecDeque::from([((1, POOL_TILES - 1), ms(0)), ((0, 0), ms(1500))]);
-        assert!(free_heaps(&free, &cooling, 2, ms(1999)).is_empty(), "their last tiles are cooling");
-        assert_eq!(free_heaps(&free, &cooling, 2, ms(2000)), vec![1], "pool 1's cooled");
-        assert_eq!(free_heaps(&free, &cooling, 2, ms(3500)), vec![0, 1]);
-        assert_eq!(free_heaps(&free[1..], &cooling, 2, ms(3500)), vec![0], "a tile of pool 1 in use");
+        assert!(free_heaps(&free, &cooling, 2, ms(1999), COOL).is_empty(), "their last tiles are cooling");
+        assert_eq!(free_heaps(&free, &cooling, 2, ms(2000), COOL), vec![1], "pool 1's cooled");
+        assert_eq!(free_heaps(&free, &cooling, 2, ms(3500), COOL), vec![0, 1]);
+        assert_eq!(free_heaps(&free[1..], &cooling, 2, ms(3500), COOL), vec![0], "a tile of pool 1 in use");
     }
 
     /// A GPU-view tile given back and unmapped at a submit is not the video memory of the next
@@ -7954,12 +8382,12 @@ mod tests {
         let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
         // the last tile of a pool freed at 0 ms, by a flush that tried at 0 ms
         let cooling = VecDeque::from([((0, 0), ms(0))]);
-        assert!(!retire_due(&cooling, false, ms(0), ms(1999)), "still cooling");
-        assert!(retire_due(&cooling, false, ms(0), ms(2000)), "cooled");
-        assert!(!retire_due(&cooling, false, ms(1000), ms(2000)), "tried 1 s ago");
-        assert!(!retire_due(&VecDeque::new(), false, ms(0), ms(5000)), "nothing freed, nothing retired");
-        assert!(retire_due(&VecDeque::new(), true, ms(0), ms(2000)), "a retired heap to drop");
-        assert!(!retire_due(&VecDeque::new(), true, ms(500), ms(2000)));
+        assert!(!retire_due(&cooling, false, ms(0), ms(1999), COOL), "still cooling");
+        assert!(retire_due(&cooling, false, ms(0), ms(2000), COOL), "cooled");
+        assert!(!retire_due(&cooling, false, ms(1000), ms(2000), COOL), "tried 1 s ago");
+        assert!(!retire_due(&VecDeque::new(), false, ms(0), ms(5000), COOL), "nothing freed, nothing retired");
+        assert!(retire_due(&VecDeque::new(), true, ms(0), ms(2000), COOL), "a retired heap to drop");
+        assert!(!retire_due(&VecDeque::new(), true, ms(500), ms(2000), COOL));
     }
 
     /// A pool whose last tile a submit freed goes at a submit `COOL` later that frees none.
