@@ -52,8 +52,11 @@ const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 /// written is a GPU / system timestamp
 const BOTTOM_TIMESTAMPS: u32 = 0x3;
 const TOP_TIMESTAMPS: u32 = 0xC;
-/// fills larger than this are not done (one pattern buffer per value, up to this size)
+/// fills larger than this are not done
 const MAX_FILL: u64 = 256 << 20;
+/// a fill pattern buffer (one per value) is at most this big; a larger fill is done in copies
+/// of it. Upload-heap buffers are never freed, so 32 of 256 MB would be 8 GB of RAM.
+const MAX_PATTERN: u64 = 16 << 20;
 /// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
 /// Overridable via `XCL_WAIT_TIMEOUT_MS` for diagnostics.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2394,7 +2397,21 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
     b.Unmap(0, None);
     let raw = b.as_raw() as usize;
     cache.push((pat, b, len));
+    let (count, bytes) = (cache.len(), cache.iter().map(|e| e.2).sum::<u64>());
+    crate::xlog_info!("D3D12.X: a fill pattern buffer of {} KB made ({count} of them now, {} KB in all)", len >> 10, bytes >> 10);
     Some(raw)
+}
+
+/// The fill pattern buffers: (how many, bytes in all).
+pub fn pattern_bytes() -> (usize, u64) {
+    let cache = PATTERNS.lock().unwrap();
+    (cache.len(), cache.iter().map(|e| e.2).sum())
+}
+
+/// The copies a fill of `size` bytes is done in, from a pattern buffer of `chunk` bytes (a
+/// multiple of 16, so every copy starts the pattern where the fill has it): (offset, bytes).
+fn fill_chunks(size: u64, chunk: u64) -> impl Iterator<Item = (u64, u64)> {
+    (0..size.div_ceil(chunk)).map(move |i| (i * chunk, chunk.min(size - i * chunk)))
 }
 
 unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, what: &str) {
@@ -2405,11 +2422,15 @@ unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, 
     let Some((d, off)) = real::uma_window_buffer(va as usize, size as usize) else {
         return warn(&N, what, format_args!("{va:#x} ({size:#x} bytes) is not in unified memory"));
     };
-    let Some(src) = pattern_buffer(list, pat, size) else {
+    let Some(src) = pattern_buffer(list, pat, size.min(MAX_PATTERN)) else {
         return warn(&N, what, format_args!("no pattern buffer for {pat:x?}"));
     };
     note_write(list as usize, va, size);
-    as_copy_dest(list, d, || copy_buffer_region(list, d, off, src, 0, size));
+    as_copy_dest(list, d, || {
+        for (at, n) in fill_chunks(size, MAX_PATTERN) {
+            copy_buffer_region(list, d, off + at, src, 0, n);
+        }
+    });
 }
 
 fn pattern(bytes: &[u8]) -> [u8; 16] {
@@ -4821,6 +4842,36 @@ mod tests {
     fn fill_patterns_repeat_the_value() {
         assert_eq!(pattern(&0x1122_3344u32.to_le_bytes())[..8], [0x44, 0x33, 0x22, 0x11, 0x44, 0x33, 0x22, 0x11]);
         assert_eq!(pattern(&[7u8; 16]), [7u8; 16]);
+    }
+
+    /// A fill larger than the pattern buffer is done in copies of it that cover the range once,
+    /// each starting the pattern where the fill has it, also for sizes that are not a multiple
+    /// of the buffer and at a destination offset that is not.
+    #[test]
+    fn large_fills_are_done_in_copies_of_the_pattern_buffer() {
+        let chunks = |size| fill_chunks(size, MAX_PATTERN).collect::<Vec<_>>();
+        assert_eq!(chunks(4), [(0, 4)]);
+        assert_eq!(chunks(MAX_PATTERN), [(0, MAX_PATTERN)]);
+        assert_eq!(chunks(MAX_PATTERN + 4), [(0, MAX_PATTERN), (MAX_PATTERN, 4)]);
+        assert_eq!(chunks(MAX_FILL).len(), 16);
+        assert!(chunks(MAX_FILL).iter().all(|&(_, n)| n == MAX_PATTERN));
+        // as the GPU would do it: a 64-byte pattern buffer, fills of odd multiples of 4 and 8
+        let pat = pattern(&0x1122_3344_5566_7788u64.to_le_bytes());
+        let src: Vec<u8> = (0..64).map(|i| pat[i % 16]).collect();
+        for (size, dst_off) in [(4u64, 0u64), (60, 4), (64, 12), (68, 0), (8 * 37, 20), (4 * 129, 36)] {
+            let mut dst = vec![0u8; (dst_off + size + 8) as usize];
+            let mut covered = 0;
+            for (at, n) in fill_chunks(size, src.len() as u64) {
+                assert_eq!(at, covered, "the copies are contiguous");
+                covered += n;
+                let d = (dst_off + at) as usize;
+                dst[d..d + n as usize].copy_from_slice(&src[..n as usize]);
+            }
+            assert_eq!(covered, size);
+            let filled = &dst[dst_off as usize..(dst_off + size) as usize];
+            assert!(filled.iter().enumerate().all(|(i, &b)| b == pat[i % 16]), "size {size} at {dst_off}");
+            assert!(dst[..dst_off as usize].iter().chain(&dst[(dst_off + size) as usize..]).all(|&b| b == 0), "nothing outside");
+        }
     }
 
     #[test]
