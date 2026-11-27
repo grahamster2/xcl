@@ -9,6 +9,8 @@
 
 use super::{rdna2, recomp, xbox};
 
+pub mod descriptors;
+
 /// The writes a program can make.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Effects {
@@ -25,6 +27,29 @@ pub struct Effects {
 /// None when the program cannot be decoded through a terminator, falls through past decoded
 /// code, contains an unresolved indirect transfer, or branches outside the decoded instructions.
 pub fn of(code: &[u8]) -> Option<Effects> {
+    let insts = decode_program(code)?;
+    let mut e = Effects::default();
+    for d in &insts {
+        e.instructions += 1;
+        let n = d.inst.name;
+        let writes = n.contains("_STORE") || n.contains("_ATOMIC");
+        match d.enc.name {
+            "ENC_MIMG" => e.images |= writes,
+            "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_SMEM" => e.memory |= writes,
+            // LDS is the group's own and gone after it; the global data share is not
+            "ENC_DS" => {
+                let gds = rdna2::field_value(d.enc, &d.words, "GDS").is_some_and(|v| v != 0);
+                e.memory |= gds || n == "DS_APPEND" || n == "DS_CONSUME" || n == "DS_ORDERED_COUNT" || n.starts_with("DS_GWS_");
+            }
+            _ => {}
+        }
+    }
+    Some(e)
+}
+
+/// The instructions of the RDNA2 program `code`, far jumps resolved, when the whole program can
+/// be read (the conditions of `of`): what the analyses of this module walk.
+pub(crate) fn decode_program(code: &[u8]) -> Option<Vec<rdna2::Decoded>> {
     let mut insts = Vec::new();
     let mut off = 0;
     // the whole program: code can follow an early terminator (a branch to it, or past it); what
@@ -54,26 +79,10 @@ pub fn of(code: &[u8]) -> Option<Effects> {
         return None;
     }
     let pcs: std::collections::HashSet<u64> = insts.iter().map(|d| d.pc).collect();
-    let mut e = Effects::default();
-    for d in &insts {
-        if d.inst.flags & (rdna2::F_BRANCH | rdna2::F_INDIRECT) != 0 && rdna2::branch_target(d).is_none_or(|t| !pcs.contains(&t)) {
-            return None;
-        }
-        e.instructions += 1;
-        let n = d.inst.name;
-        let writes = n.contains("_STORE") || n.contains("_ATOMIC");
-        match d.enc.name {
-            "ENC_MIMG" => e.images |= writes,
-            "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_SMEM" => e.memory |= writes,
-            // LDS is the group's own and gone after it; the global data share is not
-            "ENC_DS" => {
-                let gds = rdna2::field_value(d.enc, &d.words, "GDS").is_some_and(|v| v != 0);
-                e.memory |= gds || n == "DS_APPEND" || n == "DS_CONSUME" || n == "DS_ORDERED_COUNT" || n.starts_with("DS_GWS_");
-            }
-            _ => {}
-        }
+    if insts.iter().any(|d| d.inst.flags & (rdna2::F_BRANCH | rdna2::F_INDIRECT) != 0 && rdna2::branch_target(d).is_none_or(|t| !pcs.contains(&t))) {
+        return None;
     }
-    Some(e)
+    Some(insts)
 }
 
 /// The compute program of a console shader container (the hardware CS variant of an FSSM, or

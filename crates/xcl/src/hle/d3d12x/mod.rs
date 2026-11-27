@@ -18,6 +18,7 @@ pub mod console_list;
 pub mod clamp;
 pub mod cs_trace;
 mod depth_uav;
+pub mod desc_reads;
 pub mod device_x;
 pub mod dxgi_device;
 pub mod dxgi_output;
