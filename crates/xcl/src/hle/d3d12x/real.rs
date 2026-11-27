@@ -4505,12 +4505,23 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
 /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+/// `XCL_PSO_DISK_CACHE_MIN_MS=<n>` sets `KEEP` (0: every build is kept).
 pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// builds shorter than this are not worth a file
+    /// builds shorter than this are not worth a file, unless `XCL_PSO_DISK_CACHE_MIN_MS` says
     const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+
+    fn keep_min() -> std::time::Duration {
+        static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *MIN.get_or_init(|| keep_min_of(std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok().as_deref()))
+    }
+
+    /// `XCL_PSO_DISK_CACHE_MIN_MS`'s value: milliseconds, or `KEEP` when unset or not a number.
+    fn keep_min_of(v: Option<&str>) -> std::time::Duration {
+        v.and_then(|v| v.trim().parse::<u64>().ok()).map_or(KEEP, std::time::Duration::from_millis)
+    }
     static HITS: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
@@ -4620,7 +4631,7 @@ pub(crate) mod driver_cache {
     }
 
     pub(super) fn worth_keeping(took: std::time::Duration) -> bool {
-        took >= KEEP || keep_fixtures()
+        took >= keep_min() || keep_fixtures()
     }
 
     /// Keep `blob`, of a build that took `took`, for the next run.
@@ -4640,6 +4651,16 @@ pub(crate) mod driver_cache {
         struct Directory(PathBuf);
         impl Drop for Directory {
             fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+
+        #[test]
+        fn the_keep_threshold_is_250_ms_unless_set() {
+            use std::time::Duration;
+            assert_eq!(keep_min_of(None), Duration::from_millis(250));
+            assert_eq!(keep_min_of(Some("0")), Duration::ZERO, "0: every build is kept");
+            assert_eq!(keep_min_of(Some(" 40 ")), Duration::from_millis(40));
+            assert_eq!(keep_min_of(Some("fast")), Duration::from_millis(250), "not a number: the default");
+            assert_eq!(keep_min_of(Some("-1")), Duration::from_millis(250));
         }
 
         #[test]
