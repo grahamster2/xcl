@@ -36,6 +36,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    // `XCL_NV_CACHE_TRIM_GB=n`: before any D3D12 device, the NVIDIA cache files earlier runs mapped
+    crate::nv_cache::trim_at_start(&boot.logs_dir());
     if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot) {
         crate::xlog_error!("Shader preparation: {e}");
         eprintln!("xcl: {e}");

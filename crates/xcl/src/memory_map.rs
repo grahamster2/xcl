@@ -30,9 +30,17 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// The title's plain `VirtualAlloc` reservations (base → bytes), recorded only while the map is on.
 static TITLE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
-/// Starts the logging thread when `XCL_MEMORY_MAP=1` (before the title runs).
+/// Starts the logging thread when `XCL_MEMORY_MAP=1` (before the title runs). With the map off
+/// and `XCL_NV_CACHE_TRIM_GB` set, a thread only records the NVIDIA cache files mapped
+/// (`nv_cache`), every minute.
 pub fn start() {
     if std::env::var_os("XCL_MEMORY_MAP").is_none_or(|v| v == "0") {
+        if crate::nv_cache::enabled() {
+            let _ = std::thread::Builder::new().name("xcl-nv-cache-files".into()).spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                note_nv_cache_files(mapped_files());
+            });
+        }
         return;
     }
     ON.store(true, Ordering::Release);
@@ -183,6 +191,39 @@ fn mapped_file(base: usize) -> Option<String> {
     (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
 }
 
+/// The files mapped into the process (one entry per mapping).
+fn mapped_files() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    loop {
+        // SAFETY: plain data filled in by the query.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } == 0 {
+            break;
+        }
+        if m.Type == MEM_MAPPED && m.BaseAddress == m.AllocationBase {
+            out.extend(mapped_file(m.BaseAddress as usize));
+        }
+        let next = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    out
+}
+
+/// The NVIDIA shader cache files among the mapped `paths` go to the title's list
+/// (`nv_cache_files.txt` next to xcl.log), which `XCL_NV_CACHE_TRIM_GB` trims at the next start.
+fn note_nv_cache_files(paths: impl IntoIterator<Item = String>) {
+    let Some(boot) = crate::state::boot() else { return };
+    let paths: Vec<String> = paths.into_iter().collect();
+    for n in crate::nv_cache::note_mapped(&boot.logs_dir(), paths.iter().map(String::as_str)) {
+        crate::xlog_info!("memory map: the NVIDIA driver maps its shader cache file {n} (listed in {})", crate::nv_cache::LIST);
+    }
+}
+
 /// Which of the pages in `asked` are resident; adds the bytes each stands for (group, type,
 /// bytes) to its group and its type.
 fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, usize, u64)>, groups: &mut [(u64, u64)], types: &mut [(u64, u64); 3]) {
@@ -263,6 +304,7 @@ fn log_memory_map() -> Vec<String> {
     if !asked.is_empty() {
         in_memory(&mut asked, &mut stands, &mut groups, &mut types);
     }
+    note_nv_cache_files(files.into_values().flatten());
     let named: Vec<(String, u64, u64)> = g.names.into_iter().zip(groups).map(|(n, (c, r))| (n, c, r)).collect();
     let mut lines = vec![format_totals(regions.len(), started.elapsed().as_millis(), &types)];
     lines.extend(format_top(named, TOP));

@@ -22,6 +22,7 @@ pub mod launcher;
 pub mod loader;
 pub mod memory_map;
 pub mod modules;
+pub mod nv_cache;
 pub mod pe;
 pub mod preflight;
 pub mod report;
