@@ -171,7 +171,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     warn_low_commit(commit, commit_limit, private as u64, local);
                 }
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped){budget_text}",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); local video memory saved {} MB (sparse tiles under textures in system memory){budget_text}",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -180,7 +180,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(arenas as u64),
                     mb(arenas_made as u64),
                     mb(pools as u64),
-                    mb(pools_mapped as u64)
+                    mb(pools_mapped as u64),
+                    mb(crate::hle::d3d12x::sparse::demoted_bytes())
                 );
                 if pages != 0 {
                     crate::xlog_info!("{}", crate::hle::d3d12x::vram::page_owners());
@@ -189,6 +190,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 memory_lines += 1;
                 if memory_lines % 5 == 1 {
                     if let Some(line) = crate::hle::d3d12x::vram_attr::line() {
+                        crate::xlog_info!("{line}");
+                    }
+                    if let Some(line) = crate::hle::d3d12x::sparse::demote_line() {
                         crate::xlog_info!("{line}");
                     }
                 }

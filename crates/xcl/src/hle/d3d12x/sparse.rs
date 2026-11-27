@@ -26,6 +26,9 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+mod demote;
+pub use demote::{demote, line as demote_line, saved_bytes as demoted_bytes};
+
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, PAGE_GUARD,
     PAGE_NOACCESS, PAGE_READWRITE,
@@ -748,6 +751,8 @@ struct State {
     diag: ViewDiag,
     /// `XCL_VIEW_POISON`: the tile the windows' tiles without video memory show (`poison_windows`)
     poison: Option<Poison>,
+    /// tiles under the title's textures moved to system memory (`demote`)
+    demote: demote::Demotion,
 }
 
 /// The one 64 KiB of video memory the tiles of the windows without video memory of their own are
@@ -1068,7 +1073,7 @@ pub fn pool_bytes() -> (usize, usize) {
     let _held = holding(Holder::Other);
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
-    let quarantined: usize = s.quarantined.iter().map(|b| b.tiles.len()).sum::<usize>() + s.reuse.released.len();
+    let quarantined: usize = s.quarantined.iter().flat_map(|b| b.tiles.iter()).chain(s.reuse.released.iter()).filter(|&&t| !demote::is_sys(t)).count();
     (pools, pools.saturating_sub((s.free.len() + s.cooling.len() + quarantined) * TILE))
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
@@ -1241,6 +1246,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         counts: MirrorCounts::default(),
         diag: ViewDiag { keep: view_switches().keep, stats: view_switches().stats, ..Default::default() },
         poison: None,
+        demote: demote::Demotion::default(),
     })
 }
 
@@ -1540,7 +1546,7 @@ impl State {
                 coords.len() as u32,
                 Some(coords.as_ptr()),
                 Some(regions.as_ptr()),
-                self.pools[h as usize].as_ref().expect("a pool tile of a live pool"),
+                if demote::is_sys((h, 0)) { self.sys_heap(h) } else { self.pools[h as usize].as_ref().expect("a pool tile of a live pool") },
                 flags.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -1744,6 +1750,7 @@ impl State {
         let mut reused = Vec::new();
         for &(a, n, route) in asks {
             let n = if route.sized() { n } else { self.committed_reach(a, n) };
+            self.demote_written(a, n);
             let (got, left) = self.materialize(a, n, true, &mut reused);
             if got > 0 {
                 GPU_WRITE_TILES.fetch_add(got as u64, Ordering::Relaxed);
@@ -3217,8 +3224,9 @@ impl State {
             && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
             && !self.reuse.released.contains(&tile)
         {
-            if self.reuse.policy.fences {
-                // (the title's work on the buffer, submitted before its release, may still run)
+            if self.reuse.policy.fences || demote::is_sys(tile) {
+                // (the title's work on the buffer, submitted before its release, may still run; a
+                // system-memory tile goes to its own pool from `drain_quarantined`)
                 self.reuse.released.push(tile);
             } else {
                 self.cooling.push_back((tile, std::time::Instant::now()));
@@ -3340,7 +3348,11 @@ impl State {
             let batch = self.quarantined.pop_front().unwrap();
             let at = batch.at;
             for tile in batch.tiles {
-                if !self.pinned.contains_key(&tile) {
+                if self.pinned.contains_key(&tile) {
+                } else if demote::is_sys(tile) {
+                    // (a system-memory tile: to its own pool, `demote`)
+                    self.sys_tile_free(tile);
+                } else {
                     self.cooling.push_back((tile, at));
                     freed = true;
                 }
@@ -4546,7 +4558,7 @@ fn sparse_window_of(va: usize) -> Option<(usize, usize)> {
 /// but a compare without `XCL_SPARSE_LAZY`, and a thread that asked for the same tiles lately
 /// asks once (`write_asked_lately`).
 pub(super) fn gpu_write(route: WriteRoute, va: usize, len: usize) {
-    if va == 0 || len == 0 || !lazy_commits() {
+    if va == 0 || len == 0 || !lazy_on() {
         return;
     }
     let Some((start, size)) = sparse_window_of(va) else { return };
@@ -4571,9 +4583,11 @@ fn take_write_asks() -> Vec<(usize, usize, WriteRoute)> {
     std::mem::take(&mut *WRITE_ASKS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// `XCL_SPARSE_LAZY=1` is in effect: what may write on the GPU asks for its tiles (`gpu_write`).
+/// `XCL_SPARSE_LAZY=1` is in effect, or tiles were asked to move to system memory (`demote`:
+/// a recorded write keeps a tile waiting to move where it is, and one to a moved tile is
+/// counted): what may write on the GPU asks for its tiles (`gpu_write`).
 pub(super) fn lazy_on() -> bool {
-    lazy_commits()
+    lazy_commits() || demote::watching()
 }
 
 /// A list being recorded writes `[va, va + len)` on the GPU with a memory operation (an
@@ -4771,6 +4785,8 @@ impl State {
         s.note_queue(queue);
         let flushed = s.flush_parked();
         s.drain_quarantined();
+        // tiles under textures whose title queues got past their marks go to system memory
+        s.demote_ready();
         if flushed || retire_due(&s.cooling, !s.retired.is_empty(), s.retire_tried, std::time::Instant::now(), s.reuse.policy.cool) {
             s.retire_free_pools();
         }
@@ -4992,7 +5008,15 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes (of the CPU
     // view a tile of a GPU view shows)
-    let tiles = s.buffer_tiles(start, delta + bytes);
+    let mut tiles = s.buffer_tiles(start, delta + bytes);
+    // (tiles moved to system memory under a texture come back: the buffer maps video memory)
+    if s.promote_range(start, delta + bytes) > 0 {
+        for x in &mut tiles {
+            if let Some(e) = s.mapped.get(&x.0) {
+                x.1 = e.pool;
+            }
+        }
+    }
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
     // (`XCL_VIEW_POISON`: its tiles without video memory show the poison tile as the window's do)
@@ -5531,6 +5555,7 @@ mod tests {
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
+                demote: demote::Demotion::default(),
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
@@ -5922,6 +5947,7 @@ mod tests {
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
+                demote: demote::Demotion::default(),
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -6160,6 +6186,7 @@ mod tests {
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
+                demote: demote::Demotion::default(),
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -6287,6 +6314,7 @@ mod tests {
                 counts: MirrorCounts::default(),
                 diag: ViewDiag::default(),
                 poison: None,
+                demote: demote::Demotion::default(),
             };
 
             s.commit_range(base, TILE);
@@ -6464,7 +6492,7 @@ mod tests {
         }
     }
 
-    unsafe fn test_state_with_reserved(tiles: usize) -> (usize, State) {
+    pub(super) unsafe fn test_state_with_reserved(tiles: usize) -> (usize, State) {
         use windows_sys::Win32::System::Memory::MEM_RESERVE;
 
         let dev = test_device();
@@ -6513,7 +6541,7 @@ mod tests {
     }
 
     /// `len` bytes of the window at `va` as the GPU has them, after what was sent to it.
-    unsafe fn window_bytes(s: &mut State, va: usize, len: usize) -> Vec<u8> {
+    pub(super) unsafe fn window_bytes(s: &mut State, va: usize, len: usize) -> Vec<u8> {
         let mut d = buffer_desc(len as u64);
         d.Flags = D3D12_RESOURCE_FLAG_NONE;
         let mut back: Option<ID3D12Resource> = None;
@@ -6536,7 +6564,7 @@ mod tests {
     }
 
     /// Tile `t`'s CPU pages written with bytes made from `seed`; its pages, for a submit's dirty list.
-    unsafe fn write_tile(t: usize, seed: u64) -> Vec<usize> {
+    pub(super) unsafe fn write_tile(t: usize, seed: u64) -> Vec<usize> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         for i in 0..TILE / 8 {
             *(t as *mut u64).add(i) = next(&mut x);
@@ -6761,7 +6789,7 @@ mod tests {
 
     /// The tiles `flush_parked` quarantined, once the sparse queue and the title queues are past
     /// them (`drain_quarantined`), waited for up to 5 s.
-    unsafe fn settle_quarantined(s: &mut State) {
+    pub(super) unsafe fn settle_quarantined(s: &mut State) {
         s.wait_for(s.value);
         let start = std::time::Instant::now();
         while !s.quarantined.is_empty() && start.elapsed() < std::time::Duration::from_secs(5) {

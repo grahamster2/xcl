@@ -1137,6 +1137,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 if hr >= 0 && !(*ppv).is_null() {
                     if let Some(bytes) = console_bytes {
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                        // (the window's tiles under it are a dead copy: to system memory)
+                        super::sparse::demote(va as usize, bytes as usize);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
                     super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
@@ -1146,6 +1148,13 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             }
         } else {
             placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
+            // (on pages of its own, uploaded from the title's CPU memory: the window's tiles under
+            // it are a dead copy, to system memory)
+            if let (Some(hr), Some(bytes)) = (placed_hr, console_bytes) {
+                if hr >= 0 && !(*ppv).is_null() {
+                    super::sparse::demote(va as usize, bytes as usize);
+                }
+            }
         }
     }
     let hr = match placed_hr {
