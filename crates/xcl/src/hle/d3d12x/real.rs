@@ -736,6 +736,19 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     }
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
+    if kind == Kind::PipelineState {
+        LIVE_PIPELINES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// adopted pipeline states not yet released for good (`XCL_MEMORY_MAP`)
+static LIVE_PIPELINES: AtomicU64 = AtomicU64::new(0);
+
+/// For the memory map: pipelines alive, and of them the translated compute and graphics ones.
+pub(crate) fn pipeline_counts() -> (u64, usize, usize) {
+    let compute = TRANSLATED_COMPUTE.lock().unwrap().as_ref().map_or(0, |s| s.len());
+    let graphics = TRANSLATED_GRAPHICS.lock().unwrap().as_ref().map_or(0, |s| s.len());
+    (LIVE_PIPELINES.load(Ordering::Relaxed), compute, graphics)
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
@@ -1736,6 +1749,7 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        let _ = LIVE_PIPELINES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
         forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
     }
@@ -4423,6 +4437,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+pub(crate) use dispatch_chain::forms as dispatch_chain_forms;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ComputeBuild {

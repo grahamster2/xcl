@@ -171,7 +171,7 @@ fn region_group(kind: u32, protect: u32, whole: usize, path: Option<&str>) -> St
         return if file.is_empty() { "mapped: pagefile-backed sections".into() } else { format!("mapped: {file}") };
     }
     if combined {
-        return "D3D12 driver: write-combined or uncached private memory".into();
+        return format!("D3D12 driver: write-combined or uncached private memory, allocations {}", size_class(whole));
     }
     match whole {
         // what an NT heap grows by
@@ -179,6 +179,39 @@ fn region_group(kind: u32, protect: u32, whole: usize, path: Option<&str>) -> St
         n if n >= 1 << 20 => format!("rest: private allocations of {:.2} MB", n as f64 / MB as f64),
         _ => "rest: private allocations under 1 MB".into(),
     }
+}
+
+/// The size classes write-combined private allocations are counted in (upper bounds).
+const CLASSES: [(usize, &str); 5] = [(64 << 10, "under 64 KB"), (1 << 20, "of 64 KB – 1 MB"), (16 << 20, "of 1 – 16 MB"), (256 << 20, "of 16 – 256 MB"), (usize::MAX, "of 256 MB or more")];
+
+fn size_class(whole: usize) -> &'static str {
+    CLASSES.iter().find(|c| whole < c.0).map_or(CLASSES[4].1, |c| c.1)
+}
+
+/// Write-combined or uncached private allocations (`whole` sizes) counted by size class.
+fn format_combined(whole: impl IntoIterator<Item = usize>) -> String {
+    let mut n = [(0u64, 0u64); CLASSES.len()];
+    for w in whole {
+        let k = CLASSES.iter().position(|c| w < c.0).unwrap_or(CLASSES.len() - 1);
+        n[k].0 += 1;
+        n[k].1 += w as u64;
+    }
+    let parts: Vec<String> = CLASSES.iter().zip(n).filter(|(_, c)| c.0 > 0).map(|(c, (k, b))| format!("{k} {} ({} MB)", c.1, b / MB)).collect();
+    format!("memory map: D3D12 driver's write-combined or uncached private allocations: {}", if parts.is_empty() { "none".to_string() } else { parts.join(", ") })
+}
+
+/// XCL's own counts of what it holds in memory.
+fn format_own() -> String {
+    let (patterns, pattern_bytes) = crate::hle::d3d12x::list_x::pattern_bytes();
+    let (uploaders, uploader_bytes) = crate::gpu::texture::uploader_bytes();
+    let (aside, free, released) = crate::hle::d3d12x::alloc_pool::spare_counts();
+    let (pipelines, compute, graphics) = crate::hle::d3d12x::real::pipeline_counts();
+    let (chains, pieces, wholes) = crate::hle::d3d12x::real::dispatch_chain_forms();
+    format!(
+        "memory map: XCL's own: fill pattern buffers {patterns} ({} MB); texture upload buffers {uploaders} ({} MB); spare command allocators {aside} put aside ({free} free, {released} released so far); pipelines {pipelines} alive (translated: {compute} compute, {graphics} graphics); split compute programs {chains} ({pieces} pieces, {wholes} with the whole form too)",
+        pattern_bytes / MB,
+        uploader_bytes / MB
+    )
 }
 
 /// The file mapped at `base`.
@@ -305,6 +338,10 @@ fn log_memory_map() -> Vec<String> {
         in_memory(&mut asked, &mut stands, &mut groups, &mut types);
     }
     note_nv_cache_files(files.into_values().flatten());
+    let mut combined: HashMap<usize, usize> = HashMap::new();
+    for r in regions.iter().filter(|r| r.3 && r.4 != MEM_MAPPED && r.4 != MEM_IMAGE && r.5 & (PAGE_WRITECOMBINE | PAGE_NOCACHE) != 0) {
+        combined.insert(r.0, whole[&r.0]);
+    }
     let named: Vec<(String, u64, u64)> = g.names.into_iter().zip(groups).map(|(n, (c, r))| (n, c, r)).collect();
     let mut lines = vec![format_totals(regions.len(), started.elapsed().as_millis(), &types)];
     lines.extend(format_top(named, TOP));
@@ -316,6 +353,8 @@ fn log_memory_map() -> Vec<String> {
         graphics as u64 / MB,
         shaders as u64 / MB
     ));
+    lines.push(format_combined(combined.into_values()));
+    lines.push(format_own());
     lines
 }
 
@@ -457,7 +496,9 @@ mod tests {
         assert_eq!(region_group(MEM_MAPPED, PAGE_READWRITE, 1 << 30, Some(cache)), "D3D12 driver: shader cache file 7f1c_0.toc");
         assert_eq!(region_group(MEM_MAPPED, PAGE_READWRITE, 1 << 20, None), "mapped: pagefile-backed sections");
         assert_eq!(region_group(MEM_MAPPED, PAGE_READWRITE | PAGE_WRITECOMBINE, 1 << 20, None), "D3D12 driver: write-combined or uncached mappings");
-        assert_eq!(region_group(MEM_PRIVATE, PAGE_READWRITE | PAGE_WRITECOMBINE, 4 << 20, None), "D3D12 driver: write-combined or uncached private memory");
+        assert_eq!(region_group(MEM_PRIVATE, PAGE_READWRITE | PAGE_WRITECOMBINE, 4 << 20, None), "D3D12 driver: write-combined or uncached private memory, allocations of 1 – 16 MB");
+        assert_eq!(region_group(MEM_PRIVATE, PAGE_READWRITE | PAGE_NOCACHE, 0x8000, None), "D3D12 driver: write-combined or uncached private memory, allocations under 64 KB");
+        assert_eq!(region_group(MEM_PRIVATE, PAGE_READWRITE | PAGE_WRITECOMBINE, 1 << 30, None), "D3D12 driver: write-combined or uncached private memory, allocations of 256 MB or more");
         assert_eq!(region_group(MEM_PRIVATE, PAGE_READWRITE, 0xfd_0000, None), "rest: process heap segments (15.81 MB)");
         assert_eq!(region_group(MEM_PRIVATE, PAGE_READWRITE, 4 << 20, None), "rest: private allocations of 4.00 MB");
         assert_eq!(region_group(MEM_PRIVATE, PAGE_READWRITE, 0x8000, None), "rest: private allocations under 1 MB");
@@ -502,6 +543,21 @@ mod tests {
         println!("{}", format_system(system_memory(), process_memory().0, process_memory().1, 0.0));
         assert!(s.physical > 0 && s.available <= s.physical && s.commit <= s.limit);
         assert!(s.paged <= s.page_files);
+    }
+
+    #[test]
+    fn write_combined_allocations_are_counted_by_size() {
+        assert_eq!(size_class(0xffff), "under 64 KB");
+        assert_eq!(size_class(64 << 10), "of 64 KB – 1 MB");
+        assert_eq!(size_class((16 << 20) - 1), "of 1 – 16 MB");
+        assert_eq!(size_class(16 << 20), "of 16 – 256 MB");
+        assert_eq!(size_class(256 << 20), "of 256 MB or more");
+        assert_eq!(format_combined([]), "memory map: D3D12 driver's write-combined or uncached private allocations: none");
+        assert_eq!(
+            format_combined([2 << 20, 2 << 20, 0x1000, 512 << 20]),
+            "memory map: D3D12 driver's write-combined or uncached private allocations: 1 under 64 KB (0 MB), 2 of 1 – 16 MB (4 MB), 1 of 256 MB or more (512 MB)"
+        );
+        assert!(format_own().starts_with("memory map: XCL's own: fill pattern buffers "), "{}", format_own());
     }
 
     #[test]

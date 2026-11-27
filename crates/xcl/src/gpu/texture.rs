@@ -317,6 +317,13 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     Ok(failed)
 }
 
+/// For the memory map: texture upload buffers kept between batches (how many, bytes).
+pub fn uploader_bytes() -> (usize, u64) {
+    let g = UPLOADERS.lock().unwrap();
+    let kept = g.iter().flat_map(|m| m.values()).filter_map(|u| u.staging.as_ref().map(|s| s.2));
+    kept.fold((0, 0), |(n, b), cap| (n + 1, b + cap))
+}
+
 fn put_back(key: usize, up: Uploader) {
     UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
 }
