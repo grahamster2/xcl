@@ -7,7 +7,7 @@ fn enc(name: &str, e: &str, f: &[(&str, u64)]) -> Vec<u8> {
 }
 
 /// a CS: s4 a descriptor table; T# at +0x40 sampled, V# at +0x80 loaded from
-fn program() -> Shader {
+pub(crate) fn program() -> Shader {
     let mut code = enc("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)]);
     code.extend(enc("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0x40), ("SOFFSET", 125)]));
     code.extend(enc("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 2), ("OFFSET", 0x80), ("SOFFSET", 125)]));
@@ -18,7 +18,7 @@ fn program() -> Shader {
     Shader { stages: vec![Stage { hw: 6, programs: vec![p] }] }
 }
 
-fn memory(at: u64, out: &mut [u32]) -> bool {
+pub(crate) fn memory(at: u64, out: &mut [u32]) -> bool {
     let words: &[u32] = match at {
         0x1040 => &[6, 0, 0, 0x9000_0000, 0, 0, 0, 0],
         0x1080 => &[0x2000, 0x0010_0003, 64, 0],

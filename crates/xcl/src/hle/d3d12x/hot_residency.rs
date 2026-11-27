@@ -41,7 +41,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// a heap touched this recently is HIGH
 pub(super) const HOT: Duration = Duration::from_secs(2);
@@ -116,6 +116,72 @@ pub(super) fn on() -> bool {
         }
         on
     })
+}
+
+/// `XCL_HOT_DESC=0`: with `XCL_HOT_RESIDENCY=1`, a draw's or dispatch's descriptors are not read
+/// (`desc_reads`): its tables count by their first slots, as before (for A/B runs).
+pub(super) fn desc_on() -> bool {
+    if !on() {
+        return false;
+    }
+    #[cfg(test)]
+    if tests::ON_FOR_TEST.with(|c| c.get()) {
+        return !tests::DESC_OFF_FOR_TEST.with(|c| c.get());
+    }
+    static DESC: OnceLock<bool> = OnceLock::new();
+    *DESC.get_or_init(|| {
+        let v = std::env::var("XCL_HOT_DESC").ok();
+        let desc = !matches!(v.as_deref().map(str::trim), Some("0" | "off" | "false" | "no"));
+        if !desc {
+            crate::xlog_info!("D3D12.X: XCL_HOT_DESC=0: hot residency counts descriptor tables by their first slots, without reading the descriptors the shaders load");
+        }
+        desc
+    })
+}
+
+/// draws and dispatches whose pipeline's descriptors were read, those of them whose pipeline has
+/// dynamic descriptors, those that counted their tables by the first slots (nothing read, or not
+/// all), the descriptors read and the resources and ranges they touched (since the last line)
+static DESC_DRAWS: AtomicU64 = AtomicU64::new(0);
+static DESC_DYNAMIC: AtomicU64 = AtomicU64::new(0);
+static DESC_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static DESC_READS: AtomicU64 = AtomicU64::new(0);
+static DESC_TOUCHES: AtomicU64 = AtomicU64::new(0);
+
+/// A draw or dispatch of a noted pipeline (`desc_reads`): `reads` descriptors read, `touches`
+/// resources and ranges touched by them, `dynamic` its pipeline, `fallback` its tables counted by
+/// their first slots too.
+pub(super) fn note_descriptors(reads: usize, touches: usize, dynamic: bool, fallback: bool) {
+    DESC_DRAWS.fetch_add(1, Ordering::Relaxed);
+    if dynamic {
+        DESC_DYNAMIC.fetch_add(1, Ordering::Relaxed);
+    }
+    if fallback {
+        DESC_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+    if reads != 0 {
+        DESC_READS.fetch_add(reads as u64, Ordering::Relaxed);
+    }
+    if touches != 0 {
+        DESC_TOUCHES.fetch_add(touches as u64, Ordering::Relaxed);
+    }
+}
+
+/// The descriptor part of the line: per frame over `frames`.
+pub(super) fn desc_line(on: bool, draws: u64, dynamic: u64, fallback: u64, reads: u64, touches: u64, frames: u64) -> String {
+    if !on {
+        return "descriptors not read (XCL_HOT_DESC=0)".into();
+    }
+    let frames = frames.max(1);
+    let share = |n: u64| if draws == 0 { 0.0 } else { 100.0 * n as f64 / draws as f64 };
+    format!(
+        "descriptors: {} read and {} resources or ranges touched by them a frame, over {} draws and dispatches a frame of noted pipelines ({:.1} % with dynamic descriptors, {:.1} % with tables counted by their first slots)",
+        reads / frames,
+        touches / frames,
+        draws / frames,
+        share(dynamic),
+        share(fallback)
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -946,8 +1012,17 @@ fn log(h: &mut Hot, now: Instant) {
     let merge = MERGE_NS.swap(0, Ordering::Relaxed);
     let recorded = RECORDED.swap(0, Ordering::Relaxed);
     let cut = CUT.swap(0, Ordering::Relaxed);
+    let desc = desc_line(
+        desc_on(),
+        DESC_DRAWS.swap(0, Ordering::Relaxed),
+        DESC_DYNAMIC.swap(0, Ordering::Relaxed),
+        DESC_FALLBACK.swap(0, Ordering::Relaxed),
+        DESC_READS.swap(0, Ordering::Relaxed),
+        DESC_TOUCHES.swap(0, Ordering::Relaxed),
+        frames,
+    );
     crate::xlog_info!(
-        "{text}; cost {:.1} µs a frame on the presenting thread (longest {} µs) + {:.1} µs a frame at the submits; worker {:.1} µs per update ({} updates, longest {} µs; sparse scan longest {} µs, vram scan longest {} µs); {} keys recorded and {} mapped a frame, {} cut, {} pipelines touched an update; {} heaps changed class in {} SetResidencyPriority calls over {} frames",
+        "{text}; {desc}; cost {:.1} µs a frame on the presenting thread (longest {} µs) + {:.1} µs a frame at the submits; worker {:.1} µs per update ({} updates, longest {} µs; sparse scan longest {} µs, vram scan longest {} µs); {} keys recorded and {} mapped a frame, {} cut, {} pipelines touched an update; {} heaps changed class in {} SetResidencyPriority calls over {} frames",
         present as f64 / 1e3 / frames as f64,
         present_max / 1000,
         merge as f64 / 1e3 / frames as f64,

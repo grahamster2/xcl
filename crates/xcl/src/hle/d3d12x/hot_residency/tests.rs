@@ -3,6 +3,8 @@ use super::*;
 thread_local! {
     /// `on()` for this thread (the tests record without `XCL_HOT_RESIDENCY`)
     pub(super) static ON_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `XCL_HOT_DESC=0` for this thread (with `ON_FOR_TEST`)
+    pub(super) static DESC_OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct On;
@@ -20,6 +22,24 @@ impl Drop for On {
 
 /// (the frame's set is the process's: one test at a time takes it)
 static FRAME_TEST: Mutex<()> = Mutex::new(());
+
+/// For other modules' tests: recording on for this thread, the frame's set theirs (empty).
+pub(in super::super) struct Recording {
+    _on: On,
+    _g: std::sync::MutexGuard<'static, ()>,
+}
+
+pub(in super::super) fn recording() -> Recording {
+    let g = FRAME_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let on = On::new();
+    let _ = take_frame();
+    Recording { _on: on, _g: g }
+}
+
+/// The frame's set sorted out (no tables' slots, no console buffers), and taken.
+pub(in super::super) fn frame_touched() -> Touched {
+    sort_keys(take_frame(), |_, _| {}, |_, _| {})
+}
 
 const T: usize = TILE as usize;
 
@@ -229,6 +249,21 @@ fn the_line_says_what_fits() {
     t.hot_bytes = 2500 << 20;
     let s = line(&t, 32 << 20, 9000 << 20, 1024 << 20, 14000 << 20);
     assert!(s.starts_with("hot residency: HIGH 3000 MB (700 heaps), LOW 5000 MB (1200 heaps), MIN 64 MB; visible hot set 2500 MB vs target 7976 MB (budget 9000 − headroom 1024); local 14000 MB"), "{s}");
+}
+
+/// The descriptor part of the line: per frame, and the shares of the draws of noted pipelines.
+#[test]
+fn the_line_says_what_the_descriptors_touched() {
+    let s = desc_line(true, 2000, 500, 600, 30_000, 9000, 10);
+    assert_eq!(s, "descriptors: 3000 read and 900 resources or ranges touched by them a frame, over 200 draws and dispatches a frame of noted pipelines (25.0 % with dynamic descriptors, 30.0 % with tables counted by their first slots)");
+    assert!(desc_line(true, 0, 0, 0, 0, 0, 0).contains("0.0 % with dynamic"), "no draws, no frames: no division by 0");
+    assert_eq!(desc_line(false, 1, 1, 1, 1, 1, 1), "descriptors not read (XCL_HOT_DESC=0)");
+    // the switch for this thread
+    let _on = On::new();
+    assert!(desc_on());
+    DESC_OFF_FOR_TEST.with(|c| c.set(true));
+    assert!(!desc_on());
+    DESC_OFF_FOR_TEST.with(|c| c.set(false));
 }
 
 #[test]

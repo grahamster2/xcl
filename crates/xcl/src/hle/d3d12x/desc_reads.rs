@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use crate::gpu::effects::descriptors::{self, DescRead, Kind, Shader, UserData};
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// The root values of a draw or dispatch, by the stages that take them (None: the pipeline has
 /// no such stage, or they are not known). Each is `UserData`: dword d = user-data dword d.
@@ -68,8 +68,15 @@ impl<'a> Roots<'a> {
     }
 }
 
+/// The analyses of a pipeline's console shaders, and whether a descriptor of theirs comes from
+/// a value not known before the shader runs (`Class::Dynamic`: what it reads is not all here).
+struct Noted {
+    shaders: Vec<Arc<Shader>>,
+    dynamic: bool,
+}
+
 /// pipeline → the analyses of its console shaders
-static PIPELINES: super::sharded::Sharded<Arc<Vec<Arc<Shader>>>> = super::sharded::Sharded::new();
+static PIPELINES: super::sharded::Sharded<Arc<Noted>> = super::sharded::Sharded::new();
 
 /// The pipeline `pso` was made from the console shaders `blobs` (compute: one; graphics: VS / MS
 /// and PS). Each is analysed once (the analysis is cached by the shader's bytes). Meant for where
@@ -80,7 +87,8 @@ pub fn note_pipeline(pso: usize, blobs: &[&[u8]]) {
     }
     let shaders: Vec<Arc<Shader>> = blobs.iter().filter_map(|b| descriptors::cached(b)).collect();
     if !shaders.is_empty() {
-        PIPELINES.insert(pso, Arc::new(shaders));
+        let dynamic = shaders.iter().any(|s| s.dynamic());
+        PIPELINES.insert(pso, Arc::new(Noted { shaders, dynamic }));
     }
 }
 
@@ -98,8 +106,18 @@ const CACHE_MAX: usize = 1 << 14;
 /// The descriptors the console shaders of `pso` (a stand-in resolved) read with the root values
 /// `roots`, each once. Empty for a pipeline not noted, or nothing known. Kept for the frame.
 pub fn read_descriptors(pso: usize, roots: &Roots) -> Arc<[DescRead]> {
+    read_descriptors_of(pso, roots).map_or_else(|| Arc::from([]), |(r, _)| r)
+}
+
+/// `read_descriptors`, and whether a shader of the pipeline has dynamic descriptors (None: the
+/// pipeline was not noted).
+pub fn read_descriptors_of(pso: usize, roots: &Roots) -> Option<(Arc<[DescRead]>, bool)> {
     let pso = super::pso_async::resolve(pso);
-    let Some(shaders) = PIPELINES.get(pso) else { return Arc::from([]) };
+    let noted = PIPELINES.get(pso)?;
+    Some((cached_reads(pso, &noted.shaders, roots), noted.dynamic))
+}
+
+fn cached_reads(pso: usize, shaders: &[Arc<Shader>], roots: &Roots) -> Arc<[DescRead]> {
     let frame = super::present::presents();
     let key = (pso, roots.key());
     if let Some((f, m)) = CACHE.lock().unwrap().as_ref() {
@@ -109,7 +127,7 @@ pub fn read_descriptors(pso: usize, roots: &Roots) -> Arc<[DescRead]> {
             }
         }
     }
-    let r: Arc<[DescRead]> = reads_of(&shaders, roots, &mut read_console).into();
+    let r: Arc<[DescRead]> = reads_of(shaders, roots, &mut read_console).into();
     let mut g = CACHE.lock().unwrap();
     let c = g.get_or_insert_with(|| (frame, HashMap::new()));
     if c.0 != frame {
@@ -235,8 +253,8 @@ pub fn resources_of(reads: &[DescRead]) -> Vec<Touch> {
 
 /// `XCL_DESC_CENSUS` style counts of what the noted pipelines' shaders read (for a log line).
 pub fn census_of(pso: usize) -> Option<descriptors::Census> {
-    let shaders = PIPELINES.get(super::pso_async::resolve(pso))?;
+    let noted = PIPELINES.get(super::pso_async::resolve(pso))?;
     let mut c = descriptors::Census::default();
-    shaders.iter().for_each(|s| c.add(s.census()));
+    noted.shaders.iter().for_each(|s| c.add(s.census()));
     Some(c)
 }

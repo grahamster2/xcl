@@ -988,7 +988,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // (the list is submitted after this: its root views in a GPU view get their tiles there)
                         super::bind::want_root_views(layout.as_deref(), &table, super::view_want::Path::RootView);
                         super::bind::shader_store_writes(layout.as_deref(), &table, real);
-                        super::bind::note_hot(hot_list, layout.as_deref(), &table, real);
+                        // (the dispatch's io takes no heaps: `user_data_for` alone, as below)
+                        super::bind::note_hot(hot_list, layout.as_deref(), &table, real, super::bind::HotRoots::Compute(None));
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {

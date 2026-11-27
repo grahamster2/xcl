@@ -2177,6 +2177,15 @@ fn note_stores(pso: usize, blobs: &[&[u8]]) {
     }
 }
 
+/// `XCL_HOT_RESIDENCY`: the descriptors the console shaders `blobs` of `pso` (as made) load are
+/// analysed for the draws and dispatches of it (`desc_reads`; nothing without the switch, or
+/// with `XCL_HOT_DESC=0`).
+fn note_descriptors(pso: usize, blobs: &[&[u8]]) {
+    if super::hot_residency::desc_on() {
+        super::desc_reads::note_pipeline(pso, blobs);
+    }
+}
+
 /// Whether the shaders of `pso` (a stand-in resolved) may store to memory: true unless they were
 /// read and store to none (`note_stores`). What a dispatch or draw may write by address in a
 /// sparse window gets video memory first (`bind::shader_store_writes`).
@@ -2270,6 +2279,7 @@ fn forget_pso(pso: usize) {
     dispatch_chain::forget(pso);
     TRANSLATED_COMPUTE.remove(pso);
     NO_STORES.remove(pso);
+    super::desc_reads::forget_pipeline(pso);
     if let Some(s) = CONSOLE_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
@@ -5193,6 +5203,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             }
             note_translated_compute(0, ppv);
             note_stores(*ppv as usize, &[cs]);
+            note_descriptors(*ppv as usize, &[cs]);
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
             if super::gpu_profile::on() || super::gpu_times::enabled() {
                 super::gpu_profile::note_compute(record, cs, dxil.len(), wave32_only(this));
@@ -5235,6 +5246,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     note_translated_compute(hr, ppv);
     note_stores(*ppv as usize, &[cs]);
+    note_descriptors(*ppv as usize, &[cs]);
     PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (record, 0));
     if super::gpu_profile::on() || super::gpu_times::enabled() {
         super::gpu_profile::note_compute(record, cs, dxil.len(), wave32_only(this));
@@ -6539,6 +6551,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if d.HS.pShaderBytecode.is_null() && d.DS.pShaderBytecode.is_null() && d.GS.pShaderBytecode.is_null() {
         note_stores(*ppv as usize, &[Some(vs), shader_bytes(&d.PS)].into_iter().flatten().collect::<Vec<_>>());
     }
+    note_descriptors(*ppv as usize, &[Some(vs), shader_bytes(&d.PS)].into_iter().flatten().collect::<Vec<_>>());
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if (super::gpu_profile::on() || super::gpu_times::enabled()) && !super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
@@ -7897,6 +7910,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
+        note_descriptors(*ppv as usize, &[Some(ms), console_ps].into_iter().flatten().collect::<Vec<_>>());
         if super::gpu_times::enabled() {
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(ms), console_ps.map_or(0, crate::gpu::shader::fnv64)));
         }

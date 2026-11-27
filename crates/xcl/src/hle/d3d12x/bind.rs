@@ -1264,15 +1264,103 @@ fn store_addresses<'a>(l: &'a Layout, args: &'a [u8]) -> impl Iterator<Item = u6
     console_list::root_views(l, args).chain(constants).filter(|&va| va != 0 && va % 4 == 0)
 }
 
+/// The stages whose root values a draw or dispatch gives its pipeline's shaders, for
+/// `XCL_HOT_RESIDENCY`'s descriptor reads (`note_hot`, `desc_reads`), with the addresses of the
+/// view heap and the sampler heap set (`console_list::with_heaps`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HotRoots {
+    /// a dispatch: its CS (no heaps: none were given it – the console list's dispatches)
+    Compute(Option<[u32; 2]>),
+    /// a draw: its VS and PS
+    Graphics([u32; 2]),
+    /// a two-pass draw: its NGG stage (as its compute pass has it) and PS
+    Mesh([u32; 2]),
+    /// none: the root views and constants alone (the other pass of a two-pass draw)
+    Skip,
+}
+
+/// Where the user data `hot_user_data` makes has the spilled-argument table (not in memory yet:
+/// `UserData::table` has its bytes, read in its place). No address a shader reads otherwise: not
+/// canonical.
+pub(super) const HOT_TABLE_AT: u64 = 0x7FF0_0000_0000_0000;
+
+/// The user data of each stage (CS, VS + PS, NGG) `which` gives, as the bind makes it but with
+/// `HOT_TABLE_AT` for the table, and the bytes of `args` before the table (the inline ones).
+/// `user_sgprs`: the CS's (`real::pso_user_sgprs`).
+pub(super) fn hot_user_data(l: &Layout, args: &[u8], which: HotRoots, user_sgprs: Option<u32>) -> [Option<(Vec<u32>, usize)>; 3] {
+    let at = HOT_TABLE_AT;
+    let inline = |n: u32| (n as usize).min(args.len());
+    let gfx = |heaps| Some((console_list::with_heaps(l, None, console_list::user_data_gfx(l, args, at), heaps), inline(l.inline_gfx)));
+    match which {
+        HotRoots::Compute(heaps) => {
+            let d = console_list::user_data_for(l, user_sgprs, args, at);
+            let d = match heaps {
+                Some(h) => console_list::with_heaps(l, user_sgprs, d, h),
+                None => d,
+            };
+            [Some((d, inline(console_list::inline_for(l, user_sgprs)))), None, None]
+        }
+        HotRoots::Graphics(heaps) => [None, gfx(heaps), None],
+        HotRoots::Mesh(heaps) => {
+            // (the NGG stage's dword 0 is s8: the table's address)
+            let ms = console_list::with_heaps(l, None, console_list::user_data_ms(l, args, at), heaps);
+            [None, gfx(heaps), Some((ms[8..].to_vec(), inline(l.inline_ms)))]
+        }
+        HotRoots::Skip => [None, None, None],
+    }
+}
+
+/// `XCL_HOT_RESIDENCY`: what the descriptors the shaders of `pso` read with the root values of
+/// `which` name, touched on `list` – the reads by `read` (`desc_reads::read_descriptors_of`: the
+/// reads, and whether the pipeline has dynamic descriptors; None: not noted), their resources
+/// and ranges by `touches` (`desc_reads::resources_of`). Whether the tables still want their
+/// first slots counted: nothing was read, or not all could be (dynamic descriptors).
+pub(super) fn note_hot_descriptors(
+    list: usize,
+    l: &Layout,
+    args: &[u8],
+    which: HotRoots,
+    user_sgprs: Option<u32>,
+    read: &mut dyn FnMut(&super::desc_reads::Roots) -> Option<(Arc<[crate::gpu::effects::descriptors::DescRead]>, bool)>,
+    touches: &dyn Fn(&[crate::gpu::effects::descriptors::DescRead]) -> Vec<super::desc_reads::Touch>,
+) -> bool {
+    use super::desc_reads::{Roots, Touch};
+    use crate::gpu::effects::descriptors::UserData;
+    if which == HotRoots::Skip {
+        return false;
+    }
+    let ud = hot_user_data(l, args, which, user_sgprs);
+    let of = |k: usize| ud[k].as_ref().map(|(d, inline)| UserData { dwords: d, table: &args[*inline..] });
+    let roots = Roots { cs: of(0), gfx: of(1), ms: of(2) };
+    let Some((reads, dynamic)) = read(&roots) else { return true };
+    let t = if reads.is_empty() { Vec::new() } else { touches(&reads) };
+    for &x in &t {
+        match x {
+            Touch::Res(r) => super::hot_residency::touch_res(list, r),
+            Touch::Va { va, bytes } => super::hot_residency::touch_va(list, va, bytes),
+        }
+    }
+    let fallback = reads.is_empty() || dynamic;
+    super::hot_residency::note_descriptors(reads.len(), t.len(), dynamic, fallback);
+    fallback
+}
+
 /// `XCL_HOT_RESIDENCY`: a draw or dispatch of `pso` on `list` with the root arguments `args`
 /// (packed by `layout`) touches its root views (`ROOT_VIEW_BYTES` each, `ROOT_VIEW_WRITE_BYTES` when
 /// the pipeline may store), the 64-bit addresses in unified memory among its root constants and
-/// the first slots of its descriptor tables.
-pub(super) fn note_hot(list: usize, layout: Option<&Layout>, args: &[u8], pso: usize) {
+/// what the descriptors its shaders read with them name (`which`: the stages given them;
+/// `desc_reads`) – or, when those are not known (`XCL_HOT_DESC=0`, a pipeline not noted, nothing
+/// read, dynamic descriptors), the first slots of its descriptor tables.
+pub(super) fn note_hot(list: usize, layout: Option<&Layout>, args: &[u8], pso: usize, which: HotRoots) {
     if !super::hot_residency::on() {
         return;
     }
-    let (Some(l), Some(u)) = (layout, crate::gpu::uma::get()) else { return };
+    let Some(l) = layout else { return };
+    let first_slots = !super::hot_residency::desc_on() || {
+        let user_sgprs = if matches!(which, HotRoots::Compute(_)) { super::real::pso_user_sgprs(pso) } else { None };
+        note_hot_descriptors(list, l, args, which, user_sgprs, &mut |roots| super::desc_reads::read_descriptors_of(pso, roots), &super::desc_reads::resources_of)
+    };
+    let Some(u) = crate::gpu::uma::get() else { return };
     let view = if super::real::pso_may_store(pso) { super::hot_residency::ROOT_VIEW_WRITE_BYTES } else { super::hot_residency::ROOT_VIEW_BYTES };
     for va in console_list::root_views(l, args).filter(|&va| va != 0) {
         super::hot_residency::touch_va(list, va, view);
@@ -1288,7 +1376,7 @@ pub(super) fn note_hot(list: usize, layout: Option<&Layout>, args: &[u8], pso: u
                     }
                 }
             }
-            Param::Table { at } if word(at as usize) != 0 => super::hot_residency::touch_table(list, u.base() + word(at as usize) as usize),
+            Param::Table { at } if first_slots && word(at as usize) != 0 => super::hot_residency::touch_table(list, u.base() + word(at as usize) as usize),
             Param::Table { .. } => {}
             Param::Descriptor { .. } => {}
         }
@@ -2713,7 +2801,8 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     want_root_views(layout.as_deref(), &args, super::view_want::Path::MeshStage);
     shader_store_writes(layout.as_deref(), &args, 0);
-    note_hot(this as usize, layout.as_deref(), &args, real_mesh_pso);
+    // (the descriptors of the draw once: with the mesh pass, which has both stages' values)
+    note_hot(this as usize, layout.as_deref(), &args, real_mesh_pso, if compute_pass { HotRoots::Skip } else { HotRoots::Mesh(heaps) });
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -4505,7 +4594,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     });
     want_root_views(layout.as_deref(), &args, super::view_want::Path::RootView);
     shader_store_writes(layout.as_deref(), &args, pso);
-    note_hot(this as usize, layout.as_deref(), &args, pso);
+    note_hot(this as usize, layout.as_deref(), &args, pso, if gfx { HotRoots::Graphics(heaps) } else { HotRoots::Compute(Some(heaps)) });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or_else(|| {
@@ -5656,6 +5745,58 @@ void main(uint t : SV_GroupIndex) {
         }
         let io = two_pass_io(None, &[], 0x4_1234_5600, true, base, [0; 2]);
         assert_eq!((io[8], io[9]), (0x1234_5600, 4));
+    }
+
+    /// `XCL_HOT_RESIDENCY`'s user data has each stage's dwords where the bind puts them, with
+    /// `HOT_TABLE_AT` for the table (dwords 0 – 1; an NGG stage's from s8) and the heaps after
+    /// the inline arguments; a two-pass draw's compute pass reads nothing.
+    #[test]
+    fn hot_user_data_is_each_stage_s_own() {
+        let l = Layout { params: vec![Param::Constants { at: 0, count: 1 }, Param::Table { at: 4 }], size: 12, inline: 8, inline_gfx: 8, inline_ms: 4, heaps: [true, false] };
+        let args: Vec<u8> = [1u32, 0x2000, 7].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let at = [HOT_TABLE_AT as u32, (HOT_TABLE_AT >> 32) as u32];
+        let [cs, gfx, ms] = hot_user_data(&l, &args, HotRoots::Compute(Some([0x50, 0x60])), Some(16));
+        let (cs, inline) = cs.unwrap();
+        assert_eq!((&cs[..2], &cs[4..], inline), (&at[..], &[1, 0x2000, 0x50][..], 8));
+        assert!(gfx.is_none() && ms.is_none());
+        // the console list's dispatches: no heaps
+        let [cs, ..] = hot_user_data(&l, &args, HotRoots::Compute(None), Some(16));
+        assert_eq!(&cs.unwrap().0[4..], &[1, 0x2000]);
+        let [cs, gfx, ms] = hot_user_data(&l, &args, HotRoots::Mesh([0x50, 0x60]), None);
+        let ((gfx, gi), (ms, mi)) = (gfx.unwrap(), ms.unwrap());
+        assert!(cs.is_none());
+        assert_eq!((&gfx[..2], &gfx[8..], gi), (&at[..], &[1, 0x2000, 0x50][..], 8));
+        assert_eq!((&ms[..2], &ms[8..], mi), (&at[..], &[1, 0x50][..], 4));
+        assert_eq!(hot_user_data(&l, &args, HotRoots::Graphics([0x50, 0x60]), None)[1].as_ref().unwrap().0, gfx);
+        assert!(hot_user_data(&l, &args, HotRoots::Skip, None).iter().all(Option::is_none));
+    }
+
+    /// The tables are still counted by their first slots unless every descriptor was read: a
+    /// pipeline not noted, nothing read, dynamic descriptors; the reads see the table's bytes.
+    #[test]
+    fn the_first_slots_count_unless_every_descriptor_was_read() {
+        use super::super::desc_reads::{Roots, Touch};
+        use crate::gpu::effects::descriptors::{DescRead, Kind};
+        let l = Layout { params: vec![Param::Constants { at: 0, count: 2 }], size: 8, inline: 4, ..Default::default() };
+        let args: Vec<u8> = [3u32, 9].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let r = DescRead { kind: Kind::Image, dwords: 8, words: [6, 0, 0, 0x9000_0000, 0, 0, 0, 0], addr: 0 };
+        let touches = |_: &[DescRead]| vec![Touch::Res(0xAA)];
+        let first = |answer: Option<(Arc<[DescRead]>, bool)>, which: HotRoots| {
+            let mut asked = 0;
+            let mut read = |roots: &Roots| {
+                asked += 1;
+                let cs = roots.cs.expect("compute roots");
+                assert_eq!((cs.dwords[4], cs.table), (3, &9u32.to_le_bytes()[..]), "the inline argument, the spilled one");
+                answer.clone()
+            };
+            let f = note_hot_descriptors(0, &l, &args, which, Some(16), &mut read, &touches);
+            (f, asked)
+        };
+        assert_eq!(first(None, HotRoots::Compute(None)), (true, 1), "not noted");
+        assert_eq!(first(Some((Arc::from([]), false)), HotRoots::Compute(None)), (true, 1), "nothing read");
+        assert_eq!(first(Some((Arc::from([r]), true)), HotRoots::Compute(None)), (true, 1), "dynamic descriptors");
+        assert_eq!(first(Some((Arc::from([r]), false)), HotRoots::Compute(None)), (false, 1));
+        assert_eq!(first(Some((Arc::from([r]), false)), HotRoots::Skip), (false, 0), "the other pass: neither");
     }
 
     /// The root views of a bind that lie in a GPU view are asked for with `ROOT_VIEW_BYTES` each

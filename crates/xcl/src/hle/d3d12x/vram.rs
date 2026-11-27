@@ -2750,6 +2750,72 @@ mod tests {
         }
     }
 
+    /// `XCL_HOT_RESIDENCY`: a dispatch whose descriptor table holds the T# of a texture (the
+    /// shader loads it from there: `desc_reads`) makes the pool heap under the texture HIGH again
+    /// after it went LOW untouched; the same table's first slots name nothing (no view of the
+    /// texture in the slot looked at), so without the descriptor reads it would stay LOW.
+    #[test]
+    fn a_dispatch_s_table_makes_its_texture_s_pool_heap_high() {
+        use super::super::bind::{note_hot_descriptors, HotRoots};
+        use super::super::console_list::{Layout, Param};
+        use super::super::desc_reads::{self, tests as dr};
+        use super::super::hot_residency::{self, Class, HeapView, Tracker, COLD};
+        use crate::gpu::effects::descriptors::DescRead;
+        use std::sync::Arc;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(mut pages) = Pages::new(&dev) else { return crate::gpu::recomp::runner::skip_test("no tiled resources tier 2") };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 256, Height: 256, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, Flags: D3D12_RESOURCE_FLAG_NONE, ..Default::default()
+            };
+            let va = 0x20_0000_0000usize;
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).expect("reserved texture");
+            let r = r.unwrap();
+            let (used, used_extra) = pages.bind(&dev, &r, va, None, 4, &[], false).expect("pages");
+            let tex = r.as_raw() as usize;
+            pages.targets.insert(tex, Target { va, console_bytes: None, total: 4, mapped: true, used, used_extra, levels: None, gpu_owned: false });
+
+            let _rec = hot_residency::tests::recording();
+            let mut tracker = Tracker::default();
+            // the frame's touches onto the pool heap at `now`: the class it is given (None: unchanged)
+            let update = |pages: &Pages, tracker: &mut Tracker, now: Instant| -> Option<Class> {
+                let t = hot_residency::tests::frame_touched();
+                tracker.begin();
+                let mut out = Vec::new();
+                pages.hot_scan(&t.tiles, &t.res, &mut |v: &HeapView| tracker.see(v, now), &mut out);
+                tracker.end();
+                assert!(out.len() <= 1, "one pool heap");
+                out.first().map(|(_, c)| *c)
+            };
+            let t0 = Instant::now();
+            assert_eq!(update(&pages, &mut tracker, t0), Some(Class::High), "a heap seen first is in use");
+            let cold = t0 + COLD + Duration::from_secs(1);
+            assert_eq!(update(&pages, &mut tracker, cold), Some(Class::Low), "untouched since");
+
+            // a CS that loads a T# from its table (s4) at +0x40: shared-heap index 6, the texture's
+            // view; the table's first slot (+0) names nothing
+            let shaders = vec![Arc::new(dr::program())];
+            let layout = Layout { params: vec![Param::Table { at: 0 }], size: 4, inline: 4, ..Default::default() };
+            let args = 0x1000u32.to_le_bytes();
+            let list = 0x7E57_D000usize;
+            let mut read = |roots: &desc_reads::Roots| -> Option<(Arc<[DescRead]>, bool)> { Some((desc_reads::reads_of(&shaders, roots, &mut dr::memory).into(), false)) };
+            let named = |i: u32| if i == 6 { tex } else { 0 };
+            let touches = |reads: &[DescRead]| desc_reads::touches_of(reads, 0x100_0000_0000, &named);
+            let first_slots = note_hot_descriptors(list, &layout, &args, HotRoots::Compute(None), Some(16), &mut read, &touches);
+            assert!(!first_slots, "every descriptor read: the tables need no first-slots guess");
+            hot_residency::closed(list);
+            hot_residency::submitted(&[list as *mut c_void]);
+            assert_eq!(update(&pages, &mut tracker, cold + Duration::from_millis(500)), Some(Class::High), "the texture's pool heap is in use again");
+            hot_residency::reset(list);
+            pages.targets.remove(&tex);
+        }
+    }
+
     /// A placement's arena id, with heaps numbered as they are made.
     fn take(a: &mut Arenas<u32>, va: usize, bytes: usize, align: usize, now: Instant) -> u64 {
         let n = a.list.len() as u32;
