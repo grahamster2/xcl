@@ -532,6 +532,14 @@ fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RE
     }
 }
 
+/// The device the kernels run on (`hle::d3d12x::list_x`'s barrier GPU test).
+#[cfg(test)]
+pub fn device() -> Result<ID3D12Device, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.dev.clone()).map_err(|x| x.clone())
+}
+
 /// Name of the GPU the kernels run on (None: no usable GPU).
 pub fn adapter() -> Result<String, String> {
     let mut g = GPU.lock().unwrap();
