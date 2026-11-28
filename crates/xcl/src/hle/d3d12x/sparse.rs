@@ -1211,6 +1211,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
         return None;
     }
     committed(addr, rounded);
+    relay::released(addr, rounded);
     Some((addr, rounded))
 }
 
@@ -1224,6 +1225,7 @@ pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usiz
         return None;
     }
     committed(addr, rounded);
+    relay::released(addr, rounded);
     Some((addr, rounded))
 }
 
@@ -1236,7 +1238,7 @@ pub unsafe fn free(p: usize) -> bool {
     // decommitted before the address goes back: once released, another thread may get it,
     // commit it and write there
     let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
-    relay::released(start);
+    relay::released(start, len);
     decommitted(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     u.sparse_release(p).is_some()
@@ -1276,20 +1278,17 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
-        super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
-        // `XCL_RELAY_READBACK`: copied back by the relay's thread, the queue waits for it on the GPU
+        // `XCL_RELAY_READBACK`: copied back by the relay's thread, the title queue waits for it
+        // on the GPU (sent with `STATE` held: in the order of `rb_value`, and no upload passes it)
         if relay::on() {
             let (dev, rb_fence) = (s.dev.clone(), s.rb_fence.clone());
-            drop(g);
-            if relay::send(&dev, queue, &rb_fence, v, merged.clone()) {
-                return;
+            match relay::send(&dev, queue, &rb_fence, v, merged) {
+                Ok(()) => return,
+                Err(back) => merged = back,
             }
-            g = lock_state();
-            let Some(s) = g.as_mut() else { return };
-            s.readback_ranges(&merged);
-            return;
         }
+        let _ = s.queue.Wait(&s.rb_fence, v);
+        super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
 }
@@ -1302,8 +1301,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    relay::land();
-    let mut g = lock_state();
+    let mut g = lock_state_landed();
     let Some(s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -1574,8 +1572,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
     // (`XCL_RELAY_READBACK`: the CPU view has the GPU's writes before any of it goes up)
-    relay::land();
-    let mut g = lock_state();
+    let mut g = lock_state_landed();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
     // the title's work sees what was decommitted unmapped, as it was
@@ -1710,6 +1707,26 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
 static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// `STATE`, with the buffers released while it was held let go first.
+/// `lock_state` once the relay's copies back are done (`XCL_RELAY_READBACK`): none is sent while
+/// it is held.
+fn lock_state_landed() -> std::sync::MutexGuard<'static, Option<State>> {
+    loop {
+        unsafe { relay::land() };
+        let g = lock_state();
+        if !relay::on() || !relay::pending() {
+            return g;
+        }
+    }
+}
+
+/// `XCL_RELAY_READBACK`: the copies back sent so far are done (before a CPU look at the sparse
+/// windows' CPU view, such as a `Wait32/64BitValueX` at a submit). Not with `STATE` held.
+pub unsafe fn land_copies_back() {
+    if relay::on() {
+        relay::land();
+    }
+}
+
 fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
     let mut g = STATE.lock().unwrap();
     forget_released(&mut g);

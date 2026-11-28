@@ -490,7 +490,9 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             }
         }
         if release {
-            u.sparse_release(a);
+            if let Some(len) = u.sparse_release(a) {
+                crate::hle::d3d12x::sparse::wc_released(a, len);
+            }
             mirrors::released(a);
         }
         return 1;

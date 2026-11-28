@@ -2126,6 +2126,9 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         submit(lists);
         return;
     }
+    // (`XCL_RELAY_READBACK`: the waits read the sparse windows' CPU view once the GPU's writes
+    // are copied back into it, as when the submit copied them back itself)
+    super::sparse::land_copies_back();
     let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>)> = {
         let g = LISTS.lock().unwrap();
         lists

@@ -20,7 +20,9 @@ struct Backing(usize);
 impl Drop for Backing {
     fn drop(&mut self) {
         if let Some(u) = crate::gpu::uma::get() {
-            u.sparse_release(self.0);
+            if let Some(len) = u.sparse_release(self.0) {
+                crate::hle::d3d12x::sparse::wc_released(self.0, len);
+            }
         }
     }
 }

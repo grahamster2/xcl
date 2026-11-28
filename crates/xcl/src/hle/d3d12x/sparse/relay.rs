@@ -69,49 +69,65 @@ fn relay() -> std::sync::MutexGuard<'static, Option<Relay>> {
     RELAY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Instead of copying `ranges` back now: a job for the thread. `queue` signalled `rb_fence` =
-/// `rb_value` after its lists; it now waits on the GPU for the copy back. false: not done (no
-/// fence, the queue refused the wait) – the caller copies back itself.
-pub(super) unsafe fn send(dev: &ID3D12Device, queue: &ID3D12CommandQueue, rb_fence: &ID3D12Fence, rb_value: u64, ranges: Vec<(usize, usize)>) -> bool {
+/// Instead of copying `ranges` back now: a job for the thread. Called with `STATE` held (the
+/// lock order is `STATE`, then `RELAY`), right after `queue` signalled `rb_fence` = `rb_value`
+/// behind its lists; `queue` now waits on the GPU for the copy back. The sparse queue's
+/// `Wait(rb_fence)` is not queued here but by the thread just before its copy, so nothing
+/// another submit puts on the sparse queue meanwhile stands behind it. Err(ranges): not done
+/// (no fence or thread, the queue refused the wait) – the caller copies back itself.
+pub(super) unsafe fn send(dev: &ID3D12Device, queue: &ID3D12CommandQueue, rb_fence: &ID3D12Fence, rb_value: u64, ranges: Vec<(usize, usize)>) -> Result<(), Vec<(usize, usize)>> {
     let dev_raw = windows::core::Interface::as_raw(dev) as usize;
     let mut g = relay();
     if g.as_ref().is_some_and(|r| r.device != dev_raw) {
-        return false;
+        return Err(ranges);
     }
     if g.is_none() {
-        let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return false };
+        let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return Err(ranges) };
         *g = Some(Relay { fence, device: dev_raw, issued: 0, jobs: VecDeque::new(), thread: false });
     }
     let r = g.as_mut().unwrap();
-    let relay_value = r.issued + 1;
-    if queue.Wait(&r.fence, relay_value).is_err() {
-        return false;
-    }
-    r.issued = relay_value;
-    r.jobs.push_back(Job { rb_fence: rb_fence.clone(), rb_value, ranges, relay_value });
-    wait_stats::add(Stat::RelayJobs, 1);
     if !r.thread {
         r.thread = std::thread::Builder::new().name("xcl-sparse-relay".into()).spawn(worker).is_ok();
         if !r.thread {
-            // no thread: undo nothing (the queue waits), land it here and now
-            let job = r.jobs.pop_back().unwrap();
-            let fence = r.fence.clone();
-            drop(g);
-            land_job(job, &fence);
-            return true;
+            return Err(ranges);
         }
     }
+    let relay_value = r.issued + 1;
+    if queue.Wait(&r.fence, relay_value).is_err() {
+        return Err(ranges);
+    }
+    r.issued = relay_value;
+    super::super::list_x::note_internal_wait(windows::core::Interface::as_raw(queue) as usize, "sparse copy back on the relay's thread", &r.fence, relay_value);
+    r.jobs.push_back(Job { rb_fence: rb_fence.clone(), rb_value, ranges, relay_value });
+    wait_stats::add(Stat::RelayJobs, 1);
     WORK.notify_one();
-    true
+    Ok(())
 }
 
-unsafe fn wait_fence(fence: &ID3D12Fence, value: u64, event: HANDLE, ms: u32) -> bool {
-    if fence.GetCompletedValue() >= value {
-        return true;
+/// Copies back are still being sent or made (with `STATE` held: none can be sent meanwhile).
+pub(super) fn pending() -> bool {
+    relay().as_ref().is_some_and(|r| r.issued > 0 && unsafe { r.fence.GetCompletedValue() } < r.issued)
+}
+
+/// Waits until `fence` reaches `value` or `ms` are over (an auto-reset event a late completion
+/// left set is waited past).
+unsafe fn wait_fence(fence: &ID3D12Fence, value: u64, ms: u64) -> bool {
+    let deadline = Instant::now() + std::time::Duration::from_millis(ms);
+    let event = thread_event();
+    loop {
+        if fence.GetCompletedValue() >= value {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if event.is_invalid() || fence.SetEventOnCompletion(value, event).is_err() {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        } else {
+            windows::Win32::System::Threading::WaitForSingleObject(event, left.as_millis().max(1) as u32);
+        }
     }
-    let _ = fence.SetEventOnCompletion(value, event);
-    windows::Win32::System::Threading::WaitForSingleObject(event, ms);
-    fence.GetCompletedValue() >= value
 }
 
 fn thread_event() -> HANDLE {
@@ -121,18 +137,17 @@ fn thread_event() -> HANDLE {
     E.with(|e| *e)
 }
 
-unsafe fn land_job(job: Job, relay_fence: &ID3D12Fence) {
+unsafe fn land_job(job: &Job) {
     // the title's lists first, with no lock held (the submits go on meanwhile)
-    if !wait_fence(&job.rb_fence, job.rb_value, thread_event(), 5000) {
+    if !wait_fence(&job.rb_fence, job.rb_value, 5000) {
         crate::xlog_warn!("sparse windows: a title queue has not reached its copy-back point {} after 5 s – copied back anyway", job.rb_value);
     }
-    {
-        let mut g = super::lock_state();
-        if let Some(s) = g.as_mut() {
-            s.readback_ranges(&job.ranges);
-        }
+    let mut g = super::lock_state();
+    if let Some(s) = g.as_mut() {
+        // the sparse queue after the title queue's lists, right before the copy
+        let _ = s.queue.Wait(&job.rb_fence, job.rb_value);
+        s.readback_ranges(&job.ranges);
     }
-    let _ = relay_fence.Signal(job.relay_value);
 }
 
 fn worker() {
@@ -148,12 +163,18 @@ fn worker() {
                 g = WORK.wait(g).unwrap_or_else(|e| e.into_inner());
             }
         };
-        unsafe { land_job(job, &fence) };
+        // the relay fence is signalled whatever happens: the title queue waits for it
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { land_job(&job) })).is_err() {
+            crate::xlog_error!("sparse windows: a copy back on the relay's thread failed (panic) – the title queue goes on");
+        }
+        if let Err(e) = unsafe { fence.Signal(job.relay_value) } {
+            crate::xlog_error!("sparse windows: relay fence Signal({}) failed: {e}", job.relay_value);
+        }
     }
 }
 
-/// Before CPU-view bytes of the sparse windows go to the GPU, or are read for the title: the
-/// copies back sent so far are done. Called without `STATE` held (the thread takes it).
+/// Before CPU-view bytes of the sparse windows go to the GPU, or are read: the copies back sent
+/// so far are done. Called without `STATE` held (the thread takes it); see `pending`.
 pub(super) unsafe fn land() {
     let pending = relay().as_ref().filter(|r| r.issued > 0).map(|r| (r.fence.clone(), r.issued));
     let Some((fence, issued)) = pending else { return };
@@ -161,7 +182,7 @@ pub(super) unsafe fn land() {
         return;
     }
     let t0 = Instant::now();
-    if !wait_fence(&fence, issued, thread_event(), 5000) {
+    if !wait_fence(&fence, issued, 5000) {
         crate::xlog_warn!("sparse windows: copies back not landed after 5 s (at {}, sent {issued})", fence.GetCompletedValue());
     }
     wait_stats::add(Stat::SparseWaits, 1);
@@ -215,9 +236,10 @@ pub fn reserved(start: usize, len: usize, protect: u32) {
     m.insert(start, len);
 }
 
-/// The reservation at `start` went back.
-pub fn released(start: usize) {
-    WC.lock().unwrap_or_else(|e| e.into_inner()).remove(&start);
+/// `[start, start + len)` went back (or was given out again by XCL): nothing in it is known
+/// write-combined any more.
+pub fn released(start: usize, len: usize) {
+    reserved(start, len, 0);
 }
 
 fn in_wc(map: &BTreeMap<usize, usize>, a: usize, n: usize) -> bool {
@@ -266,8 +288,10 @@ mod tests {
         reserved(A + 0x2000, 0x1000, 0x4);
         assert!(!wc(A + 0x1000, 0x1000), "a commit with another protection ends it");
         reserved(A, 0x10_0000, 0x404);
-        released(A);
+        reserved(A + 0x4000, 0x1000, 0x404);
+        released(A, 0x10_0000);
         assert!(!wc(A, 0x1000));
+        assert!(!wc(A + 0x4000, 0x1000), "a commit's entry inside it goes too");
         reserved(A, 0x10_0000, 0x404);
         reserved(A, 0x10_0000, 0x4);
         assert!(!wc(A, 0x1000), "reserved again without write-combining");
