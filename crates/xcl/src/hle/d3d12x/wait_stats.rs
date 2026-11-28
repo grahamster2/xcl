@@ -51,9 +51,17 @@ pub enum Stat {
     RefreshUs,
     /// µs of the title's `ExecuteCommandLists` calls in all
     SubmitUs,
+    /// µs of the look for CPU writes in the submits (write-watch and guards; part of `RefreshUs`)
+    WatchUs,
+    /// `XCL_WATCH_AHEAD`: passes ahead of the submits, the pages they found, their µs, and the
+    /// pages submits took from them
+    AheadPasses,
+    AheadPages,
+    AheadUs,
+    AheadPagesUsed,
 }
 
-pub const COUNT: usize = Stat::SubmitUs as usize + 1;
+pub const COUNT: usize = Stat::AheadPagesUsed as usize + 1;
 
 static STATS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
@@ -75,7 +83,7 @@ pub fn line(d: &[u64; COUNT]) -> String {
     let n = |s: Stat| d[s as usize];
     format!(
         "Wait32/64 at submit: {} GPU-bridged, {} GPU-watched ({} ms to release, {} timed out), {} CPU-polled ({} ms on the submit thread, {} timed out), {} self-waits skipped; {} Write64 cycle breaks, {} watchdog releases; \
-         sparse CPU waits {} ({} ms); PresentX slot waits {} ({} ms); pipeline-build waits {} ({} ms); submits {} ms in XCL ({} ms write-watch and uploads)",
+         sparse CPU waits {} ({} ms); PresentX slot waits {} ({} ms); pipeline-build waits {} ({} ms); submits {} ms in XCL ({} ms write-watch and uploads, {} ms of it the look for writes); looks ahead {} ({} ms, {} pages found, {} taken by submits)",
         n(Stat::Bridged),
         n(Stat::Watched),
         ms(Stat::WatchedUs),
@@ -94,6 +102,11 @@ pub fn line(d: &[u64; COUNT]) -> String {
         ms(Stat::PsoWaitUs),
         ms(Stat::SubmitUs),
         ms(Stat::RefreshUs),
+        ms(Stat::WatchUs),
+        n(Stat::AheadPasses),
+        ms(Stat::AheadUs),
+        n(Stat::AheadPages),
+        n(Stat::AheadPagesUsed),
     )
 }
 
@@ -109,6 +122,7 @@ mod tests {
         }
         let l = line(&d);
         assert!(l.starts_with("Wait32/64 at submit: 1000 GPU-bridged, 2000 GPU-watched (3 ms to release, 4000 timed out), 5000 CPU-polled (6 ms"), "{l}");
-        assert!(l.ends_with("submits 18 ms in XCL (17 ms write-watch and uploads)"), "{l}");
+        assert!(l.contains("submits 18 ms in XCL (17 ms write-watch and uploads, 19 ms of it the look for writes)"), "{l}");
+        assert!(l.ends_with("looks ahead 20000 (22 ms, 21000 pages found, 23000 taken by submits)"), "{l}");
     }
 }

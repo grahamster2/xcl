@@ -31,6 +31,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::gpu::texture::{self, Subresource};
 use crate::hle::xg;
 
+mod ahead;
+
 /// GetWriteWatch with atomic reset of the reported writes.
 const WRITE_WATCH_FLAG_RESET: u32 = 1;
 #[link(name = "kernel32")]
@@ -728,6 +730,28 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
+/// The pages of `ranges` written since the last look (reset), and those of physical-page views
+/// the guards caught, added to `dirty`.
+unsafe fn take_all_written(ranges: &[(usize, usize)], dirty: &mut Vec<usize>, page: &mut u32) {
+    take_watched(ranges, dirty, page);
+    // views of physical pages are not write-watched: their writes are caught by guards
+    // (`XCL_PAGE_ALIAS`), a write through one view counting for all of them
+    crate::hle::kernelx::guards::take_dirty(dirty, *page as usize);
+}
+
+/// `take_all_written` without the guards: the write-watched pages only.
+unsafe fn take_watched(ranges: &[(usize, usize)], dirty: &mut Vec<usize>, page: &mut u32) {
+    WATCH_BUF.with(|wcell| {
+        let mut buf = wcell.borrow_mut();
+        if buf.len() < 16384 {
+            buf.resize(16384, std::ptr::null_mut());
+        }
+        for &(base, size) in ranges.iter() {
+            take_written(base, size, &mut buf, dirty, page);
+        }
+    });
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
@@ -741,22 +765,22 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
-        WATCH_BUF.with(|wcell| {
-            let mut buf = wcell.borrow_mut();
-            if buf.len() < 16384 {
-                buf.resize(16384, std::ptr::null_mut());
-            }
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
-            }
-        });
-        // views of physical pages are not write-watched: their writes are caught by guards
-        // (`XCL_PAGE_ALIAS`), a write through one view counting for all of them
-        crate::hle::kernelx::guards::take_dirty(&mut dirty, page as usize);
-        dirty.sort_unstable();
+        if ahead::on() {
+            // what the pass ahead found, and what was written since it (`ahead`)
+            ahead::take_with_final_pass(&mut dirty, |d| take_all_written(&ranges, d, &mut page));
+            dirty.sort_unstable();
+            dirty.dedup();
+        } else {
+            take_all_written(&ranges, &mut dirty, &mut page);
+            dirty.sort_unstable();
+        }
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    super::wait_stats::add_us(super::wait_stats::Stat::WatchUs, watch_t0);
+    if ahead::on() {
+        ahead::kick();
+    }
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
