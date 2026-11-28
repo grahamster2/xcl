@@ -1877,6 +1877,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 };
+                // its name for `XCL_RODATA`'s name entries, before it is translated
+                recomp::pso::rodata_gate::note_record(&blob, &sh, &name);
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
                     record_done();
                     continue;
@@ -1927,9 +1929,20 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, rodata: recomp::pso::rodata_gate::rodata(&blob, f, p), ..Default::default() };
+                        let stage = match mode {
+                            recomp::Mode::Vertex(_) => recomp::pso::Stage::Vertex,
+                            recomp::Mode::Pixel(_) => recomp::pso::Stage::Pixel,
+                            recomp::Mode::Mesh(_) => recomp::pso::Stage::Mesh,
+                            _ => recomp::pso::Stage::Compute,
+                        };
                         let t = match recomp::translate(code, &opt) {
-                            Ok(t) if t.complete() => t,
+                            // (`XCL_LOOP_CAP` / `XCL_RODATA_CLAMP`, as the title's pipelines get it)
+                            Ok(mut t) if t.complete() => {
+                                t.hlsl = recomp::pso::safety::apply(std::mem::take(&mut t.hlsl), stage, code, !opt.rodata.is_empty());
+                                t.hlsl = recomp::pso::render::apply(std::mem::take(&mut t.hlsl), &blob, Some(&f.data), stage, split);
+                                t
+                            }
                             Ok(_) => {
                                 if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
                                 continue;
@@ -1962,6 +1975,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             });
         }
     });
+    recomp::pso::rodata_gate::summary();
     if let Some(selected) = selected {
         let matched = matched.into_inner().unwrap();
         let mut unmatched: Vec<_> = selected.difference(&matched).copied().collect();
@@ -2623,9 +2637,9 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                         let t = std::time::Instant::now();
                         let r = {
                             let (tx, rx) = std::sync::mpsc::channel();
-                            let (c, m) = (code.to_vec(), mode.clone());
+                            let (c, m, rodata) = (code.to_vec(), mode.clone(), f.rodata(p));
                             std::thread::spawn(move || {
-                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
+                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate, &rodata));
                             });
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
@@ -2667,7 +2681,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                                     recomp::Mode::Pixel(_) => "ps_6_6",
                                     _ => "cs_6_6",
                                 };
-                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, ..Default::default() };
+                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
                                 let t = recomp::translate(code, &opt).ok().filter(|t| t.complete())?;
                                 dump("hlsl", t.hlsl.as_bytes());
                                 let d = recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok()?;
