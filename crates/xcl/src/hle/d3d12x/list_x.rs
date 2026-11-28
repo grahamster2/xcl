@@ -4165,11 +4165,20 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
                 }
             }
         }
-        if ty > 2 || flags > 3 {
+        if ty > 2 {
             if N.fetch_add(1, Ordering::Relaxed) < 16 {
                 crate::xlog_warn!("D3D12.X: ResourceBarrier: console barrier type {ty} flags {flags:#x} dropped ({:x?})", b);
             }
             continue;
+        }
+        // Console cache hints must not discard the transition or memory ordering itself.
+        // Keep the PC split-barrier bits and let the PC perform its normal synchronization.
+        const PC_FLAGS: u32 = (D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.0 | D3D12_RESOURCE_BARRIER_FLAG_END_ONLY.0) as u32;
+        if flags & !PC_FLAGS != 0 {
+            if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!("D3D12.X: ResourceBarrier: console flag bits {:#x} dropped", flags & !PC_FLAGS);
+            }
+            b[1] &= PC_FLAGS;
         }
         if ty == 1 {
             // Keep the identity of textures that really share placed GPU memory.
@@ -4623,6 +4632,173 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the console entry point through a fake PC list, without a device or title data.
+    fn captured_resource_barriers(input: &[[u32; 8]]) -> Vec<[u32; 8]> {
+        #[repr(C)]
+        struct FakeList {
+            vt: *const usize,
+            sent: Mutex<Vec<[u32; 8]>>,
+        }
+        unsafe extern "system" fn get_type(_: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE_DIRECT
+        }
+        unsafe extern "system" fn barrier(this: *mut c_void, n: u32, b: *const [u32; 8]) {
+            let list = &*(this as *const FakeList);
+            list.sent.lock().unwrap().extend_from_slice(std::slice::from_raw_parts(b, n as usize));
+        }
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_GET_TYPE] = get_type as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = barrier as usize;
+        let mut ext_vt = [0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        // The CPU fixtures use a stable word value as their resource identity. Give it a
+        // real object-shaped backing while the hook runs, including an active capture's GetDesc.
+        unsafe extern "system" fn get_desc(_: *mut c_void, out: *mut D3D12_RESOURCE_DESC) -> *mut D3D12_RESOURCE_DESC {
+            out.write(D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 64, Height: 1, DepthOrArraySize: 1,
+                MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            });
+            out
+        }
+        let mut resource_vt = [0usize; 16];
+        resource_vt[10] = get_desc as usize;
+        let resource = resource_vt.as_ptr();
+        let resource_words = [(&resource as *const _ as usize) as u32, ((&resource as *const _ as usize) as u64 >> 32) as u32];
+        let replace_resource = |barriers: &mut [[u32; 8]], from: [u32; 2], to: [u32; 2]| {
+            for b in barriers {
+                let end = match b[0] { 0 | 2 => 4, 1 => 6, _ => 2 };
+                for words in b[2..end].chunks_exact_mut(2) {
+                    if words == from { words.copy_from_slice(&to); }
+                }
+            }
+        };
+        let mut input = input.to_vec();
+        replace_resource(&mut input, [0x1234, 0], resource_words);
+        let mut list = FakeList { vt: unsafe { ext_vt.as_ptr().add(1) }, sent: Mutex::new(Vec::new()) };
+        unsafe { resource_barrier_x(&mut list as *mut FakeList as *mut c_void, input.len() as u32, input.as_ptr()) };
+        let mut sent = list.sent.into_inner().unwrap();
+        replace_resource(&mut sent, resource_words, [0x1234, 0]);
+        sent
+    }
+
+    #[test]
+    fn resource_barrier_console_flags_keep_transition_and_split_bits() {
+        for extra in [0, 4, 0x0001_0000, 0x8000_0000, 0x8000_0004] {
+            for split in [0, 1, 2] {
+                // COPY_DEST -> COPY_SOURCE does not need a resource description lookup.
+                let input = [0, extra | split, 0x1234, 0, 7, 0x400, 0x800, 0];
+                let mut expected = input;
+                expected[1] = split;
+                assert_eq!(captured_resource_barriers(&[input]), vec![expected], "extra={extra:#x}, split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn resource_barrier_console_flags_keep_uav_ordering_and_aliasing() {
+        let transition = [0, 4, 0x1234, 0, u32::MAX, 8, 0x400, 0];
+        let mut expected = transition;
+        expected[1] = 0;
+        let uav = [2, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(captured_resource_barriers(&[transition]), vec![expected, uav]);
+        // Explicit UAV barriers still cover all aliases, and duplicate UAV barriers collapse.
+        assert_eq!(captured_resource_barriers(&[[2, 4, 0x1234, 0, 0, 0, 0, 0], uav]), vec![uav]);
+        assert_eq!(captured_resource_barriers(&[[1, 4, 0, 0, 0, 0, 0, 0]]), vec![[1, 0, 0, 0, 0, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn resource_barrier_console_flags_leave_existing_filters_in_place() {
+        assert!(captured_resource_barriers(&[]).is_empty());
+        assert!(captured_resource_barriers(&[[3, 4, 0, 0, 0, 0, 0, 0]]).is_empty());
+        // Removing console-only state bits can still leave a transition with no work to do.
+        assert!(captured_resource_barriers(&[[0, 4, 0x1234, 0, 0, 0x8000_0400, 0x400, 0]]).is_empty());
+        let input = [0, 4, 0x1234, 0, 0, 0x8000_0400, 0x800, 0];
+        assert_eq!(captured_resource_barriers(&[input]), vec![[0, 0, 0x1234, 0, 0, 0x400, 0x800, 0]]);
+    }
+
+    #[test]
+    fn gpu_resource_barrier_console_hint_preserves_texture_copy() {
+        use crate::gpu::{fence, recomp::runner};
+
+        let dev = match runner::device() {
+            Ok(dev) => dev,
+            Err(e) => {
+                eprintln!("barrier test device unavailable: {e}");
+                runner::skip_test("no GPU");
+                return;
+            }
+        };
+        println!("barrier texture-copy adapter: {}", runner::adapter().unwrap_or_default());
+        unsafe {
+            // One ordinary transition, the console hint, and the hint on a split pair.
+            // No command uses the texture between the two halves of the split transition.
+            for flags in [&[0u32][..], &[0x0001_0000][..], &[0x0001_0001, 0x0001_0002][..]] {
+                let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 4, Height: 4, DepthOrArraySize: 1, MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default()
+                };
+                let mut texture: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut texture).unwrap();
+                let texture = texture.unwrap();
+                let rtv: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).unwrap();
+                let handle = rtv.GetCPUDescriptorHandleForHeapStart();
+                dev.CreateRenderTargetView(&texture, None, handle);
+                list.ClearRenderTargetView(handle, &[0.0, 1.0, 0.0, 1.0], None);
+
+                let raw = texture.as_raw() as usize as u64;
+                let input: Vec<[u32; 8]> = flags.iter().map(|&f| [0, f, raw as u32, (raw >> 32) as u32, u32::MAX, 4, 0x800, 0]).collect();
+                let mut expected = input.clone();
+                for b in &mut expected { b[1] &= 3; }
+                let translated = captured_resource_barriers(&input);
+                // Fail the original-runtime control before submitting a missing transition.
+                assert_eq!(translated, expected, "console hint must retain the complete native transition: {flags:x?}");
+                let native: Vec<D3D12_RESOURCE_BARRIER> = translated.iter().map(|b| std::mem::transmute_copy(b)).collect();
+                list.ResourceBarrier(&native);
+
+                let readback_desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 4 * 256, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+                };
+                let mut readback: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+                let readback = readback.unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: desc.Format, Width: 4, Height: 4, Depth: 1, RowPitch: 256 }
+                    } },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: transmute_copy(&texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let complete = queue.Signal(&done, 1).map_err(|e| format!("Signal: {e}"))
+                    .and_then(|_| fence::wait(&done, 1, &dev, None, 2000).map_err(|e| e.to_string()));
+                if let Err(e) = complete {
+                    // A timed-out copy may still own these objects. Retain this tiny batch until
+                    // the test process exits rather than releasing memory the GPU could use.
+                    std::mem::forget((queue, alloc, list, done, texture, rtv, readback));
+                    panic!("bounded barrier texture copy did not complete: {e}");
+                }
+                let mut ptr = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut ptr)).unwrap();
+                let pixels: Vec<[u8; 4]> = (0..4).flat_map(|y| (0..4).map(move |x| (ptr as *const u8).add(y * 256 + x * 4).cast::<[u8; 4]>().read_unaligned())).collect();
+                readback.Unmap(0, None);
+                assert_eq!(pixels, vec![[0, 255, 0, 255]; 16], "texture copy after flags {flags:x?}");
+            }
+        }
+    }
     use std::sync::Arc;
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
