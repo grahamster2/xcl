@@ -17,6 +17,9 @@ use crate::gpu::xbox;
 
 #[cfg(test)]
 mod offline_cold_profile;
+/// The ten ACES LUT bakes' constant data after their program (#2229, for them only)
+pub(crate) mod aces;
+mod code_loads;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -491,7 +494,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, super::aces::identity(identity(), blob), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -1052,7 +1055,11 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let mut t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    // the ten ACES LUT bakes: #2229's reads of their constant data (`aces`)
+    if stage == Stage::Compute {
+        t.hlsl = aces::apply(std::mem::take(&mut t.hlsl), blob, f, p, code);
+    }
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));

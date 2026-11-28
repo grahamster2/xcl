@@ -1086,8 +1086,26 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
 /// apart) the bytes of its texels, which no console layout of them is smaller than. Without a
 /// size, `vram` gave such a texture every tile of the PC texture as a page at its address (18 for
 /// that LUT), so neighbouring LUTs shared 10 pages and overwrote each other's rows.
+/// Off by default here: `XCL_VOLUME_SIZE=1` turns the texel-bytes fallback on.
 fn console_bytes(x: &[u8; 0x38]) -> Option<u64> {
-    crate::hle::xg::Texture::new(x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0).or_else(|| volume_texel_bytes(x))
+    console_bytes_with(x, volume_size())
+}
+
+fn console_bytes_with(x: &[u8; 0x38], volumes: bool) -> Option<u64> {
+    let xg = crate::hle::xg::Texture::new(x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+    if volumes { xg.or_else(|| volume_texel_bytes(x)) } else { xg }
+}
+
+/// `XCL_VOLUME_SIZE=1`: a 3-D texture XG cannot size takes its texels' bytes (#2753).
+fn volume_size() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_VOLUME_SIZE").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_VOLUME_SIZE=1 - a 3-D texture XG cannot size is taken at its texels' bytes");
+        }
+        on
+    })
 }
 
 /// The bytes of the texels of every level of a 3-D texture (`x`: the console's desc); None for
@@ -1349,15 +1367,16 @@ mod tests {
         };
         let lut = volume(0x5, 1);
         assert!(crate::hle::xg::Texture::new(&lut).is_err());
-        assert_eq!(console_bytes(&lut), Some(33 * 33 * 33 * 8));
+        assert_eq!(console_bytes_with(&lut, true), Some(33 * 33 * 33 * 8));
+        assert_eq!(console_bytes_with(&lut, false), None, "XCL_VOLUME_SIZE off: as before #2753");
         let (a, b) = (0x15_1c8a_0000usize, 0x15_1c92_0000usize);
-        let (first_a, n_a) = super::super::vram::owned_pages(a, console_bytes(&lut), 18).unwrap();
-        let (first_b, _) = super::super::vram::owned_pages(b, console_bytes(&lut), 18).unwrap();
+        let (first_a, n_a) = super::super::vram::owned_pages(a, console_bytes_with(&lut, true), 18).unwrap();
+        let (first_b, _) = super::super::vram::owned_pages(b, console_bytes_with(&lut, true), 18).unwrap();
         assert!(first_a + n_a * 0x1_0000 <= first_b, "{first_a:#x} + {n_a} pages reach {first_b:#x}");
         // every level: 33^3, 16^3, ... 1 texels
-        assert_eq!(console_bytes(&volume(0x5, 0)), Some((33 * 33 * 33 + 16 * 16 * 16 + 8 * 8 * 8 + 4 * 4 * 4 + 2 * 2 * 2 + 1) * 8));
+        assert_eq!(console_bytes_with(&volume(0x5, 0), true), Some((33 * 33 * 33 + 16 * 16 * 16 + 8 * 8 * 8 + 4 * 4 * 4 + 2 * 2 * 2 + 1) * 8));
         let sampled = volume(0, 1);
-        assert_eq!(console_bytes(&sampled), Some(crate::hle::xg::Texture::new(&sampled).unwrap().size()));
+        assert_eq!(console_bytes_with(&sampled, true), Some(crate::hle::xg::Texture::new(&sampled).unwrap().size()));
     }
 
     /// GPU: a 256x256 D16 depth buffer the console creates for unordered access too, in

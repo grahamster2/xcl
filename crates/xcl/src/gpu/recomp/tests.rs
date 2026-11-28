@@ -10006,3 +10006,78 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// `pso::aces`: #2229's table reads for the ten ACES LUT bakes only, by an edit of the HLSL.
+/// A program whose table loads all come from `s_getpc_b64` gets them as `xcl_cload*`; the other
+/// loads and every other line stay as the recompiler made them.
+#[test]
+fn aces_bakes_read_their_constant_data() {
+    use super::pso::aces;
+    let body = |table: u32| {
+        prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(table.wrapping_sub(4))),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)], None),
+            ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 10), ("SADDR", 0), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            // memory, not the data
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ])
+    };
+    let block = body(0).len() as u32 + 4;
+    let code = body(block + 4);
+    let mut data = vec![8u32];
+    data.extend((0..8).map(|i| 0x7AB1_E000 + i));
+    data.push(0xBF81_0000);
+    let rodata = vec![(block, data)];
+    for windows in [1u32, 4] {
+        let t = translate(&code, &Options { mem_windows: windows, ..Options::default() }).unwrap();
+        let e = aces::edit(&t.hlsl, &code, &rodata).unwrap();
+        assert!(e.contains("static const uint xcl_rodata[10]") && e.contains("uint xcl_cload(uint a)"), "{e}");
+        // the two table loads read the table, the third the memory
+        let main = &e[e.find("void main(").unwrap()..];
+        assert_eq!(main.matches("xcl_cload").count(), 4, "x3 global (3 dwords) and one s_load: {main}");
+        let load = if windows > 1 { "xcl_mLoad2(" } else { "mem.Load2(" };
+        assert!(main.contains(load), "{main}");
+        // nothing else changed: without the loader, and with the table loads' accessor back,
+        // the HLSL is the recompiler's
+        let loader = aces::rodata_loader(&rodata);
+        let loader = if windows > 1 { loader.replace("mem.Load", "xcl_mLoad") } else { loader };
+        assert_eq!(e.matches(loader.as_str()).count(), 1);
+        let back = e.replacen(loader.as_str(), "", 1).replace("xcl_cload", if windows > 1 { "xcl_mLoad" } else { "mem.Load" });
+        assert_eq!(back, t.hlsl);
+    }
+    // no table data, or a load that may read either: left as it is
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(aces::edit(&t.hlsl, &code, &[]).is_err());
+    let mixed = prog(&[
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 2)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 21), ("SBASE", 0), ("OFFSET", 12), ("SOFFSET", 125)], None),
+    ]);
+    let t = translate(&mixed, &Options::default()).unwrap();
+    assert!(aces::edit(&t.hlsl, &mixed, &[(28, vec![1, 2, 3, 4])]).is_err());
+}
+
+/// A record that is not one of the ten bakes, with `s_getpc_b64` and data after its program,
+/// translates as before: `aces::apply` returns the recompiler's HLSL, and its cache identity
+/// is the same.
+#[test]
+fn other_records_with_constant_data_translate_as_before() {
+    use super::pso::aces;
+    let mut code = Vec::new();
+    for w in [0xBE80_1F00u32, 0xBF81_0000, 0xBF81_0000, 4, 0x3e63_3333, 0x3df5_c28f, 0, 1, 0xBF81_0000] {
+        code.extend_from_slice(&w.to_le_bytes());
+    }
+    let blob = crate::gpu::xbox::tests::sample(1, &[crate::gpu::xbox::tests::fssm(&code, &[(6, 0)])]);
+    assert!(!aces::allowed(&blob));
+    let sh = crate::gpu::xbox::parse(&blob).unwrap();
+    let (f, p) = (&sh.fssm[0], &sh.fssm[0].programs[0]);
+    assert!(!aces::rodata(f, p).is_empty(), "the data is after the program");
+    let prog_code = &f.data[p.offset..p.offset + p.len];
+    let hlsl = translate(prog_code, &Options::default()).unwrap().hlsl;
+    assert_eq!(aces::apply(hlsl.clone(), &blob, f, p, prog_code), hlsl);
+    assert_eq!(aces::identity(0x1234, &blob), 0x1234);
+}
