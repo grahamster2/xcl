@@ -19,6 +19,8 @@ use crate::gpu::xbox;
 mod offline_cold_profile;
 /// `XCL_RODATA` / `XCL_RODATA_SKIP`: which records get the constant data after their program
 pub(crate) mod rodata_gate;
+/// `XCL_X64_POLLS` / `XCL_X64_DEAD_BUDGET` / `XCL_X64_POLLS_ALL`: the translation's own waits bounded
+pub(crate) mod meet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -278,8 +280,14 @@ mod translated {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
-            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+            } else {
+                id
+            };
+            // `XCL_WAVE64_SPIN=0` (group barriers for one-wave64 groups in the split form): another output
+            if std::env::var("XCL_WAVE64_SPIN").is_ok_and(|v| v.trim() == "0") {
+                identity_for(&id.to_string(), "xcl-wave64-spin-0")
             } else {
                 id
             }
@@ -493,7 +501,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, rodata_identity(identity(), blob), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, super::meet::identity(rodata_identity(identity(), blob), blob, stage, split), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// `ident` for `blob`, under another identity when `XCL_RODATA` withholds the constant data
@@ -1051,7 +1059,8 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let mut t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        t.hlsl = meet::apply(std::mem::take(&mut t.hlsl), blob, stage, split_wave64);
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1080,7 +1089,8 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata: rodata_gate::rodata(blob, f, p), ..Default::default() })?;
+    let mut t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata: rodata_gate::rodata(blob, f, p), ..Default::default() })?;
+    t.hlsl = meet::apply(std::mem::take(&mut t.hlsl), blob, stage, split_wave64);
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1149,7 +1159,8 @@ fn compile_console_mesh(
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    let t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata, ..Default::default() })?;
+    let mut t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata, ..Default::default() })?;
+    t.hlsl = meet::apply(std::mem::take(&mut t.hlsl), blob, Stage::Mesh, wave64 && split_wave64);
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));

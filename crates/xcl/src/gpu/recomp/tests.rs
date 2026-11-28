@@ -10122,3 +10122,57 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// `pso::meet` edits the recompiler's HLSL by its text: the split wave64 meeting
+/// (`xcl_x_meet`) and the safe barrier (`xcl_s_barrier`) must keep the form it looks for.
+#[test]
+fn meet_switches_find_both_waits() {
+    use super::pso::meet::{edit, Switches};
+    let on = Switches::parse(Some("4096"), Some("1"), Some("1"));
+    let code = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None),
+        ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
+    ]);
+    let cs = |threads: u32| super::CsInterface { threads: [threads, 1, 1], ..Default::default() };
+    let split = translate(&code, &Options { mode: Mode::Compute(cs(64)), wave64: true, split_wave64: true, ..Options::default() }).unwrap().hlsl;
+    assert!(split.contains("bool xcl_x_meet()"), "the split form has the meeting: {split}");
+    let e = edit(&on, &split);
+    assert!(e.contains("if (n >= 4096u) { ok = 0u; break; }") && e.contains("xcl_x_dead = true; xcl_budget = 0u; return false;"), "{e}");
+    let bar = prog(&[("S_BARRIER", "ENC_SOPP", &[], None), ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None)]);
+    let b = translate(&bar, &Options { mode: Mode::Compute(cs(256)), wave64: false, ..Options::default() }).unwrap().hlsl;
+    if b.contains("void xcl_s_barrier()") {
+        let e = edit(&on, &b);
+        assert!(e.contains("if (_n >= 4096u) {") && e.contains("xcl_bar_alive = false; xcl_budget = 0u; }"), "{e}");
+    } else {
+        // the safe barrier only where the program needs it: the meeting's form is what is checked
+        assert!(!b.contains("1u << 20"), "{b}");
+    }
+    assert_eq!(edit(&Switches::default(), &split), split, "off: byte for byte");
+}
+
+/// How many records of a shader pack `pso::meet` re-translates (`XCL_SAMPLE_RPF=<shaders.rpf>`;
+/// `--ignored --nocapture`): with constant data only and with `XCL_X64_POLLS_ALL=1`, split
+/// (a GPU of 32-lane waves) and not.
+#[test]
+#[ignore]
+fn meet_census() {
+    use super::pso::meet::{changes, Switches};
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    let data = std::fs::read(path).unwrap();
+    let (scoped, all) = (Switches::parse(Some("4096"), Some("1"), None), Switches::parse(Some("4096"), Some("1"), Some("1")));
+    let mut n = [0usize; 5];
+    for rec in crate::gpu::pack::scan(&data, 0x40) {
+        // compute and mesh records: the only ones with the waits (`meet::waits_in`)
+        if !matches!(crate::gpu::pack::name_stage(&rec.name), Some("CS" | "MS")) {
+            continue;
+        }
+        let Some(blob) = crate::gpu::pack::inflate(&data, &rec) else { continue };
+        n[0] += 1;
+        n[1] += changes(&scoped, &blob, true) as usize;
+        n[2] += changes(&all, &blob, true) as usize;
+        n[3] += changes(&scoped, &blob, false) as usize;
+        n[4] += changes(&all, &blob, false) as usize;
+    }
+    eprintln!("meet census: {} compute / mesh records; split: {} with constant data, {} with XCL_X64_POLLS_ALL=1; not split: {} / {}", n[0], n[1], n[2], n[3], n[4]);
+}

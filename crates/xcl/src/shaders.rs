@@ -1931,7 +1931,17 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, rodata: recomp::pso::rodata_gate::rodata(&blob, f, p), ..Default::default() };
                         let t = match recomp::translate(code, &opt) {
-                            Ok(t) if t.complete() => t,
+                            // (`XCL_X64_POLLS` and its switches, as the title's pipelines get it)
+                            Ok(mut t) if t.complete() => {
+                                let stage = match mode {
+                                    recomp::Mode::Vertex(_) => recomp::pso::Stage::Vertex,
+                                    recomp::Mode::Pixel(_) => recomp::pso::Stage::Pixel,
+                                    recomp::Mode::Mesh(_) => recomp::pso::Stage::Mesh,
+                                    _ => recomp::pso::Stage::Compute,
+                                };
+                                t.hlsl = recomp::pso::meet::apply(std::mem::take(&mut t.hlsl), &blob, stage, split);
+                                t
+                            }
                             Ok(_) => {
                                 if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
                                 continue;
