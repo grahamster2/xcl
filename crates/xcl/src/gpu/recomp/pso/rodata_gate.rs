@@ -6,7 +6,8 @@
 //! - `XCL_RODATA=<list>`: only the records the list names. An entry of 16 hex digits (an
 //!   optional `0x`) is a record hash (`shader::fnv64` of the container, the `record` of the
 //!   driver compile lines and `xcl shaders --record-hash`); anything else is a part of a
-//!   record name (`postfx_aces:CS_Bake…`, case ignored). Entries are split at `,` or `;`.
+//!   record name (`postfx_aces:CS_Bake…`, case ignored). Entries are split at `,` or `;`;
+//!   `@<path>` takes the entries of a file, one per line (`<hash> <name>` lines: the hash).
 //! - `XCL_RODATA_SKIP=<list>`, the same form: these records never get it.
 //!
 //! Only a program that takes a code address (`takes_code_address`) and has data after it is
@@ -42,18 +43,36 @@ pub(crate) struct Gate {
     pub list: bool,
 }
 
-fn parse_list(s: &str) -> Vec<Pat> {
-    s.split([',', ';'])
-        .map(str::trim)
+fn pat(e: &str) -> Pat {
+    let hex = e.strip_prefix("0x").or_else(|| e.strip_prefix("0X")).unwrap_or(e);
+    match (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok()).flatten() {
+        Some(h) => Pat::Hash(h),
+        None => Pat::Name(e.to_ascii_lowercase()),
+    }
+}
+
+/// `@<path>`: the entries of a file, one per line – its first word (a line `<hash> <name>`
+/// is the hash); blank lines and `#` comments are left out.
+fn file_entries(text: &str) -> Vec<Pat> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").split_whitespace().next().unwrap_or(""))
         .filter(|e| !e.is_empty())
-        .map(|e| {
-            let hex = e.strip_prefix("0x").or_else(|| e.strip_prefix("0X")).unwrap_or(e);
-            match (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok()).flatten() {
-                Some(h) => Pat::Hash(h),
-                None => Pat::Name(e.to_ascii_lowercase()),
-            }
-        })
+        .map(pat)
         .collect()
+}
+
+fn parse_list(s: &str) -> Vec<Pat> {
+    let mut out = Vec::new();
+    for e in s.split([',', ';']).map(str::trim).filter(|e| !e.is_empty()) {
+        match e.strip_prefix('@') {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => out.extend(file_entries(&text)),
+                Err(err) => crate::xlog_warn!("[RODATA] {path}: {err} – no entries from it"),
+            },
+            None => out.push(pat(e)),
+        }
+    }
+    out
 }
 
 impl Gate {
@@ -283,6 +302,23 @@ mod tests {
         assert!(!super::withheld_by(&Gate::parse(Some(&hash), None, None), &with));
         assert!(super::withheld_by(&Gate::parse(None, Some(&hash), None), &with));
         assert!(!super::withheld_by(&Gate::parse(Some("all"), None, None), &with));
+    }
+
+    #[test]
+    fn files_give_one_entry_per_line() {
+        let e = super::file_entries("# comment
+14f33bcccd1ec01d	postfx_aces:CS_Bake
+
+  water_  # part
+");
+        assert_eq!(e, vec![Pat::Hash(0x14f3_3bcc_cd1e_c01d), Pat::Name("water_".into())]);
+        let path = std::env::temp_dir().join(format!("xcl-rodata-{}.txt", std::process::id()));
+        std::fs::write(&path, "0000000000000002 b
+").unwrap();
+        let g = Gate::parse(Some(&format!("0000000000000001,@{}", path.display())), None, None);
+        let _ = std::fs::remove_file(&path);
+        assert!(g.gives(1, &[]) && g.gives(2, &[]) && !g.gives(3, &[]));
+        assert_eq!(Gate::parse(Some(r"@Z:\no\such\file"), None, None).only, Some(Vec::new()), "an unreadable file gives nothing");
     }
 
     #[test]
