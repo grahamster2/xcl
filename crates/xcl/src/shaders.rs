@@ -1940,6 +1940,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             // (`XCL_LOOP_CAP` / `XCL_RODATA_CLAMP`, as the title's pipelines get it)
                             Ok(mut t) if t.complete() => {
                                 t.hlsl = recomp::pso::safety::apply(std::mem::take(&mut t.hlsl), stage, code, !opt.rodata.is_empty());
+                                t.hlsl = recomp::pso::render::apply(std::mem::take(&mut t.hlsl), &blob, Some(&f.data), stage, split);
                                 t
                             }
                             Ok(_) => {

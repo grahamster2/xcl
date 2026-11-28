@@ -21,6 +21,8 @@ mod offline_cold_profile;
 pub(crate) mod rodata_gate;
 /// `XCL_LOOP_CAP` / `XCL_RODATA_CLAMP`: VIctory-NVIDIA's loop cap and table clamp
 pub(crate) mod safety;
+/// `XCL_EARLY_DEPTH` / `XCL_LEAVE_OUT` / `XCL_WATER_LIGHT`: VIctory-NVIDIA's render switches
+pub(crate) mod render;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -495,7 +497,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, super::safety::identity(rodata_identity(identity(), blob), blob, stage), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, super::render::identity(super::safety::identity(rodata_identity(identity(), blob), blob, stage), blob, stage, split), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// `ident` for `blob`, under another identity when `XCL_RODATA` withholds the constant data
@@ -1055,6 +1057,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
         let mut t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         t.hlsl = safety::apply(std::mem::take(&mut t.hlsl), stage, f.code, false);
+        t.hlsl = render::apply(std::mem::take(&mut t.hlsl), blob, None, stage, split_wave64);
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1087,6 +1090,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     let has_rodata = !rodata.is_empty();
     let mut t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata, ..Default::default() })?;
     t.hlsl = safety::apply(std::mem::take(&mut t.hlsl), stage, code, has_rodata);
+    t.hlsl = render::apply(std::mem::take(&mut t.hlsl), blob, Some(&f.data), stage, split_wave64);
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));

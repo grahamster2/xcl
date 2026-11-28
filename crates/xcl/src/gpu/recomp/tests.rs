@@ -10159,3 +10159,23 @@ fn safety_switches_find_what_they_change() {
     assert!(t.hlsl.contains("xcl_gload"), "{}", t.hlsl);
     assert!(clamp_hlsl(&t.hlsl).contains("bool xcl_code(uint hi, uint a) { return hi == 0xC0DEu; }"), "{}", clamp_hlsl(&t.hlsl));
 }
+
+/// `XCL_LEAVE_OUT` / `XCL_EARLY_DEPTH` (`pso::render`) edit the recompiler's HLSL by its text:
+/// a compute `main` and a pixel `main` must keep the form they look for.
+#[test]
+fn render_switches_find_what_they_change() {
+    use super::pso::render::{early_depth_hlsl, empty_hlsl};
+    let code = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None)]);
+    let cs = translate(&code, &Options { mode: Mode::Compute(super::CsInterface::default()), ..Options::default() }).unwrap().hlsl;
+    let empty = empty_hlsl(&cs);
+    assert!(empty.contains(")
+{
+    return; // XCL_LEAVE_OUT
+"), "{empty}");
+    let ps = translate(&code, &Options { mode: Mode::Pixel(draw_psi()), wave64: true, ..Options::default() }).unwrap().hlsl;
+    let early = early_depth_hlsl(&ps);
+    assert!(early.contains("
+[earlydepthstencil]
+XclOut main(XclIn xi)
+"), "{early}");
+}
