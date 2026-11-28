@@ -4719,6 +4719,8 @@ mod tests {
         assert_eq!(captured_resource_barriers(&[input]), vec![[0, 0, 0x1234, 0, 0, 0x400, 0x800, 0]]);
     }
 
+    // (left out on this base: it needs `runner::device()`, which `main` here does not have)
+    #[cfg(any())]
     #[test]
     fn gpu_resource_barrier_console_hint_preserves_texture_copy() {
         use crate::gpu::{fence, recomp::runner};
