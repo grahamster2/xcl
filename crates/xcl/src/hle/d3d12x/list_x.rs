@@ -4170,6 +4170,28 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
 /// the D3D12_RESOURCE_STATES bits the PC knows
 const PC_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
 
+/// Whether a barrier with console hint flags (flags > 3) is kept with the hint bits taken off
+/// (#3090; unset or `XCL_HINT_BARRIERS=1`) or dropped as before it (`XCL_HINT_BARRIERS=0`).
+fn hint_barriers() -> bool {
+    #[cfg(test)]
+    if let Some(on) = HINT_BARRIERS_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_HINT_BARRIERS").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: XCL_HINT_BARRIERS=0 – barriers with console hint flags are dropped (as before #3090)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static HINT_BARRIERS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// #26 ResourceBarrier(count, barriers): console barriers (D3D12_RESOURCE_BARRIER, 32 bytes) as
 /// PC ones – state bits the PC does not know are dropped (logged: the console's own), a
 /// transition left with nothing to do goes, aliasing barriers name placed textures
@@ -4193,7 +4215,8 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
                 }
             }
         }
-        if ty > 2 {
+        // `XCL_HINT_BARRIERS=0`: a barrier with console hint flags is dropped, as before #3090
+        if ty > 2 || (flags > 3 && !hint_barriers()) {
             if N.fetch_add(1, Ordering::Relaxed) < 16 {
                 crate::xlog_warn!("D3D12.X: ResourceBarrier: console barrier type {ty} flags {flags:#x} dropped ({:x?})", b);
             }
@@ -4710,6 +4733,18 @@ mod tests {
         let mut sent = list.sent.into_inner().unwrap();
         replace_resource(&mut sent, resource_words, [0x1234, 0]);
         sent
+    }
+
+    /// `XCL_HINT_BARRIERS=0`: a barrier with console hint flags is dropped, one without them
+    /// goes to the PC as it is (main's behaviour before #3090).
+    #[test]
+    fn resource_barrier_console_flags_dropped_with_hint_barriers_off() {
+        HINT_BARRIERS_TEST.with(|c| c.set(Some(false)));
+        let hinted = [0, 4 | 1, 0x1234, 0, 7, 0x400, 0x800, 0];
+        let plain = [0, 1, 0x1234, 0, 7, 0x400, 0x800, 0];
+        let sent = captured_resource_barriers(&[hinted, plain]);
+        HINT_BARRIERS_TEST.with(|c| c.set(None));
+        assert_eq!(sent, vec![plain]);
     }
 
     #[test]
