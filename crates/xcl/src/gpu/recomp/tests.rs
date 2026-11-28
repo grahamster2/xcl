@@ -10122,3 +10122,40 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// `XCL_LOOP_CAP` / `XCL_RODATA_CLAMP` (`pso::safety`) edit the recompiler's HLSL by its text:
+/// the loop budget and the constant data loader must keep the form they look for.
+#[test]
+fn safety_switches_find_what_they_change() {
+    use super::pso::safety::{cap_hlsl, clamp_hlsl, has_loop};
+    let code = prog(&[
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 20), ("SOFFSET", 125)], None),
+        ("S_SUB_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None), // back to s_sub
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
+    ]);
+    assert!(has_loop(&code));
+    let rodata = vec![(code.len() as u32 + 4, vec![3u32, 5, 6, 7])];
+    for structured in [true, false] {
+        let t = translate(&code, &Options { rodata: rodata.clone(), structured, ..Options::default() }).unwrap();
+        assert!(t.hlsl.contains("xcl_budget--"), "{}", t.hlsl);
+        let capped = cap_hlsl(&t.hlsl, 4096);
+        assert!(capped.contains("static uint xcl_budget = 4096u;") && !capped.contains("1u << 16"), "{capped}");
+        let clamped = clamp_hlsl(&t.hlsl);
+        assert!(clamped.contains("uint xcl_cload(uint a) {
+    uint r = xcl_rodata[3u];
+"), "{clamped}");
+    }
+    // a mixed load (`xcl_gload`): its code test is the tag alone
+    let t = translate(&prog(&[
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 2)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 21), ("SBASE", 0), ("OFFSET", 12), ("SOFFSET", 125)], None),
+    ]), &Options { rodata: vec![(28, vec![1, 2, 3, 4])], ..Options::default() }).unwrap();
+    assert!(t.hlsl.contains("xcl_gload"), "{}", t.hlsl);
+    assert!(clamp_hlsl(&t.hlsl).contains("bool xcl_code(uint hi, uint a) { return hi == 0xC0DEu; }"), "{}", clamp_hlsl(&t.hlsl));
+}

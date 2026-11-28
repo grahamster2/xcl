@@ -1930,8 +1930,18 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, rodata: recomp::pso::rodata_gate::rodata(&blob, f, p), ..Default::default() };
+                        let stage = match mode {
+                            recomp::Mode::Vertex(_) => recomp::pso::Stage::Vertex,
+                            recomp::Mode::Pixel(_) => recomp::pso::Stage::Pixel,
+                            recomp::Mode::Mesh(_) => recomp::pso::Stage::Mesh,
+                            _ => recomp::pso::Stage::Compute,
+                        };
                         let t = match recomp::translate(code, &opt) {
-                            Ok(t) if t.complete() => t,
+                            // (`XCL_LOOP_CAP` / `XCL_RODATA_CLAMP`, as the title's pipelines get it)
+                            Ok(mut t) if t.complete() => {
+                                t.hlsl = recomp::pso::safety::apply(std::mem::take(&mut t.hlsl), stage, code, !opt.rodata.is_empty());
+                                t
+                            }
                             Ok(_) => {
                                 if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
                                 continue;

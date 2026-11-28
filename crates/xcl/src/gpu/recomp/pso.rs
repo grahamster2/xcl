@@ -19,6 +19,8 @@ use crate::gpu::xbox;
 mod offline_cold_profile;
 /// `XCL_RODATA` / `XCL_RODATA_SKIP`: which records get the constant data after their program
 pub(crate) mod rodata_gate;
+/// `XCL_LOOP_CAP` / `XCL_RODATA_CLAMP`: VIctory-NVIDIA's loop cap and table clamp
+pub(crate) mod safety;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -493,7 +495,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, rodata_identity(identity(), blob), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, super::safety::identity(rodata_identity(identity(), blob), blob, stage), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// `ident` for `blob`, under another identity when `XCL_RODATA` withholds the constant data
@@ -1051,7 +1053,8 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let mut t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        t.hlsl = safety::apply(std::mem::take(&mut t.hlsl), stage, f.code, false);
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1080,7 +1083,10 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata: rodata_gate::rodata(blob, f, p), ..Default::default() })?;
+    let rodata = rodata_gate::rodata(blob, f, p);
+    let has_rodata = !rodata.is_empty();
+    let mut t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata, ..Default::default() })?;
+    t.hlsl = safety::apply(std::mem::take(&mut t.hlsl), stage, code, has_rodata);
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1149,7 +1155,9 @@ fn compile_console_mesh(
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    let t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata, ..Default::default() })?;
+    let has_rodata = !rodata.is_empty();
+    let mut t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata, ..Default::default() })?;
+    t.hlsl = safety::apply(std::mem::take(&mut t.hlsl), Stage::Mesh, code, has_rodata);
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
