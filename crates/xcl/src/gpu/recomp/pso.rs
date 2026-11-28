@@ -17,6 +17,8 @@ use crate::gpu::xbox;
 
 #[cfg(test)]
 mod offline_cold_profile;
+/// `XCL_RODATA` / `XCL_RODATA_SKIP`: which records get the constant data after their program
+pub(crate) mod rodata_gate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
@@ -620,7 +622,14 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, rodata_identity(identity(), blob), direct_output(), blob, stage, sampler_base, windows, split, translate)
+    }
+
+    /// `ident` for `blob`, under another identity when `XCL_RODATA` withholds the constant data
+    /// after one of its programs (`rodata_gate::withheld`): that translation differs from the
+    /// full one, which keeps `ident`.
+    pub(super) fn rodata_identity(ident: u64, blob: &[u8]) -> u64 {
+        if ident != 0 && super::rodata_gate::withheld(blob) { identity_for(&format!("{ident:016x}"), "xcl-rodata-withheld") } else { ident }
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -1168,7 +1177,7 @@ pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     // the constant data the program reads from its own code region (`Options::rodata`)
-    let rodata = f.rodata(p);
+    let rodata = rodata_gate::rodata(blob, f, p);
     let wave64 = super::fssm_wave64(f, code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
@@ -1236,7 +1245,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, s
         (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::Entry::Pixel(ps.clone()),
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
-    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, entry, &f.rodata(p))?;
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, entry, &rodata_gate::rodata(blob, f, p))?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers, dispatch_remap: None })
 }
@@ -1276,7 +1285,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, no_remap, rodata: f.rodata(p), ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, no_remap, rodata: rodata_gate::rodata(blob, f, p), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1372,7 +1381,7 @@ fn console_mesh_with(
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::fssm_wave64(f, code);
     let split = wave64 && split_wave64;
-    let compile_one = || compile(code, f.rodata(p), ms, wave64);
+    let compile_one = || compile(code, rodata_gate::rodata(blob, f, p), ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
     // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
     let cs = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
