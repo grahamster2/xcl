@@ -59,9 +59,13 @@ pub enum Stat {
     AheadPages,
     AheadUs,
     AheadPagesUsed,
+    /// `XCL_RELAY_READBACK`: copies back handed to the relay's thread
+    RelayJobs,
+    /// `XCL_WC_NO_BACK`: KiB of GPU writes into write-combined memory not copied back
+    WcLeftKb,
 }
 
-pub const COUNT: usize = Stat::AheadPagesUsed as usize + 1;
+pub const COUNT: usize = Stat::WcLeftKb as usize + 1;
 
 static STATS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
@@ -83,7 +87,7 @@ pub fn line(d: &[u64; COUNT]) -> String {
     let n = |s: Stat| d[s as usize];
     format!(
         "Wait32/64 at submit: {} GPU-bridged, {} GPU-watched ({} ms to release, {} timed out), {} CPU-polled ({} ms on the submit thread, {} timed out), {} self-waits skipped; {} Write64 cycle breaks, {} watchdog releases; \
-         sparse CPU waits {} ({} ms); PresentX slot waits {} ({} ms); pipeline-build waits {} ({} ms); submits {} ms in XCL ({} ms write-watch and uploads, {} ms of it the look for writes); looks ahead {} ({} ms, {} pages found, {} taken by submits)",
+         sparse CPU waits {} ({} ms); PresentX slot waits {} ({} ms); pipeline-build waits {} ({} ms); submits {} ms in XCL ({} ms write-watch and uploads, {} ms of it the look for writes); looks ahead {} ({} ms, {} pages found, {} taken by submits); copies back relayed {}, {} KiB write-combined not copied back",
         n(Stat::Bridged),
         n(Stat::Watched),
         ms(Stat::WatchedUs),
@@ -107,6 +111,8 @@ pub fn line(d: &[u64; COUNT]) -> String {
         ms(Stat::AheadUs),
         n(Stat::AheadPages),
         n(Stat::AheadPagesUsed),
+        n(Stat::RelayJobs),
+        n(Stat::WcLeftKb),
     )
 }
 
@@ -123,6 +129,6 @@ mod tests {
         let l = line(&d);
         assert!(l.starts_with("Wait32/64 at submit: 1000 GPU-bridged, 2000 GPU-watched (3 ms to release, 4000 timed out), 5000 CPU-polled (6 ms"), "{l}");
         assert!(l.contains("submits 18 ms in XCL (17 ms write-watch and uploads, 19 ms of it the look for writes)"), "{l}");
-        assert!(l.ends_with("looks ahead 20000 (22 ms, 21000 pages found, 23000 taken by submits)"), "{l}");
+        assert!(l.ends_with("looks ahead 20000 (22 ms, 21000 pages found, 23000 taken by submits); copies back relayed 24000, 25000 KiB write-combined not copied back"), "{l}");
     }
 }

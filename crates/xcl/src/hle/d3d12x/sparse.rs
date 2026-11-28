@@ -22,6 +22,9 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+mod relay;
+pub use relay::{released as wc_released, reserved as wc_reserved};
+
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -1233,6 +1236,7 @@ pub unsafe fn free(p: usize) -> bool {
     // decommitted before the address goes back: once released, another thread may get it,
     // commit it and write there
     let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
+    relay::released(start);
     decommitted(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     u.sparse_release(p).is_some()
@@ -1254,7 +1258,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
-    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
+    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some() && !relay::skip_back(a, n)).collect();
     if filtered.is_empty() {
         return;
     }
@@ -1274,6 +1278,18 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if queue.Signal(&s.rb_fence, v).is_ok() {
         let _ = s.queue.Wait(&s.rb_fence, v);
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
+        // `XCL_RELAY_READBACK`: copied back by the relay's thread, the queue waits for it on the GPU
+        if relay::on() {
+            let (dev, rb_fence) = (s.dev.clone(), s.rb_fence.clone());
+            drop(g);
+            if relay::send(&dev, queue, &rb_fence, v, merged.clone()) {
+                return;
+            }
+            g = lock_state();
+            let Some(s) = g.as_mut() else { return };
+            s.readback_ranges(&merged);
+            return;
+        }
     }
     s.readback_ranges(&merged);
 }
@@ -1286,6 +1302,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
+    relay::land();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
@@ -1556,6 +1573,8 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    // (`XCL_RELAY_READBACK`: the CPU view has the GPU's writes before any of it goes up)
+    relay::land();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);

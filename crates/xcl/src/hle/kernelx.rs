@@ -280,6 +280,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_sparse(addr as usize)) {
         let q = commit_sparse(addr as usize, size, p);
         trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
+        if !q.is_null() {
+            crate::hle::d3d12x::sparse::wc_reserved(addr as usize, size, p);
+        }
         return q;
     }
     // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them.
@@ -294,6 +297,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             }
             mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
+            crate::hle::d3d12x::sparse::wc_reserved(q, size, p);
             return q as *mut c_void;
         }
     }
@@ -308,6 +312,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         let rounded = size.max(1).div_ceil(align) * align;
         if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
             trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
+            crate::hle::d3d12x::sparse::wc_reserved(q, rounded, p);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.alloc(rounded, align)) {
@@ -328,6 +333,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         if let Some(q) = reserved {
             mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
+            crate::hle::d3d12x::sparse::wc_reserved(q, size, p);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.reserve(size, 0x1_0000)) {
