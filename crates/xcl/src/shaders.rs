@@ -1877,6 +1877,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 };
+                // its name for `XCL_RODATA`'s name entries, before it is translated
+                recomp::pso::rodata_gate::note_record(&blob, &sh, &name);
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
                     record_done();
                     continue;
@@ -1927,7 +1929,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, rodata: recomp::pso::rodata_gate::rodata(&blob, f, p), ..Default::default() };
                         let t = match recomp::translate(code, &opt) {
                             Ok(t) if t.complete() => t,
                             Ok(_) => {
@@ -1962,6 +1964,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             });
         }
     });
+    recomp::pso::rodata_gate::summary();
     if let Some(selected) = selected {
         let matched = matched.into_inner().unwrap();
         let mut unmatched: Vec<_> = selected.difference(&matched).copied().collect();
