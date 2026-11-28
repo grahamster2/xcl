@@ -1504,6 +1504,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         out
     };
     for (va, val, fence) in to_release {
+        super::wait_stats::add(super::wait_stats::Stat::CycleBreaks, 1);
         publish_cpu_cycle_break(va, val);
         let _ = fence.Signal(val);
         static MIXED_WARN: AtomicU64 = AtomicU64::new(0);
@@ -1606,6 +1607,7 @@ fn wake_sync_watchdog() {
             }
             let had_expired = !expired.is_empty();
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
+                super::wait_stats::add(super::wait_stats::Stat::WatchdogReleases, 1);
                 unsafe {
                     let _ = fence.Signal(val);
                 }
@@ -1832,6 +1834,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
             SignalAction::CpuCycleBreak(waiters) => {
+                super::wait_stats::add(super::wait_stats::Stat::CycleBreaks, 1);
                 publish_cpu_cycle_break(va, val);
                 let _ = fence.Signal(val);
                 static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
@@ -2023,10 +2026,32 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             continue;
         }
         match try_gpu_wait(queue, w, list_writes) {
-            GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
+            GpuWaitOutcome::Handled => {
+                super::wait_stats::add(super::wait_stats::Stat::Bridged, 1);
+                continue;
+            }
+            GpuWaitOutcome::CycleSkip => {
+                super::wait_stats::add(super::wait_stats::Stat::CycleSkips, 1);
+                continue;
+            }
             GpuWaitOutcome::FallbackCpu => {}
         }
-        if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
+        // `XCL_GPU_SIDE_WAITS=1`: the queue waits on the GPU, XCL's thread polls (`gpu_watch`)
+        if !queue.is_null() && super::gpu_watch::enabled() {
+            let pw = *w;
+            let what = format!("Wait{}BitValueX at {:#x} (op {}, want {:#x}, mask {:#x}, queue_type={q_ty})", w.width * 8, w.va, w.comparison, w.value, w.mask);
+            if super::gpu_watch::arm(queue, Box::new(move || unsafe { pw.is_satisfied() }), what, timeout) {
+                continue;
+            }
+        }
+        let polled = Instant::now();
+        let held = w.wait_until_satisfied(timeout);
+        super::wait_stats::add(super::wait_stats::Stat::CpuPolled, 1);
+        super::wait_stats::add_us(super::wait_stats::Stat::CpuPolledUs, polled);
+        if !held {
+            super::wait_stats::add(super::wait_stats::Stat::CpuTimeouts, 1);
+        }
+        if !held && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
                 g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
@@ -6283,6 +6308,71 @@ mod tests {
             on_release(dl_ptr as usize);
             on_release(cl_ptr as usize);
             SYNC_GRAPH.lock().unwrap().as_mut().map(|gr| gr.cells.remove(&va));
+        }
+    }
+
+    /// `XCL_GPU_SIDE_WAITS=1`: a `Wait32BitValueX` on memory the CPU writes (no per-address
+    /// fence can bridge it) does not hold the submitting thread; the queue starts the list only
+    /// once the memory holds, and lists submitted before it in the batch run at once.
+    #[test]
+    fn gpu_side_wait32_holds_the_queue_not_the_submitting_thread() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Some(warp) = CreateDXGIFactory1::<IDXGIFactory4>().ok().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>().ok()) else {
+                    return crate::gpu::recomp::runner::skip_test("no GPU");
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    return crate::gpu::recomp::runner::skip_test("no GPU");
+                }
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let first: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let waiting: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let (f_ptr, w_ptr) = (first.as_raw(), waiting.as_raw());
+            on_create(f_ptr, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            on_create(w_ptr, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let cell = Box::new(AtomicU32::new(1));
+            let va = &*cell as *const AtomicU32 as u64;
+            // (value & 0xFF) == 7: a comparison and mask the per-address fences never bridge
+            wait32_x(w_ptr, va, D3D12_COMPARISON_FUNC_EQUAL.0 as u32, 7, 0xFF, 0);
+            first.Close().unwrap();
+            waiting.Close().unwrap();
+            let before = super::super::wait_stats::snapshot();
+
+            let after_first: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let lists = [first.cast::<ID3D12CommandList>().unwrap(), waiting.cast::<ID3D12CommandList>().unwrap()];
+            let mut chunks = Vec::new();
+            let t0 = Instant::now();
+            super::super::gpu_watch::with_enabled(|| {
+                execute_with_waits_on(q.as_raw(), &[f_ptr, w_ptr], |chunk| {
+                    chunks.push(chunk.to_vec());
+                    let pc: Vec<Option<ID3D12CommandList>> = chunk.iter().map(|&l| Some(lists[if l == f_ptr { 0 } else { 1 }].clone())).collect();
+                    q.ExecuteCommandLists(&pc);
+                    if chunk[0] == f_ptr {
+                        q.Signal(&after_first, 1).unwrap();
+                    }
+                });
+            });
+            assert!(t0.elapsed() < Duration::from_millis(500), "the submitting thread does not poll ({} ms)", t0.elapsed().as_millis());
+            assert_eq!(chunks, vec![vec![f_ptr], vec![w_ptr]], "the batch is split before the waiting list");
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&after_first, 1, &dev, None, 2000).expect("the list before the wait runs at once");
+            std::thread::sleep(Duration::from_millis(150));
+            assert_eq!(done.GetCompletedValue(), 0, "the waiting list does not start before the memory holds");
+            cell.store(0x307, Ordering::Release);
+            crate::gpu::fence::wait(&done, 1, &dev, None, 1500).expect("the queue goes on once the memory holds");
+            let after = super::super::wait_stats::snapshot();
+            use super::super::wait_stats::Stat;
+            assert!(after[Stat::Watched as usize] > before[Stat::Watched as usize]);
+            on_release(f_ptr as usize);
+            on_release(w_ptr as usize);
         }
     }
 

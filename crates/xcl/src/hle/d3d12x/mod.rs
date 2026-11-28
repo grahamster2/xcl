@@ -18,6 +18,7 @@ pub mod dxgi_device;
 mod cpu_writes;
 pub mod dred;
 mod fence_x;
+pub mod gpu_watch;
 pub mod frame;
 pub mod guard;
 mod late_release;
@@ -35,6 +36,7 @@ pub mod title_list;
 pub mod title_textures;
 mod uma_driver;
 pub mod vram;
+pub mod wait_stats;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

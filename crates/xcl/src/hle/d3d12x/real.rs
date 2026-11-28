@@ -7469,8 +7469,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
+    let _timed = SubmitTimer(std::time::Instant::now());
     // textures in title memory the CPU wrote since: uploaded again first
+    let refresh_t0 = std::time::Instant::now();
     super::title_textures::refresh(this);
+    super::wait_stats::add_us(super::wait_stats::Stat::RefreshUs, refresh_t0);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -7499,6 +7502,15 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
+}
+
+/// Counts a title submit's time in XCL (`wait_stats`), however the call returns.
+struct SubmitTimer(std::time::Instant);
+
+impl Drop for SubmitTimer {
+    fn drop(&mut self) {
+        super::wait_stats::add_us(super::wait_stats::Stat::SubmitUs, self.0);
+    }
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

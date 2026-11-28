@@ -834,8 +834,11 @@ impl State {
         if target == 0 || self.fence.GetCompletedValue() >= target {
             return;
         }
+        let t0 = std::time::Instant::now();
         let _ = self.fence.SetEventOnCompletion(target, self.event);
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        super::wait_stats::add(super::wait_stats::Stat::SparseWaits, 1);
+        super::wait_stats::add_us(super::wait_stats::Stat::SparseWaitUs, t0);
         if self.fence.GetCompletedValue() < target {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
         }

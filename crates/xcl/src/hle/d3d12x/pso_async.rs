@@ -353,6 +353,22 @@ impl Drop for Held {
     }
 }
 
+/// Counts a bind's wait for a pipeline still being built (`wait_stats`).
+struct PsoWaitTimer(std::time::Instant);
+
+impl PsoWaitTimer {
+    fn new() -> PsoWaitTimer {
+        PsoWaitTimer(std::time::Instant::now())
+    }
+}
+
+impl Drop for PsoWaitTimer {
+    fn drop(&mut self) {
+        super::wait_stats::add(super::wait_stats::Stat::PsoWaits, 1);
+        super::wait_stats::add_us(super::wait_stats::Stat::PsoWaitUs, self.0);
+    }
+}
+
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
 }
@@ -1258,6 +1274,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
+    let _timed = _held.is_some().then(PsoWaitTimer::new);
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }

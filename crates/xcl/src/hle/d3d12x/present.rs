@@ -644,7 +644,14 @@ unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Resul
     }
     if wait_val > 0 {
         let timeout_ms = if is_present_x { 2000 } else { 100 };
-        fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), timeout_ms)?;
+        let t0 = Instant::now();
+        let waits = p.fence.GetCompletedValue() < wait_val;
+        let r = fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), timeout_ms);
+        if waits {
+            super::wait_stats::add(super::wait_stats::Stat::PresentWaits, 1);
+            super::wait_stats::add_us(super::wait_stats::Stat::PresentWaitUs, t0);
+        }
+        r?;
         p.ring.mark_slot_reusable(slot);
         p.slot_sources[slot].clear();
         p.slot_dumps[slot].clear();
